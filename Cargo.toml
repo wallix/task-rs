@@ -1,0 +1,88 @@
+[workspace]
+resolver = "2"
+members = ["crates/ocicas", "crates/taskcore", "crates/task"]
+
+[workspace.package]
+version = "4.0.0"
+edition = "2024"
+authors = [
+    "Vincent Vanackere <vvanackere@wallix.com>",
+    "WALLIX",
+]
+license = "Apache-2.0"
+repository = "https://github.com/wallix/task-rs"
+homepage = "https://github.com/wallix/task-rs"
+description = "A Rust reimplementation of the Task runner (WALLIX fork), drop-in compatible with Taskfile v3"
+
+# Smaller, faster, more deterministic release binaries: cross-crate inlining +
+# dead-code elimination (thin LTO, one codegen unit) and symbol stripping.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
+# Deny-lints applied to every workspace member (each crate opts in with
+# `[lints] workspace = true`). arithmetic_side_effects is allowed inside tests
+# via `#[cfg_attr(test, allow(...))]` at the call sites that need it.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+
+# Single source of truth for dependency versions. Members reference these with
+# `<dep>.workspace = true` and add only the per-crate features they need. Kept in
+# step with virtkit's pins where the crate is shared (oci-client, zstd, …).
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# YAML has no stdlib equivalent; serde_yaml_ng is the maintained serde-yaml fork
+# (same choice as virtkit). indexmap gives the insertion-ordered maps the
+# Taskfile schema needs (vars, tasks) — the guidelines allow it for that reason.
+serde_yaml_ng = "0.10"
+indexmap = { version = "2", features = ["serde"] }
+# Template engine for Taskfile variable interpolation. Go's text/template has no
+# stdlib-equivalent semantics; minijinja is the chosen engine. `custom_syntax`
+# lets the Go-mode renderer use sentinel block/comment delimiters so raw Jinja
+# syntax in a Taskfile string stays literal (matches Go text/template).
+minijinja = { version = "2", features = ["custom_syntax"] }
+# SemVer parsing/comparison for the Taskfile `version:` field (correctness-critical;
+# reimplementing risks subtle bugs). notify for `--watch` filesystem events (no
+# stdlib equivalent).
+semver = "1"
+notify = "8"
+# Zip archive format for the classic (non-OCI) remote build cache. No stdlib zip.
+zip = "2"
+# Redis client for the distributed `cache.lock` backend (SET NX EX + heartbeat).
+# No stdlib equivalent; tokio async to match the engine runtime.
+redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
+# Regular expressions for the sprig `regexReplaceAll` template helper (Go's RE2
+# syntax maps directly onto the regex crate). No stdlib regex; already present
+# in the build graph via brush.
+regex = "1"
+# CLI argument parsing for the `task` binary. clap earns its place: task's flag
+# set is large and needs POSIX-style parsing, env fallbacks, and completion gen.
+clap = { version = "4", features = ["derive", "env", "string"] }
+# Content-defined chunking + content addressing + per-chunk/index compression
+# of the dedup cache format. Kept in step with virtkit's pins (the eventual
+# merge target). No stdlib equivalent; the chunk boundaries and the
+# compressed/hashed bytes are part of the on-registry format.
+fastcdc = "4"
+zstd = "0.13"
+sha2 = "0.11"
+# Fast non-cryptographic hashing (xxHash3) for the file-content fingerprint and
+# task-identity hashes — the cache hot path. Not security-sensitive; matches the
+# Go original's xxh3 choice. (The OCI CAS keeps sha2 — registry digests are
+# spec-mandated.)
+twox-hash = "2"
+# OCI registry transport for the dedup cache. Backends wired directly (reqwest
+# rustls+ring, jsonwebtoken rust_crypto) so a single crypto provider is linked
+# and the binary can stay musl-static — mirrors virtkit's registry stack. The
+# `task` binary installs the ring provider at startup.
+oci-client = { version = "0.17", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "query", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+tokio = { version = "1" }

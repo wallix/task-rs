@@ -1,0 +1,8 @@
+# Pin the toolchain so every developer and CI build with the same compiler.
+# The musl target is kept available for the static-binary release path (build.sh);
+# the default `cargo build` targets the host (see the note in README/build.sh).
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-unknown-linux-musl"]
+profile = "minimal"

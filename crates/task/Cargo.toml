@@ -1,0 +1,22 @@
+[package]
+name = "task"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "task"
+path = "src/main.rs"
+
+[dependencies]
+taskcore = { path = "../taskcore" }
+clap = { workspace = true }
+rustls = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

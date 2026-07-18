@@ -1,0 +1,43 @@
+version: '3'
+
+tasks:
+  default:
+    - task: missing-var
+
+  missing-var:
+    requires:
+      vars:
+        - FOO
+    cmd: echo "{{.FOO}}"
+
+  var-defined-in-task:
+    vars:
+      FOO: bar
+    requires:
+      vars:
+        - FOO
+    cmd: echo "{{.FOO}}"
+
+  validation-var-dynamic:
+    vars:
+      FOO:
+        sh: echo "one"
+    requires:
+      vars:
+        - name: FOO
+          enum: ['one', 'two']
+
+  validation-var:
+    requires:
+      vars:
+        - ENV
+        - name: FOO
+          enum: ['one', 'two']
+
+  require-before-compile:
+    requires:
+      vars: [ MY_VAR ]
+    cmd: |
+      {{range .MY_VAR | splitList " " }}
+        echo {{.}}
+      {{end}}

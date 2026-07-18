@@ -1,0 +1,16 @@
+name: CI
+
+# Quality checks on every push to main and every pull request. Tag pushes are
+# excluded (branches: main matches branches, not tags) — release.yml calls the
+# same quality.yml checks as a gate before publishing, so a tag build does not
+# double-run them here.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  quality:
+    uses: ./.github/workflows/quality.yml

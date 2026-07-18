@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "title": "Taskrc YAML Schema",
+  "description": "Schema for .taskrc files.",
+  "type": "object",
+  "properties": {
+    "verbose": {
+      "type": "boolean",
+      "description": "Enable verbose output"
+    },
+    "silent": {
+      "type": "boolean",
+      "description": "Disables echoing",
+      "default": false
+    },
+    "color": {
+      "type": "boolean",
+      "description": "Enable colored output"
+    },
+    "disable-fuzzy": {
+      "type": "boolean",
+      "description": "Disable fuzzy matching for task names"
+    },
+    "concurrency": {
+      "type": "integer",
+      "description": "Number of concurrent tasks to run",
+      "minimum": 1
+    },
+    "failfast": {
+      "description": "When running tasks in parallel, stop all tasks if one fails.",
+      "type": "boolean",
+      "default": false
+    },
+    "interactive": {
+      "description": "Prompt for missing required variables instead of failing. Requires a TTY.",
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "additionalProperties": false
+}

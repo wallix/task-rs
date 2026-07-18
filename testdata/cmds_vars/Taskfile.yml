@@ -1,0 +1,8 @@
+version: '3'
+
+tasks:
+  build-checksum:
+    sources:
+      - ./source.txt
+    cmds:
+      - echo "{{.CHECKSUM}}"
