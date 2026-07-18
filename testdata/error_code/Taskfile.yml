@@ -1,0 +1,10 @@
+version: '3'
+
+tasks:
+  direct:
+    cmds:
+      - exit 42
+
+  indirect:
+    cmds:
+      - task: direct

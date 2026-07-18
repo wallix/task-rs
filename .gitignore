@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target
+
+# task's own cache dir and release output
+.task
+dist/
+
+.DS_Store
+
+# editors
+.idea/
+.vscode/settings.json
+.fleet/
+
+# exuberant ctags
+tags
+
+/testdata/vars/v1
+/tmp

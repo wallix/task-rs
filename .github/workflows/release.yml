@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # Create the GitHub release once, with notes taken from the matching
+  # CHANGELOG.md section (e.g. `## v4.0.0` for tag `v4.0.0`).
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          changelog: CHANGELOG.md
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Build, package, checksum, and upload one archive per platform. Native
+  # runners for macOS/Windows; linux aarch64 cross-compiles via `cross`.
+  upload-assets:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: windows-x86_64
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            name: windows-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      # Install cross from a prebuilt binary for the target that needs it.
+      # This avoids `cargo install cross`, which would build from source under
+      # our pinned rust-toolchain.toml (toolchain-override warning) and resolve
+      # cross's own lockfile (yanked-dependency warning). upload-rust-binary-action
+      # reuses the cross already on PATH.
+      - if: contains(matrix.target, 'aarch64-unknown-linux')
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: task
+          target: ${{ matrix.target }}
+          # task-<os>-<arch>.tar.gz (.zip on Windows), containing the binary
+          # plus these files.
+          archive: task-${{ matrix.name }}
+          include: README.md,LICENSE,crates/task/completion
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,45 @@
+[package]
+name = "taskcore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+# The task runner library: Taskfile parsing, templating, shell execution,
+# variable compilation, the execution engine (DAG scheduling, caching, watch),
+# and the supporting utilities. The `task` binary is a thin CLI over this crate.
+
+[dependencies]
+ocicas = { path = "../ocicas" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+indexmap = { workspace = true }
+twox-hash = { workspace = true }
+zip = { workspace = true }
+regex = { workspace = true }
+redis = { workspace = true }
+minijinja = { workspace = true }
+semver = { workspace = true }
+notify = { workspace = true }
+brush-core = "0.5.0"
+brush-parser = "0.4.0"
+# brush-core ships the shell interpreter but no builtins; brush-builtins
+# provides the default bash-compatible builtin set (echo, set, shopt, cd, …)
+# that the interpreter needs to run Taskfile command strings.
+brush-builtins = "0.2.0"
+tokio = { workspace = true, features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "process",
+    "sync",
+    "time",
+    "fs",
+] }
+
+[lints]
+workspace = true

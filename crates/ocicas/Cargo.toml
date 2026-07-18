@@ -1,0 +1,26 @@
+[package]
+name = "ocicas"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+# Content-addressable store with content-defined-chunk deduplication, backed by an
+# OCI registry, plus the vk-registry HTTP lock client. Vendored from virtkit
+# (vk-driver/src/registry.rs) and decoupled from its microVM specifics so `task`
+# can share it; intended to be unified back into a single shared crate later.
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+fastcdc.workspace = true
+zstd.workspace = true
+sha2.workspace = true
+oci-client.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util", "time"] }
+
+[lints]
+workspace = true

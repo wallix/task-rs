@@ -1,0 +1,7 @@
+version: '3'
+
+tasks:
+  whereami:
+    cmds:
+      - pwd
+    silent: true

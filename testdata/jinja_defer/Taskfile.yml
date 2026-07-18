@@ -1,0 +1,9 @@
+version: '3'
+templater: jinja
+tasks:
+  default:
+    vars:
+      NAME: world
+    cmds:
+      - 'true'
+      - defer: 'echo "deferred hello {{ NAME | upper }}"'
