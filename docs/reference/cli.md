@@ -140,7 +140,9 @@ task buidl --disable-fuzzy
 
 #### `-F, --failfast`
 
-Stop executing dependencies as soon as one of them fails.
+Stop waiting for dependencies as soon as one of them fails, cancelling the
+rest. They have all started by then, so a cancelled sibling may leave partial
+side effects — see [Fail-fast dependencies](../guide.md#fail-fast-dependencies).
 
 - **Config equivalent**: [`failfast`](./config.md#failfast)
 - **Environment variable**: [`TASK_FAILFAST`](./environment.md#task-failfast)

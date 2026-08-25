@@ -9,7 +9,7 @@
 )]
 
 mod common;
-use common::{run, stage};
+use common::{empty_case_dir, run, stage};
 
 // Ports Go `TestDry`.
 #[test]
@@ -40,6 +40,104 @@ fn cyclic_dependency_errors() {
             .contains("Cyclic dependency detected: task-1 -> task-2 -> task-1"),
         "expected the cycle to be named, got: {}",
         o.combined()
+    );
+}
+
+// Above the ~400 a release build tolerated before dependencies were queued on
+// the runtime (a debug build managed ~30), so the depth guards the fix in either
+// profile. Kept just past that threshold on purpose: each of the two chain
+// tests writes and runs a Taskfile this long, and the cost is linear in it.
+const CHAIN_DEPTH: usize = 600;
+
+// Writes a Taskfile whose tasks form a `CHAIN_DEPTH`-long chain, linked either
+// through `deps:` or through a nested `task:` command — the two call sites that
+// queue a task on the runtime.
+fn write_chain(dir: &std::path::Path, nested: bool) {
+    let mut taskfile = String::from("version: '3'\n\ntasks:\n");
+    for i in 1..=CHAIN_DEPTH {
+        taskfile.push_str(&format!("  t{i}:\n"));
+        if i == CHAIN_DEPTH {
+            taskfile.push_str("    cmds: [\"true\"]\n");
+        } else if nested {
+            taskfile.push_str(&format!("    cmds:\n      - task: t{}\n", i + 1));
+        } else {
+            taskfile.push_str(&format!("    deps: [t{}]\n    cmds: [\"true\"]\n", i + 1));
+        }
+    }
+    std::fs::write(dir.join("Taskfile.yml"), taskfile).unwrap();
+}
+
+// A chain of dependencies used to nest one future per level and abort the
+// process; queued on the runtime, depth costs no stack.
+#[test]
+fn deep_dependency_chain_does_not_overflow_the_stack() {
+    let dir = empty_case_dir("deep_deps");
+    write_chain(&dir, false);
+
+    let o = run(&dir, &["t1"]);
+    // Removed before asserting, so a failure does not leave the tree behind.
+    let _ = std::fs::remove_dir_all(&dir);
+    // A stack overflow aborts, which the harness reports as -1.
+    assert!(
+        o.ok(),
+        "a {CHAIN_DEPTH}-deep dependency chain should run, got code {}: {}",
+        o.code,
+        o.combined()
+    );
+}
+
+// The same depth reached through nested `task:` commands rather than `deps:`.
+#[test]
+fn deep_nested_task_chain_does_not_overflow_the_stack() {
+    let dir = empty_case_dir("deep_cmds");
+    write_chain(&dir, true);
+
+    let o = run(&dir, &["t1"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        o.ok(),
+        "a {CHAIN_DEPTH}-deep chain of `task:` commands should run, got code {}: {}",
+        o.code,
+        o.combined()
+    );
+}
+
+// Failfast abandons the surviving siblings and waits for those aborts before the
+// error propagates, so they never reach the `echo` a full run prints.
+#[test]
+fn failfast_aborts_siblings_before_returning() {
+    let dir = stage("failfast/default");
+    let o = run(&dir, &["--failfast", "default"]);
+    assert_eq!(o.code, 201, "expected a task failure: {}", o.combined());
+    assert!(
+        o.stdout.trim().is_empty(),
+        "the aborted siblings should print nothing, got: {:?}",
+        o.stdout
+    );
+
+    // Without it, the same fixture runs every sibling to completion.
+    let dir = stage("failfast/default");
+    let o = run(&dir, &["default"]);
+    assert_eq!(o.code, 201, "expected a task failure: {}", o.combined());
+    for dep in ["dep1", "dep2", "dep3"] {
+        assert!(
+            o.stdout.contains(dep),
+            "{dep} should have finished without failfast, got: {:?}",
+            o.stdout
+        );
+    }
+}
+
+// The task-level `failfast: true` takes the same path as the flag.
+#[test]
+fn task_level_failfast_aborts_siblings() {
+    let dir = stage("failfast/task");
+    let o = run(&dir, &["default"]);
+    assert_eq!(o.code, 201, "expected a task failure: {}", o.combined());
+    assert!(
+        o.stdout.trim().is_empty(),
+        "the aborted siblings should print nothing, got: {:?}",
+        o.stdout
     );
 }
 

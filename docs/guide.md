@@ -609,8 +609,8 @@ tasks:
 ### Fail-fast dependencies
 
 By default, Task waits for all dependencies to finish running before continuing.
-If you want Task to stop executing further dependencies as soon as one fails,
-you can set `failfast: true` on a specific task:
+If you want Task to stop waiting for the remaining dependencies as soon as one
+fails, you can set `failfast: true` on a specific task:
 
 ```yaml
 # Taskfile.yml
@@ -623,6 +623,12 @@ tasks:
 ```
 
 Alternatively, you can use `--failfast`, which also work for `--parallel`.
+
+Dependencies all start together, so `failfast` stops Task *waiting* for the
+rest and cancels them rather than preventing them from starting: a sibling may
+already have run part of its commands and left their side effects behind. A
+command that has already been handed to the shell is not killed, so a
+long-running process one started keeps going after Task exits.
 
 ## Platform specific tasks and commands
 

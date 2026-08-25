@@ -88,11 +88,111 @@ impl CallPath {
     }
 }
 
+/// Bookkeeping for the tasks this executor has queued on the runtime.
+///
+/// The runtime owns the queued futures, so abandoning one — a sibling dropped
+/// after a failfast error, or a whole subtree whose parent was abandoned — only
+/// *schedules* its cancellation. Counting live tasks lets
+/// [`Executor::drain_queue`] wait for those cancellations to actually run,
+/// while the runtime is still turning, so an abandoned task releases its lock
+/// and concurrency permit and starts no further command before the run
+/// returns. A command already handed to the shell is not killed: cancellation
+/// has never done that.
+#[derive(Default)]
+pub(crate) struct TaskQueue {
+    /// Tasks queued and not yet finished or cancelled.
+    live: std::cell::Cell<usize>,
+    /// Aborts for every task queued during this run.
+    aborts: std::cell::RefCell<Vec<tokio::task::AbortHandle>>,
+    /// Notified whenever a task finishes, so a drain can re-check `live`.
+    idle: tokio::sync::Notify,
+}
+
+/// Decrements the live count when a queued task ends, however it ends.
+struct LiveTask {
+    executor: Rc<Executor>,
+}
+
+impl Drop for LiveTask {
+    fn drop(&mut self) {
+        let live = &self.executor.queue.live;
+        debug_assert!(live.get() > 0, "a queued task was counted down twice");
+        live.set(live.get().saturating_sub(1));
+        self.executor.queue.idle.notify_waiters();
+    }
+}
+
+/// Unwraps a queued task's outcome, turning a cancellation into an error and
+/// re-raising a panic the way an inline await did.
+fn queued_result(
+    res: Result<Result<(), ExecutorError>, tokio::task::JoinError>,
+) -> Result<(), ExecutorError> {
+    match res {
+        Ok(result) => result,
+        Err(e) if e.is_cancelled() => Err(ExecutorError::Cancelled),
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
+
+/// A task queued on the runtime's local task set.
+///
+/// Dropping the handle aborts the task, so abandoning a sibling on the first
+/// failure cancels it exactly as dropping an inline future used to.
+#[must_use = "dropping a QueuedTask aborts the task it stands for"]
+struct QueuedTask {
+    handle: Option<tokio::task::JoinHandle<Result<(), ExecutorError>>>,
+}
+
+impl QueuedTask {
+    /// Waits for the task to finish. Dropping this future before it resolves
+    /// aborts the task.
+    async fn join(mut self) -> Result<(), ExecutorError> {
+        // Always `Some`: `spawn_task` is the only constructor, and the only
+        // other consumer is `Drop`. Reported as a cancellation rather than
+        // unwrapped, which the crate's lints forbid.
+        debug_assert!(self.handle.is_some(), "a queued task was joined twice");
+        let Some(handle) = self.handle.as_mut() else {
+            return Err(ExecutorError::Cancelled);
+        };
+        let res = handle.await;
+        // Finished, so there is nothing left for `Drop` to abort.
+        self.handle = None;
+        queued_result(res)
+    }
+}
+
+impl Drop for QueuedTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 impl Executor {
     /// Runs the given calls. Existence and internal checks run first, then a
     /// dry summary if requested, otherwise the calls are executed (in parallel
     /// when `parallel` is set). Ports Go `Run`.
+    ///
+    /// # Panics
+    ///
+    /// Must be awaited inside a [`tokio::task::LocalSet`]: dependencies, setup
+    /// tasks and nested `task:` commands are queued with `spawn_local`, which
+    /// panics outside one.
+    ///
+    /// One run at a time per executor: the queue is shared, so a concurrent run
+    /// on the same executor would tear this one's tasks down with its own.
     pub async fn run(self: &Rc<Self>, calls: &[Call]) -> Result<(), ExecutorError> {
+        let result = self.run_calls(calls).await;
+        // However the run ended, nothing queued may outlive it.
+        self.drain_queue().await;
+        result
+    }
+
+    /// The body of [`Self::run`], wrapped so the queue is drained on both the
+    /// success and the error exit. A panic unwinds past the drain, taking the
+    /// process with it.
+    async fn run_calls(self: &Rc<Self>, calls: &[Call]) -> Result<(), ExecutorError> {
         // Validate that every requested task exists and is not internal.
         for call in calls {
             let task = self.get_task(call)?;
@@ -138,11 +238,11 @@ impl Executor {
     /// bounded by the run-once dedup and the concurrency limiter inside
     /// `run_task`.
     async fn run_parallel(self: &Rc<Self>, calls: &[Call]) -> Result<(), ExecutorError> {
-        let mut futures = Vec::with_capacity(calls.len());
+        let mut tasks = Vec::with_capacity(calls.len());
         for call in calls {
-            futures.push(self.run_task_boxed(call.clone(), None));
+            tasks.push(self.spawn_task(call.clone(), None));
         }
-        join_all_failfast(futures, self.failfast).await
+        join_queued(tasks, self.failfast).await
     }
 
     fn split_regular_and_watch(
@@ -321,20 +421,80 @@ impl Executor {
         Ok(result?)
     }
 
-    /// Runs a task as a boxed future. Recursive call sites (deps, setup, cmd
-    /// subtasks) use this to break the `async fn` recursion cycle, which the
-    /// compiler cannot size otherwise.
-    pub(crate) fn run_task_boxed(
-        self: &Rc<Self>,
-        call: Call,
-        ancestors: Ancestors,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ExecutorError>> + '_>> {
+    /// Queues a task on the runtime's local task set and returns its handle.
+    ///
+    /// Recursive call sites (deps, setup, cmd subtasks) go through this instead
+    /// of awaiting the child inline: the child is polled by the runtime, not
+    /// from within its parent's poll, so the stack no longer grows with the
+    /// depth of the dependency tree.
+    fn spawn_task(self: &Rc<Self>, call: Call, ancestors: Ancestors) -> QueuedTask {
         let this = Rc::clone(self);
-        Box::pin(async move { this.run_task_on(call, ancestors).await })
+        // Counted up and handed to the task in one step: the guard is what
+        // counts it back down, however the task ends.
+        self.queue.live.set(self.queue.live.get().saturating_add(1));
+        let live = LiveTask {
+            executor: Rc::clone(self),
+        };
+        // Type-erased so the recursion — a task queueing its own dependencies —
+        // stays a finite type for the compiler.
+        let task: std::pin::Pin<Box<dyn std::future::Future<Output = _>>> = Box::pin(async move {
+            // Held for the task's whole life, including a cancellation.
+            let _live = live;
+            this.run_task_on(call, ancestors).await
+        });
+        let handle = tokio::task::spawn_local(task);
+        {
+            let mut aborts = self.queue.aborts.borrow_mut();
+            // A watch session queues tasks for as long as it runs, so drop the
+            // finished handles once they outnumber the live ones.
+            let live = self.queue.live.get();
+            if aborts.len() > live.saturating_mul(2).saturating_add(64) {
+                aborts.retain(|abort| !abort.is_finished());
+            }
+            aborts.push(handle.abort_handle());
+        }
+        QueuedTask {
+            handle: Some(handle),
+        }
+    }
+
+    /// Cancels everything still queued and waits for those cancellations to
+    /// run, so every abandoned task has released its lock and permit and will
+    /// start no further command by the time the run returns. A process the
+    /// shell has already started keeps running — nothing here kills it.
+    pub(crate) async fn drain_queue(&self) {
+        // Taken rather than iterated under a shared borrow: `abort()` is
+        // foreign code, and the other borrow of this cell is a `borrow_mut`.
+        let aborts = std::mem::take(&mut *self.queue.aborts.borrow_mut());
+        for abort in &aborts {
+            abort.abort();
+        }
+        while self.queue.live.get() > 0 {
+            // `notified()` only registers the waiter when it is first polled, so
+            // enable it explicitly before the re-check: a task finishing in
+            // between must not leave this waiting for a notification that has
+            // already been sent.
+            let mut idle = std::pin::pin!(self.queue.idle.notified());
+            idle.as_mut().enable();
+            if self.queue.live.get() == 0 {
+                break;
+            }
+            idle.await;
+        }
     }
 
     /// Runs a task by resolving it, checking preconditions/fingerprint/cache,
     /// running its dependencies, and executing its commands. Ports Go `RunTask`.
+    ///
+    /// # Panics
+    ///
+    /// Must be awaited inside a [`tokio::task::LocalSet`]: dependencies, setup
+    /// tasks and nested `task:` commands are queued with `spawn_local`, which
+    /// panics outside one.
+    ///
+    /// Unlike [`Self::run`] this does not drain the queue, so a caller that
+    /// keeps the executor alive across calls — the watch loop — has to call
+    /// [`Self::drain_queue`] itself once the call returns.
     pub async fn run_task(self: &Rc<Self>, call: Call) -> Result<(), ExecutorError> {
         self.run_task_on(call, None).await
     }
@@ -397,11 +557,12 @@ impl Executor {
         // A task already running on this path with the same compiled body
         // depends on itself and will keep doing so. Reported here rather than
         // left to the call counter below, which only trips after a thousand
-        // calls — long after the nested futures overflow the stack.
+        // calls — a thousand pointless task compilations, and a cycle reported
+        // as "called too many times".
         //
         // It has to run before `execute`, because `run_setup` runs before the
-        // up-to-date check and a cycle closed through `setup:` would recurse
-        // forever otherwise. The cost is that nothing `execute` would have
+        // up-to-date check and a cycle closed through `setup:` would never
+        // terminate otherwise. The cost is that nothing `execute` would have
         // short-circuited on can be seen from here — see CHANGELOG.md.
         //
         // The reported name is `full_name`, the name with wildcards
@@ -724,8 +885,8 @@ impl Executor {
         }
     }
 
-    /// Runs setup tasks sequentially and unconditionally, releasing the
-    /// concurrency slot while they run. Ports Go `runSetup`.
+    /// Runs setup tasks sequentially and unconditionally. Ports Go `runSetup`.
+    /// Holds no concurrency slot: one is taken only around a command.
     async fn run_setup(
         self: &Rc<Self>,
         t: &Task,
@@ -738,7 +899,7 @@ impl Executor {
                 silent: d.silent,
                 indirect: true,
             };
-            self.run_task_boxed(call, ancestors.clone()).await?;
+            self.spawn_task(call, ancestors.clone()).join().await?;
         }
         Ok(())
     }
@@ -750,7 +911,7 @@ impl Executor {
         t: &Task,
         ancestors: &Ancestors,
     ) -> Result<(), ExecutorError> {
-        let mut futures = Vec::with_capacity(t.deps.len());
+        let mut tasks = Vec::with_capacity(t.deps.len());
         for d in &t.deps {
             let call = Call {
                 task: d.task.clone(),
@@ -758,9 +919,9 @@ impl Executor {
                 silent: d.silent,
                 indirect: true,
             };
-            futures.push(self.run_task_boxed(call, ancestors.clone()));
+            tasks.push(self.spawn_task(call, ancestors.clone()));
         }
-        join_all_failfast(futures, self.failfast || t.failfast).await
+        join_queued(tasks, self.failfast || t.failfast).await
     }
 
     /// Runs a single deferred command. Deferred commands are left un-templated
@@ -848,7 +1009,7 @@ impl Executor {
                 silent: cmd.silent,
                 indirect: true,
             };
-            let result = self.run_task_boxed(sub, ancestors.clone()).await;
+            let result = self.spawn_task(sub, ancestors.clone()).join().await;
             if let Err(ExecutorError::TaskRun { source, .. }) = &result
                 && matches!(
                     &**source,
@@ -1285,56 +1446,93 @@ fn unwrap_arc(err: Arc<ExecutorError>) -> ExecutorError {
     }
 }
 
-/// Drives a set of `!Send` futures concurrently on the current-thread runtime.
-/// With failfast, returns as soon as one errors (dropping the rest); otherwise
-/// runs all and returns the first error. Ports the `errgroup` used by Go
+/// Joins a set of queued tasks. With failfast, returns as soon as one errors,
+/// aborting the rest and waiting for those aborts to run — for the siblings
+/// themselves; their own subtrees are cancelled transitively, and only
+/// [`Executor::drain_queue`] waits for those. Otherwise waits for all of them
+/// and returns the first error. Ports the `errgroup` used by Go
 /// `runDeps`/`Run`.
-async fn join_all_failfast<F>(futures: Vec<F>, failfast: bool) -> Result<(), ExecutorError>
-where
-    F: std::future::Future<Output = Result<(), ExecutorError>>,
-{
+async fn join_queued(tasks: Vec<QueuedTask>, failfast: bool) -> Result<(), ExecutorError> {
     use std::future::poll_fn;
     use std::pin::Pin;
     use std::task::Poll;
 
-    let mut pending: Vec<Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut pending = tasks;
     if pending.is_empty() {
         return Ok(());
     }
 
     let mut first_err: Option<ExecutorError> = None;
+    let mut fatal: Option<ExecutorError> = None;
     poll_fn(|cx| {
         let mut i = 0;
         while i < pending.len() {
-            if let Some(fut) = pending.get_mut(i) {
-                match fut.as_mut().poll(cx) {
-                    Poll::Ready(res) => {
-                        pending.remove(i);
-                        if let Err(e) = res {
-                            if failfast {
-                                return Poll::Ready(Err(e));
-                            }
-                            if first_err.is_none() {
-                                first_err = Some(e);
-                            }
-                        }
-                        continue;
-                    }
-                    Poll::Pending => {
-                        i = i.saturating_add(1);
-                    }
-                }
-            } else {
+            let Some(task) = pending.get_mut(i) else {
                 break;
+            };
+            // Always `Some` here: a handle is only taken below, after which
+            // the task has already left `pending`.
+            let Some(handle) = task.handle.as_mut() else {
+                debug_assert!(false, "a queued task lost its handle while pending");
+                drop(pending.remove(i));
+                continue;
+            };
+            match Pin::new(handle).poll(cx) {
+                Poll::Ready(res) => {
+                    // Dropped with its handle: aborting a task that has already
+                    // finished is a no-op.
+                    drop(pending.remove(i));
+                    if let Err(e) = queued_result(res) {
+                        if failfast {
+                            fatal = Some(e);
+                            return Poll::Ready(());
+                        }
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                    continue;
+                }
+                Poll::Pending => {
+                    i = i.saturating_add(1);
+                }
             }
         }
         if pending.is_empty() {
-            Poll::Ready(Ok(()))
+            Poll::Ready(())
         } else {
             Poll::Pending
         }
     })
-    .await?;
+    .await;
+
+    if let Some(e) = fatal {
+        // Cancel the siblings and wait for it: aborting only schedules the
+        // cancellation, and returning before it runs would let them start
+        // further commands, which dropping an inline future never did. A
+        // command already handed to the shell still runs to completion. Their
+        // own subtrees are cancelled with them but drained by `drain_queue`,
+        // not here.
+        for task in &pending {
+            if let Some(handle) = task.handle.as_ref() {
+                handle.abort();
+            }
+        }
+        for mut task in pending {
+            if let Some(handle) = task.handle.as_mut() {
+                // A cancelled sibling is expected, and its error is discarded in
+                // favor of the one that cancelled it. A *panicking* sibling is a
+                // bug, and must not be hidden behind that error.
+                if let Err(join_err) = handle.await
+                    && !join_err.is_cancelled()
+                {
+                    std::panic::resume_unwind(join_err.into_panic());
+                }
+            }
+            task.handle = None;
+        }
+        return Err(e);
+    }
 
     match first_err {
         Some(e) => Err(e),

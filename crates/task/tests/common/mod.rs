@@ -27,8 +27,8 @@ pub fn testdata(case: &str) -> PathBuf {
         .join(case)
 }
 
-/// Copies `testdata/<case>` into a fresh temp directory and returns its path.
-pub fn stage(case: &str) -> PathBuf {
+/// A fresh temp directory for `case`, emptied if a previous run left one.
+fn temp_case_dir(case: &str) -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let dst = std::env::temp_dir().join(format!(
         "task-bt-{}-{}-{}",
@@ -37,7 +37,25 @@ pub fn stage(case: &str) -> PathBuf {
         case.replace('/', "_")
     ));
     let _ = std::fs::remove_dir_all(&dst);
+    dst
+}
+
+/// Copies `testdata/<case>` into a fresh temp directory and returns its path.
+pub fn stage(case: &str) -> PathBuf {
+    let dst = temp_case_dir(case);
     copy_dir(&testdata(case), &dst);
+    dst
+}
+
+/// An empty temp directory, for a test that generates its own Taskfile. Shares
+/// `stage`'s naming and counter, so the two can never collide.
+///
+/// Named for the case, not for the Taskfile — `misc.rs` has its own `scratch`
+/// taking the Taskfile body, and the two would otherwise be indistinguishable
+/// at a call site.
+pub fn empty_case_dir(case: &str) -> PathBuf {
+    let dst = temp_case_dir(case);
+    std::fs::create_dir_all(&dst).unwrap();
     dst
 }
 

@@ -19,6 +19,12 @@ impl Executor {
     /// the given tasks and their dependencies to `zip_path`. Setup tasks run
     /// first so their outputs exist. Skips writing when an identical archive
     /// already exists. Ports Go `ExportCache`.
+    ///
+    /// # Panics
+    ///
+    /// Must be awaited inside a [`tokio::task::LocalSet`]: dependencies, setup
+    /// tasks and nested `task:` commands are queued with `spawn_local`, which
+    /// panics outside one.
     pub async fn export_cache(
         self: &Rc<Self>,
         zip_path: &Path,
@@ -60,6 +66,12 @@ impl Executor {
     /// Restores files from an archive created by [`Executor::export_cache`],
     /// then runs setup tasks so preparation steps are applied. Ports Go
     /// `ImportCache`.
+    ///
+    /// # Panics
+    ///
+    /// Must be awaited inside a [`tokio::task::LocalSet`]: dependencies, setup
+    /// tasks and nested `task:` commands are queued with `spawn_local`, which
+    /// panics outside one.
     pub async fn import_cache(
         self: &Rc<Self>,
         zip_path: &Path,

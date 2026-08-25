@@ -14,7 +14,16 @@
 //! (`Rc`-based, matching their reference counterparts), the engine runs on a
 //! current-thread runtime and schedules concurrent work with
 //! [`tokio::task::LocalSet`]/`spawn_local` rather than the multi-thread
-//! scheduler. The CLI drives the async methods inside a `LocalSet`.
+//! scheduler. The CLI drives the async methods inside a `LocalSet`, which
+//! [`Executor::run`] and [`Executor::run_task`] therefore require.
+//!
+//! Every dependency, setup task, and nested `task:` command is queued on that
+//! local set rather than awaited inside its parent, so the runtime polls each
+//! one directly and the stack does not grow with the depth of the dependency
+//! tree. [`Executor::run`] drains whatever it still has queued before
+//! returning, so no abandoned task keeps touching engine state afterwards; the
+//! lower-level [`Executor::run_task`], [`Executor::import_cache`] and
+//! [`Executor::export_cache`] leave that to their caller's `LocalSet`.
 //!
 //! Shared engine state lives behind [`std::rc::Rc`] with per-field interior
 //! mutability ([`RefCell`]/[`tokio::sync::Mutex`]). The concurrency cap is a
@@ -168,6 +177,9 @@ pub struct Executor {
     pub(crate) mkdir_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Deduplicates concurrent executions of the same task hash.
     pub(crate) run_once: Mutex<HashMap<String, Arc<OnceCell<RunOnceResult>>>>,
+    /// Tracks the tasks queued on the runtime so an abandoned run can tear them
+    /// down instead of leaving their commands behind.
+    pub(crate) queue: run::TaskQueue,
 }
 
 impl Default for Executor {
@@ -214,6 +226,7 @@ impl Default for Executor {
             task_call_count: RefCell::new(HashMap::new()),
             mkdir_locks: Mutex::new(HashMap::new()),
             run_once: Mutex::new(HashMap::new()),
+            queue: run::TaskQueue::default(),
         }
     }
 }

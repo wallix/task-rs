@@ -112,8 +112,15 @@ impl Executor {
     }
 
     /// Runs one watched task, logging completion or a non-cancellation error.
+    ///
+    /// Drains the queue afterwards, as `run` does for a one-shot invocation:
+    /// the watch loop then blocks the runtime thread waiting for the next
+    /// event, so anything left cancelled-but-not-dropped would hold its lock
+    /// and concurrency permit until that event arrived.
     async fn run_watch_call(self: &Rc<Self>, call: &Call) {
-        match self.run_task(call.clone()).await {
+        let result = self.run_task(call.clone()).await;
+        self.drain_queue().await;
+        match result {
             Ok(()) => {
                 self.logger().borrow_mut().errf(
                     Color::Green,

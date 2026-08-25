@@ -21,6 +21,13 @@
   instead of running until the process ran out of stack. A task that reaches
   itself is rejected: calling itself with different `vars:` still works, but
   recursion driven by state outside the Taskfile no longer does.
+- **Deep dependency trees no longer crash the runner.** Thousands of levels
+  run; a runaway recursion stops with an error instead.
+- **Tasks start in a different order**, so interleaved output can differ.
+  `--output group` and `prefixed` still keep each task's output together.
+- **A failing dependency no longer stops its siblings starting.** Under
+  `--failfast` they all start and are cancelled when one fails, so a cancelled
+  sibling may leave partial work behind.
 
 ## v4.0.0 - 2026-08-24
 
