@@ -1,0 +1,107 @@
+version: '3'
+
+includes:
+  sub: sub.yml
+  one: one.yml
+  two: two.yml
+
+tasks:
+  # A three-task cycle: long enough that the reported path is only right if it
+  # is ordered outermost first.
+  c-1:
+    cmds:
+      - task: c-2
+  c-2:
+    cmds:
+      - task: c-3
+  c-3:
+    cmds:
+      - task: c-1
+
+  # A cycle closed through `setup:` rather than through a command.
+  s-1:
+    setup:
+      - s-2
+    cmds:
+      - "true"
+  s-2:
+    setup:
+      - s-1
+    cmds:
+      - "true"
+
+  # A cycle that leaves the root Taskfile and comes back through an include.
+  i-1:
+    cmds:
+      - task: sub:i-2
+
+  # Two tasks sharing a short name in different namespaces: distinct identities,
+  # so one calling the other is a chain, not a repeat.
+  names:
+    cmds:
+      - task: one:build
+
+  # Two tasks that list each other under `deps:` and expand their `sources:`
+  # from those deps: the cycle is closed during compilation, before the call
+  # path exists, so it needs its own guard.
+  g-1:
+    deps: [g-2]
+    sources:
+      - from: deps
+    cmds:
+      - echo "g-1"
+  g-2:
+    deps: [g-1]
+    sources:
+      - from: deps
+    cmds:
+      - echo "g-2"
+
+  # A diamond: `shared` is reached from both branches, `base` from both setups.
+  # Reached twice on separate paths is not a repeat on one path.
+  top:
+    setup:
+      - left
+      - right
+    cmds:
+      - echo "top"
+
+  # The same diamond through `deps:`, which run in parallel: each branch has to
+  # get its own copy of the path, or one sibling would see the other's tasks.
+  p-top:
+    deps:
+      - p-left
+      - p-right
+    cmds:
+      - echo "p-top"
+  p-left:
+    deps:
+      - p-shared
+    cmds:
+      - echo "p-left"
+  p-right:
+    deps:
+      - p-shared
+    cmds:
+      - echo "p-right"
+  p-shared:
+    cmds:
+      - echo "p-shared"
+  left:
+    setup:
+      - shared
+    cmds:
+      - echo "left"
+  right:
+    setup:
+      - shared
+    cmds:
+      - echo "right"
+  shared:
+    setup:
+      - base
+    cmds:
+      - echo "shared"
+  base:
+    cmds:
+      - echo "base"

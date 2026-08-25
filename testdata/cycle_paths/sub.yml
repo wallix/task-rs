@@ -1,0 +1,6 @@
+version: '3'
+
+tasks:
+  i-2:
+    cmds:
+      - task: :i-1

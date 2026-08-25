@@ -1,0 +1,30 @@
+version: '3'
+
+# Two tasks expanding `sources: [{from: deps}]` over the *same* dep. Compiling
+# that dep evaluates an `sh:` var, which yields, so the two expansions
+# interleave. Nothing here is cyclic.
+tasks:
+  top:
+    deps: [b, c]
+    cmds:
+      - echo "top"
+  b:
+    deps: [common]
+    sources:
+      - from: deps
+    cmds:
+      - echo "b"
+  c:
+    deps: [common]
+    sources:
+      - from: deps
+    cmds:
+      - echo "c"
+  common:
+    vars:
+      SLOW:
+        sh: 'sleep 0.3; echo slow'
+    sources:
+      - f.txt
+    cmds:
+      - echo "common {{.SLOW}}"

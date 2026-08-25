@@ -34,6 +34,60 @@ pub struct MatchingTask<'a> {
     pub wildcards: Vec<String>,
 }
 
+/// The tasks running above a call on its dependency path, innermost first —
+/// which is why [`CallPath::to_path_through`] reverses before reporting. `None`
+/// is an invocation from the command line, which has none.
+pub(crate) type Ancestors = Option<Rc<CallPath>>;
+
+/// One task on a dependency path, linked to the task that depends on it. Levels
+/// share their parents, so extending a path is a single allocation and a lookup
+/// walks at most its length.
+///
+/// A level carries two strings because the thing that identifies a repeat is
+/// not the thing worth reporting: `key` is the resolved name plus a digest of
+/// the compiled task, `name` is what the cycle is printed as.
+pub(crate) struct CallPath {
+    key: String,
+    name: String,
+    parent: Ancestors,
+}
+
+impl CallPath {
+    /// The path with a level appended, for handing to that task's own callees.
+    fn extend(path: &Ancestors, key: &str, name: &str) -> Rc<Self> {
+        Rc::new(Self {
+            key: key.to_string(),
+            name: name.to_string(),
+            parent: path.clone(),
+        })
+    }
+
+    /// Reports whether a task with this key is already running on this path.
+    fn contains(&self, key: &str) -> bool {
+        let mut node = Some(self);
+        while let Some(cur) = node {
+            if cur.key == key {
+                return true;
+            }
+            node = cur.parent.as_deref();
+        }
+        false
+    }
+
+    /// This path with `task` appended, outermost task first — the cycle to
+    /// report, ending with the repeat that closes it.
+    fn to_path_through(&self, task: &str) -> Vec<String> {
+        let mut names = vec![task.to_string()];
+        let mut node = Some(self);
+        while let Some(cur) = node {
+            names.push(cur.name.clone());
+            node = cur.parent.as_deref();
+        }
+        names.reverse();
+        names
+    }
+}
+
 impl Executor {
     /// Runs the given calls. Existence and internal checks run first, then a
     /// dry summary if requested, otherwise the calls are executed (in parallel
@@ -86,7 +140,7 @@ impl Executor {
     async fn run_parallel(self: &Rc<Self>, calls: &[Call]) -> Result<(), ExecutorError> {
         let mut futures = Vec::with_capacity(calls.len());
         for call in calls {
-            futures.push(self.run_task_boxed(call.clone()));
+            futures.push(self.run_task_boxed(call.clone(), None));
         }
         join_all_failfast(futures, self.failfast).await
     }
@@ -195,6 +249,25 @@ impl Executor {
         call: &Call,
         evaluate_sh_vars: bool,
     ) -> Result<Task, ExecutorError> {
+        let resolver = GlobResolver {
+            exec: self,
+            // Seeded with this task, so a cycle reads from the task whose globs
+            // started the expansion and a task whose `from:` reaches itself is
+            // caught on the first hop.
+            above: Some(CallPath::extend(&None, &call.task, &call.task)),
+        };
+        self.compiled_task_with(call, evaluate_sh_vars, &resolver)
+            .await
+    }
+
+    /// The body of [`Self::compiled_task_inner`], taking the resolver that
+    /// expands `from:` globs so a nested expansion can hand down its own path.
+    async fn compiled_task_with(
+        &self,
+        call: &Call,
+        evaluate_sh_vars: bool,
+        resolver: &dyn crate::variables::TaskResolver,
+    ) -> Result<Task, ExecutorError> {
         let (orig, wildcards) = self.get_task_with_match(call)?;
 
         // Inject the captured wildcards as the MATCH variable.
@@ -241,7 +314,7 @@ impl Executor {
             &ctx,
             &compiler,
             &mut scratch,
-            Some(self as &dyn crate::variables::TaskResolver),
+            Some(resolver),
         )
         .await;
         self.flush_scratch(&sink);
@@ -254,14 +327,25 @@ impl Executor {
     pub(crate) fn run_task_boxed(
         self: &Rc<Self>,
         call: Call,
+        ancestors: Ancestors,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ExecutorError>> + '_>> {
         let this = Rc::clone(self);
-        Box::pin(async move { this.run_task(call).await })
+        Box::pin(async move { this.run_task_on(call, ancestors).await })
     }
 
     /// Runs a task by resolving it, checking preconditions/fingerprint/cache,
     /// running its dependencies, and executing its commands. Ports Go `RunTask`.
-    pub async fn run_task(self: &Rc<Self>, mut call: Call) -> Result<(), ExecutorError> {
+    pub async fn run_task(self: &Rc<Self>, call: Call) -> Result<(), ExecutorError> {
+        self.run_task_on(call, None).await
+    }
+
+    /// [`Self::run_task`] with the tasks already running above it on this
+    /// dependency path, used to detect a cycle before it can recurse.
+    pub(crate) async fn run_task_on(
+        self: &Rc<Self>,
+        mut call: Call,
+        ancestors: Ancestors,
+    ) -> Result<(), ExecutorError> {
         self.inject_prompted_vars(&mut call);
 
         let fast = self.fast_compiled_task(&call).await?;
@@ -310,7 +394,59 @@ impl Executor {
         requires::check_required_vars_set(&t)?;
         requires::check_allowed_values(&t)?;
 
-        // Guard against cyclic dependencies via a per-task call counter.
+        // A task already running on this path with the same compiled body
+        // depends on itself and will keep doing so. Reported here rather than
+        // left to the call counter below, which only trips after a thousand
+        // calls — long after the nested futures overflow the stack.
+        //
+        // It has to run before `execute`, because `run_setup` runs before the
+        // up-to-date check and a cycle closed through `setup:` would recurse
+        // forever otherwise. The cost is that nothing `execute` would have
+        // short-circuited on can be seen from here — see CHANGELOG.md.
+        //
+        // The reported name is `full_name`, the name with wildcards
+        // substituted; `t.task` for a wildcard task is the pattern, so `x-2`
+        // calling `x-1` would read as `x-*` reaching itself. Compilation always
+        // sets it — to the task key when nothing was substituted — so the
+        // fallback only covers a task that never went through compilation.
+        let name = if t.full_name.is_empty() {
+            t.task.as_str()
+        } else {
+            t.full_name.as_str()
+        };
+        // Matched on the name *and* a digest of the compiled task, so a task
+        // that calls itself with different vars — the countdown idiom, whose
+        // commands render differently each turn — makes progress rather than
+        // reading as a repeat. `crate::hash::hash` does not hash the vars field
+        // itself, but the compiled `cmds`/`dirs`/`sources` it does hash have
+        // the resolved values baked in.
+        //
+        // The digest only sees the compiled body, so recursion whose progress
+        // lives outside it — a counter in a file, read by `if:` or by a command
+        // — reads as a repeat and is rejected. Telling that apart from a real
+        // loop would mean running it, which is the thing being avoided.
+        //
+        // Hashing is infallible today; the fallback is defensive. Note it
+        // degrades towards *missing* a cycle, since a bare name never matches a
+        // `name\0digest` key from another level.
+        let key = match crate::hash::hash(&t) {
+            Ok(digest) => format!("{name}\0{digest}"),
+            Err(_) => name.to_string(),
+        };
+        if let Some(above) = &ancestors
+            && above.contains(&key)
+        {
+            return Err(ExecutorError::CyclicDependency {
+                path: above.to_path_through(name),
+            });
+        }
+        // The ancestor chain this task hands to everything it calls.
+        let callee_ancestors = Some(CallPath::extend(&ancestors, &key, name));
+
+        // Guard against a task being called too many times without repeating on
+        // any single path, via a per-task call counter. Keyed by `t.task`, the
+        // pattern rather than the resolved name, on purpose: a thousand
+        // instances of one wildcard pattern are the fan-out this guards.
         if !self.watch {
             let mut counts = self.task_call_count.borrow_mut();
             let count = counts.entry(t.task.clone()).or_insert(0);
@@ -322,7 +458,7 @@ impl Executor {
             }
         }
 
-        let result = self.start_execution(&t, &call).await;
+        let result = self.start_execution(&t, &call, callee_ancestors).await;
         result.map_err(|source| ExecutorError::TaskRun {
             task_name: t.name().to_string(),
             source: Box::new(unwrap_arc(source)),
@@ -332,10 +468,15 @@ impl Executor {
     /// Deduplicates concurrent executions of the same task hash: the first
     /// caller runs the task while later callers await its result. Ports Go
     /// `startExecution` + its `sync.Once`-style execution-hash map.
-    async fn start_execution(self: &Rc<Self>, t: &Task, call: &Call) -> RunOnceResult {
+    async fn start_execution(
+        self: &Rc<Self>,
+        t: &Task,
+        call: &Call,
+        ancestors: Ancestors,
+    ) -> RunOnceResult {
         let h = self.task_hash(t);
         if h.is_empty() || t.watch {
-            return self.execute(t, call).await.map_err(Arc::new);
+            return self.execute(t, call, ancestors).await.map_err(Arc::new);
         }
 
         let cell = {
@@ -348,7 +489,7 @@ impl Executor {
         // The first caller runs the task; concurrent callers await the same
         // result via the shared cell.
         let result = cell
-            .get_or_init(|| async { self.execute(t, call).await.map_err(Arc::new) })
+            .get_or_init(|| async { self.execute(t, call, ancestors).await.map_err(Arc::new) })
             .await;
         result.clone()
     }
@@ -374,12 +515,17 @@ impl Executor {
     /// The core task execution body run once per dedup hash: fingerprint/cache
     /// short-circuit, deps, then commands. Ports the closure passed to Go
     /// `startExecution`.
-    async fn execute(self: &Rc<Self>, t: &Task, call: &Call) -> Result<(), ExecutorError> {
+    async fn execute(
+        self: &Rc<Self>,
+        t: &Task,
+        call: &Call,
+        ancestors: Ancestors,
+    ) -> Result<(), ExecutorError> {
         self.logger()
             .borrow_mut()
             .verbose_errf(Color::Magenta, &format!("task: {:?} started\n", call.task));
 
-        self.run_setup(t).await?;
+        self.run_setup(t, &ancestors).await?;
 
         let mut checker = ChecksumChecker::new(&self.temp_dir.fingerprint, t.clone());
         let source_hash = t.source_hash.clone();
@@ -446,7 +592,7 @@ impl Executor {
             }
         }
 
-        self.run_deps(t).await?;
+        self.run_deps(t, &ancestors).await?;
 
         // Task-level prompts.
         for p in &t.prompt.0 {
@@ -476,7 +622,7 @@ impl Executor {
                 deferred.push(i);
                 continue;
             }
-            if let Err(e) = self.run_command(t, call, i).await {
+            if let Err(e) = self.run_command(t, call, i, &ancestors).await {
                 let _ = checker.on_error();
                 let code = e.task_exit_code();
                 if code > 0 {
@@ -496,7 +642,8 @@ impl Executor {
         }
 
         for &i in deferred.iter().rev() {
-            self.run_deferred(t, call, i, deferred_exit_code).await;
+            self.run_deferred(t, call, i, deferred_exit_code, &ancestors)
+                .await;
         }
 
         // A remote lock lost mid-run means a peer may have been running this
@@ -579,7 +726,11 @@ impl Executor {
 
     /// Runs setup tasks sequentially and unconditionally, releasing the
     /// concurrency slot while they run. Ports Go `runSetup`.
-    async fn run_setup(self: &Rc<Self>, t: &Task) -> Result<(), ExecutorError> {
+    async fn run_setup(
+        self: &Rc<Self>,
+        t: &Task,
+        ancestors: &Ancestors,
+    ) -> Result<(), ExecutorError> {
         for d in &t.setup {
             let call = Call {
                 task: d.task.clone(),
@@ -587,14 +738,18 @@ impl Executor {
                 silent: d.silent,
                 indirect: true,
             };
-            self.run_task_boxed(call).await?;
+            self.run_task_boxed(call, ancestors.clone()).await?;
         }
         Ok(())
     }
 
     /// Runs a task's dependencies concurrently, honoring failfast. Ports Go
     /// `runDeps`.
-    async fn run_deps(self: &Rc<Self>, t: &Task) -> Result<(), ExecutorError> {
+    async fn run_deps(
+        self: &Rc<Self>,
+        t: &Task,
+        ancestors: &Ancestors,
+    ) -> Result<(), ExecutorError> {
         let mut futures = Vec::with_capacity(t.deps.len());
         for d in &t.deps {
             let call = Call {
@@ -603,7 +758,7 @@ impl Executor {
                 silent: d.silent,
                 indirect: true,
             };
-            futures.push(self.run_task_boxed(call));
+            futures.push(self.run_task_boxed(call, ancestors.clone()));
         }
         join_all_failfast(futures, self.failfast || t.failfast).await
     }
@@ -612,7 +767,14 @@ impl Executor {
     /// during compilation so they can be rendered here against the task's
     /// variables plus `EXIT_CODE` (the failing command's exit status). Errors are
     /// ignored. Ports Go `runDeferred`.
-    async fn run_deferred(self: &Rc<Self>, t: &Task, call: &Call, i: usize, exit_code: u8) {
+    async fn run_deferred(
+        self: &Rc<Self>,
+        t: &Task,
+        call: &Call,
+        i: usize,
+        exit_code: u8,
+        ancestors: &Ancestors,
+    ) {
         let Some(cmd) = t.cmds.get(i) else {
             return;
         };
@@ -638,7 +800,7 @@ impl Executor {
         if let Some(slot) = task.cmds.get_mut(i) {
             *slot = rendered;
         }
-        if let Err(e) = self.run_command(&task, call, i).await {
+        if let Err(e) = self.run_command(&task, call, i, ancestors).await {
             self.logger().borrow_mut().verbose_errf(
                 Color::Yellow,
                 &format!("task: ignored error in deferred cmd: {e}\n"),
@@ -654,6 +816,7 @@ impl Executor {
         t: &Task,
         call: &Call,
         i: usize,
+        ancestors: &Ancestors,
     ) -> Result<(), ExecutorError> {
         let Some(cmd) = t.cmds.get(i) else {
             return Ok(());
@@ -685,7 +848,7 @@ impl Executor {
                 silent: cmd.silent,
                 indirect: true,
             };
-            let result = self.run_task_boxed(sub).await;
+            let result = self.run_task_boxed(sub, ancestors.clone()).await;
             if let Err(ExecutorError::TaskRun { source, .. }) = &result
                 && matches!(
                     &**source,
@@ -1020,12 +1183,28 @@ impl Executor {
     }
 }
 
-/// Reports whether the cache block is active for a task. Ports Go
-/// `cacheEnabled`.
 /// Lets `variables::compiled_task` expand `from: deps`/`from: cmds` globs by
 /// recursively compiling the referenced tasks. Async because compilation may
-/// evaluate dynamic variables; the recursion terminates on the dependency DAG.
-impl crate::variables::TaskResolver for Executor {
+/// evaluate dynamic variables.
+///
+/// This recursion runs *during* compilation, before `run_task_on` can consult
+/// the call path, so it needs its own guard: two tasks that list each other
+/// under `deps:` and both take `sources: [{from: deps}]` would otherwise
+/// compile each other until the stack overflowed.
+///
+/// The guard is the path carried by this value, not state on the executor.
+/// Compiling a dynamic (`sh:`) variable yields, so two tasks expanding globs
+/// over a shared dep interleave; a single stack on the executor would see the
+/// other's entry and report a cycle that does not exist, pop the wrong entry,
+/// and keep a stale one when `join_all_failfast` drops a suspended sibling.
+struct GlobResolver<'a> {
+    exec: &'a Executor,
+    /// The tasks being compiled above this one, innermost first. Keyed by name
+    /// alone: a repeat here is a task whose globs need its own globs.
+    above: Ancestors,
+}
+
+impl crate::variables::TaskResolver for GlobResolver<'_> {
     fn compiled_task_for_globs<'a>(
         &'a self,
         task: &'a str,
@@ -1034,19 +1213,43 @@ impl crate::variables::TaskResolver for Executor {
         Box<dyn std::future::Future<Output = Result<Task, crate::variables::CompileError>> + 'a>,
     > {
         Box::pin(async move {
+            if let Some(above) = &self.above
+                && above.contains(task)
+            {
+                // Reported from the task whose globs started the expansion, the
+                // same convention the call-path guard uses.
+                return Err(crate::variables::CompileError::Cycle {
+                    path: above.to_path_through(task),
+                });
+            }
             let call = Call {
                 task: task.to_string(),
                 vars: vars.clone(),
                 silent: false,
                 indirect: true,
             };
-            self.compiled_task(&call)
+            let inner = GlobResolver {
+                exec: self.exec,
+                above: Some(CallPath::extend(&self.above, task, task)),
+            };
+            self.exec
+                .compiled_task_with(&call, true, &inner)
                 .await
-                .map_err(|e| crate::variables::CompileError::FromTask(e.to_string()))
+                .map_err(|e| match e {
+                    // Keep a cycle typed as it unwinds through the outer frames,
+                    // so it still reaches the process as a cyclic-dependency
+                    // error rather than as an opaque compile failure.
+                    ExecutorError::CyclicDependency { path } => {
+                        crate::variables::CompileError::Cycle { path }
+                    }
+                    other => crate::variables::CompileError::FromTask(other.to_string()),
+                })
         })
     }
 }
 
+/// Reports whether the cache block is active for a task. Ports Go
+/// `cacheEnabled`.
 fn cache_enabled(t: &Task) -> bool {
     let Some(c) = &t.cache else {
         return false;
@@ -1164,5 +1367,56 @@ impl std::io::Write for SharedBytes {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CallPath;
+
+    /// A level whose key and reported name are the same, for the cases where
+    /// the digest half is not what is under test.
+    fn level(path: &super::Ancestors, task: &str) -> std::rc::Rc<CallPath> {
+        CallPath::extend(path, task, task)
+    }
+
+    #[test]
+    fn detects_only_tasks_on_this_path() {
+        let root = Some(level(&None, "a"));
+        let branch = Some(level(&root, "b"));
+        let sibling = level(&root, "c");
+        let deep = level(&branch, "d");
+
+        assert!(deep.contains("a"), "an ancestor is on the path");
+        assert!(deep.contains("b"));
+        assert!(deep.contains("d"), "the task itself closes a self-cycle");
+        // `c` runs beside `b`, not above `d`: a task reached twice on separate
+        // paths is a diamond, not a cycle.
+        assert!(!deep.contains("c"));
+        assert!(!sibling.contains("b"));
+    }
+
+    #[test]
+    fn reports_the_cycle_outermost_first() {
+        // Three deep, so the order is observable: a two-task cycle reads the
+        // same in both directions and would pass without any reversal.
+        let a = Some(level(&None, "a"));
+        let b = Some(level(&a, "b"));
+        let path = level(&b, "c");
+        assert_eq!(path.to_path_through("a"), ["a", "b", "c", "a"]);
+    }
+
+    // A level matches on the key but reports the name, so the same task name
+    // entered with a different compiled body is not a repeat — and the cycle
+    // still reads in names when one is.
+    #[test]
+    fn a_different_body_under_the_same_name_is_not_a_repeat() {
+        let first = Some(CallPath::extend(&None, "count\0aaa", "count"));
+        let second = CallPath::extend(&first, "count\0bbb", "count");
+
+        assert!(!second.contains("count\0ccc"), "a third turn progresses");
+        assert!(second.contains("count\0aaa"), "the same body repeats");
+        // The digests never reach the reported path.
+        assert_eq!(second.to_path_through("count"), ["count", "count", "count"]);
     }
 }

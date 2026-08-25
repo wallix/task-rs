@@ -52,8 +52,9 @@ use crate::logger::Logger;
 use crate::output::Output;
 use crate::sort::Sorter;
 
-/// The maximum number of times a task can be called, guarding against cyclic
-/// dependencies. Ports Go `MaximumTaskCall`.
+/// The maximum number of times a task can be called, guarding against runaway
+/// fan-out; a cycle is caught on the call path instead. Ports Go
+/// `MaximumTaskCall`.
 pub const MAXIMUM_TASK_CALL: i32 = 1000;
 
 /// The default debounce window for watch events.

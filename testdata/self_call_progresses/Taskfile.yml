@@ -1,0 +1,16 @@
+version: '3'
+templater: jinja
+
+# A task that calls itself with different vars is making progress, not looping:
+# each turn compiles to a different command. The Go dialect spells the same
+# thing; Jinja is used here only for the arithmetic.
+tasks:
+  countdown:
+    vars:
+      N: '{{ N | default(3) }}'
+    if: 'test {{ N }} -gt 0'
+    cmds:
+      - 'echo n={{ N }}'
+      - task: countdown
+        vars:
+          N: '{{ N | int - 1 }}'

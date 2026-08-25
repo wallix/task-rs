@@ -35,6 +35,11 @@ pub enum ExecutorError {
     Requires(Box<RequiresError>),
     /// A precondition was not met or failed to run.
     Precondition(Box<PreconditionError>),
+    /// A task depends on itself, directly or through other tasks.
+    CyclicDependency {
+        /// The dependency path, outermost task first, ending with the repeat.
+        path: Vec<String>,
+    },
     /// A command failed while running a task.
     Exec(crate::execext::Error),
     /// A cache operation failed.
@@ -60,8 +65,9 @@ pub enum ExecutorError {
         /// The task names that share it.
         task_names: Vec<String>,
     },
-    /// A task was called more times than [`super::MAXIMUM_TASK_CALL`], indicating
-    /// a dependency cycle.
+    /// A task was called more times than [`super::MAXIMUM_TASK_CALL`] without
+    /// repeating on any one dependency path — runaway fan-out rather than a
+    /// cycle, which [`Self::CyclicDependency`] reports.
     TaskCalledTooManyTimes {
         /// The offending task name.
         task_name: String,
@@ -123,8 +129,11 @@ impl std::fmt::Display for ExecutorError {
             ),
             Self::TaskCalledTooManyTimes { task_name } => write!(
                 f,
-                "task: Task {task_name:?} was called too many times (probably a cyclic dependency)"
+                "task: Task {task_name:?} was called too many times (runaway fan-out; a cycle is reported as one)"
             ),
+            Self::CyclicDependency { path } => {
+                write!(f, "task: Cyclic dependency detected: {}", path.join(" -> "))
+            }
             Self::TaskRun { task_name, source } => {
                 write!(f, "task: Failed to run task {task_name:?}: {source}")
             }
@@ -148,7 +157,12 @@ impl ExecutorError {
             Self::TaskRun { .. } | Self::Exec(_) => 201,
             Self::TaskInternal { .. } => 202,
             Self::TaskNameConflict { .. } => 203,
-            Self::TaskCalledTooManyTimes { .. } => 204,
+            // Same class as the call counter it pre-empts, so Go's code for
+            // that failure is kept. In practice a cycle found while running has
+            // a caller above it and reaches the process wrapped in `TaskRun`,
+            // which exits 201; 204 surfaces when the cycle is found while
+            // compiling `from:` globs, before any task is running.
+            Self::TaskCalledTooManyTimes { .. } | Self::CyclicDependency { .. } => 204,
             Self::Cancelled => 205,
             Self::Requires(_) => 206,
             // No other-appropriate code: matches Go `CodeUnknown`.
@@ -195,7 +209,13 @@ impl From<CompilerError> for ExecutorError {
 }
 impl From<CompileError> for ExecutorError {
     fn from(e: CompileError) -> Self {
-        Self::Compile(Box::new(e))
+        // A cycle found while compiling `from:` globs is the same failure as one
+        // found on the call path, so it surfaces as the same error rather than
+        // as a generic compile failure with Go's "unknown" exit code.
+        match e {
+            CompileError::Cycle { path } => Self::CyclicDependency { path },
+            other => Self::Compile(Box::new(other)),
+        }
     }
 }
 impl From<RequiresError> for ExecutorError {
@@ -244,6 +264,27 @@ mod tests {
             200
         );
         assert_eq!(ExecutorError::Cancelled.code(), 205);
+    }
+
+    // A cycle names the whole path, and shares the exit code of the call
+    // counter it pre-empts.
+    #[test]
+    fn cyclic_dependency_names_the_path() {
+        let err = ExecutorError::CyclicDependency {
+            path: vec!["a".to_string(), "b".to_string(), "a".to_string()],
+        };
+        assert_eq!(
+            err.to_string(),
+            "task: Cyclic dependency detected: a -> b -> a"
+        );
+        assert_eq!(err.code(), 204);
+        assert_eq!(
+            err.code(),
+            ExecutorError::TaskCalledTooManyTimes {
+                task_name: "a".to_string(),
+            }
+            .code()
+        );
     }
 
     #[test]

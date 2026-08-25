@@ -1,0 +1,15 @@
+version: '3'
+
+tasks:
+  # A task that calls itself with nothing changed between the turns: same
+  # commands, same sources, same generates. Rejected as a cycle. Before the
+  # check existed this shape did not run either — it deadlocked on its own task
+  # lock, or exhausted the stack when there was no lock to take.
+  touchy:
+    sources:
+      - in.txt
+    generates:
+      - out.txt
+    cmds:
+      - cp in.txt out.txt
+      - task: touchy

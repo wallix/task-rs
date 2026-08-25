@@ -481,6 +481,24 @@ mod tests {
         assert_eq!(hash(&base).unwrap(), hash(&mutated).unwrap());
     }
 
+    // A task whose *compiled* commands differ hashes differently even though the
+    // vars field itself is not hashed — which is what lets the cycle check tell
+    // one turn of a countdown from the next.
+    #[test]
+    fn hash_follows_compiled_cmds() {
+        let mut a = sample_task();
+        a.cmds = vec![ast::Cmd {
+            cmd: "echo n=3".to_string(),
+            ..Default::default()
+        }];
+        let mut b = a.clone();
+        b.cmds = vec![ast::Cmd {
+            cmd: "echo n=2".to_string(),
+            ..Default::default()
+        }];
+        assert_ne!(hash(&a).unwrap(), hash(&b).unwrap());
+    }
+
     #[test]
     fn hash_ignores_task_vars() {
         // Two tasks differing only in their (task-level) variables hash the

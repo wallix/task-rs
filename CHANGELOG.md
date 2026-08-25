@@ -17,6 +17,10 @@
   Affected tasks re-run once, and a Taskfile already converted needs checking by
   hand.
 - **The Go-template deprecation warning no longer runs into the next line.**
+- **A dependency cycle is reported as one**, naming the path (`a -> b -> a`),
+  instead of running until the process ran out of stack. A task that reaches
+  itself is rejected: calling itself with different `vars:` still works, but
+  recursion driven by state outside the Taskfile no longer does.
 
 ## v4.0.0 - 2026-08-24
 

@@ -1,0 +1,21 @@
+version: '3'
+
+tasks:
+  noop:
+    cmds:
+      - "true"
+
+  # Two instances of one pattern on a single dependency path: `x-2` calls `x-1`,
+  # which calls `noop` and stops. Not a cycle, though both share the pattern.
+  x-*:
+    vars:
+      NEXT: '{{if eq (index .MATCH 0) "2"}}x-1{{else}}noop{{end}}'
+    cmds:
+      - task: '{{.NEXT}}'
+      - echo "x {{index .MATCH 0}}"
+
+  # A wildcard instance that calls itself, on the other hand, is a cycle — the
+  # resolved name repeats on the path.
+  y-*:
+    cmds:
+      - task: 'y-{{index .MATCH 0}}'

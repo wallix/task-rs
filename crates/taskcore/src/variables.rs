@@ -27,7 +27,8 @@ use crate::logger::Logger;
 use crate::templater::{Cache, TemplaterError};
 
 /// Resolves `from:` entries in `sources`/`generates` by compiling the tasks
-/// they reference. The Executor implements this; `compiled_task` calls it to
+/// they reference. The executor's `GlobResolver` implements this;
+/// `compiled_task` calls it to
 /// expand wrapper tasks that inherit their children's globs.
 pub trait TaskResolver {
     /// Compiles the task named by a dep/cmd call, returning its fully-resolved
@@ -71,6 +72,11 @@ pub enum CompileError {
     Glob(String),
     /// Compiling a task referenced by a `from:` clause failed.
     FromTask(String),
+    /// Tasks referenced by `from:` clauses compile each other in a cycle.
+    Cycle {
+        /// The dependency path, outermost task first, ending with the repeat.
+        path: Vec<String>,
+    },
     /// A cached task references a generates path outside the project root.
     CacheGeneratesOutsideRoot {
         /// The task being compiled.
@@ -99,6 +105,9 @@ impl std::fmt::Display for CompileError {
             ),
             Self::Glob(message) => write!(f, "task: glob expansion failed: {message}"),
             Self::FromTask(message) => write!(f, "{message}"),
+            Self::Cycle { path } => {
+                write!(f, "task: Cyclic dependency detected: {}", path.join(" -> "))
+            }
             Self::CacheGeneratesOutsideRoot { task, glob, root } => write!(
                 f,
                 "task: {task}: generates path {glob:?} is outside project root {root:?}; caching requires all outputs to be within the project directory"

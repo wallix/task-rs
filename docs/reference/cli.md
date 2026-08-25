@@ -376,7 +376,9 @@ Task uses specific exit codes to indicate different types of errors:
 - **201** - Command execution error
 - **202** - Attempted to run internal task
 - **203** - Multiple tasks with same name/alias
-- **204** - Task called too many times (recursion limit)
+- **204** - Task called too many times (recursion limit), or a cyclic dependency
+  found while compiling `from:` globs. A cycle found while running surfaces
+  through the calling task as **201**.
 - **205** - Task cancelled by user
 - **206** - Missing required variables
 - **207** - Variable has incorrect value

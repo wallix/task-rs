@@ -31,6 +31,134 @@ fn cyclic_dependency_errors() {
     let dir = stage("cyclic");
     let o = run(&dir, &["task-1"]);
     assert!(!o.ok(), "a cyclic dependency must fail: {}", o.combined());
+    // Failing is not enough: a stack overflow aborts the process, which `code`
+    // reports as -1 and `ok()` accepts as a failure. The cycle has to be
+    // reported, and named, by the task that detected it.
+    assert_eq!(o.code, 201, "expected a task failure: {}", o.combined());
+    assert!(
+        o.combined()
+            .contains("Cyclic dependency detected: task-1 -> task-2 -> task-1"),
+        "expected the cycle to be named, got: {}",
+        o.combined()
+    );
+}
+
+// A wildcard task reaching another instance of its own pattern is two tasks, not
+// a repeat: the path is keyed by the resolved name, not the pattern.
+#[test]
+fn wildcard_instances_on_one_path_are_not_cyclic() {
+    let dir = stage("wildcard_not_cyclic");
+    let o = run(&dir, &["x-2"]);
+    assert!(o.ok(), "x-2 -> x-1 is not a cycle: {}", o.combined());
+    assert!(
+        o.combined().contains("x 1") && o.combined().contains("x 2"),
+        "both instances should run: {}",
+        o.combined()
+    );
+    // The other direction: one instance calling itself does repeat.
+    let o = run(&dir, &["y-7"]);
+    assert!(!o.ok(), "y-7 calling itself is a cycle: {}", o.combined());
+    assert!(
+        o.combined()
+            .contains("Cyclic dependency detected: y-7 -> y-7"),
+        "expected the resolved name in the cycle, got: {}",
+        o.combined()
+    );
+}
+
+// A self-call with nothing changed between the turns is a cycle, and is named
+// as one. Before the check existed this shape did not run either: it deadlocked
+// on its own task lock, or exhausted the stack when there was no lock to take.
+#[test]
+fn self_call_with_the_same_body_is_cyclic() {
+    let dir = stage("self_call_same_body");
+    let o = run(&dir, &["touchy"]);
+    assert!(!o.ok(), "expected a cycle error: {}", o.combined());
+    assert!(
+        o.combined()
+            .contains("Cyclic dependency detected: touchy -> touchy"),
+        "expected the cycle to be named, got: {}",
+        o.combined()
+    );
+}
+
+// The reported path is ordered outermost first. A two-task cycle reads the same
+// in both directions, so only three deep pins the order through the binary.
+#[test]
+fn cycle_is_reported_outermost_first() {
+    let dir = stage("cycle_paths");
+    let o = run(&dir, &["c-1"]);
+    assert_eq!(o.code, 201, "expected a task failure: {}", o.combined());
+    assert!(
+        o.combined()
+            .contains("Cyclic dependency detected: c-1 -> c-2 -> c-3 -> c-1"),
+        "expected the whole path, outermost first, got: {}",
+        o.combined()
+    );
+}
+
+// A cycle closed through `setup:` rather than through a command: a distinct
+// code path to the one the `task:` command takes.
+#[test]
+fn cycle_through_setup_is_detected() {
+    let dir = stage("cycle_paths");
+    let o = run(&dir, &["s-1"]);
+    assert_eq!(o.code, 201, "expected a task failure: {}", o.combined());
+    assert!(
+        o.combined()
+            .contains("Cyclic dependency detected: s-1 -> s-2 -> s-1"),
+        "expected the cycle to be named, got: {}",
+        o.combined()
+    );
+}
+
+// A cycle that leaves the root Taskfile and comes back through an include: the
+// path is keyed by the namespaced name, which is what closes it.
+#[test]
+fn cycle_across_included_taskfiles_is_detected() {
+    let dir = stage("cycle_paths");
+    let o = run(&dir, &["i-1"]);
+    assert_eq!(o.code, 201, "expected a task failure: {}", o.combined());
+    assert!(
+        o.combined()
+            .contains("Cyclic dependency detected: i-1 -> sub:i-2 -> i-1"),
+        "expected the namespaced cycle, got: {}",
+        o.combined()
+    );
+}
+
+// A task reached twice on separate paths — a diamond, a shared setup — is not a
+// repeat on any one path, so it still runs.
+#[test]
+fn diamond_with_a_shared_setup_is_not_cyclic() {
+    let dir = stage("cycle_paths");
+    let o = run(&dir, &["top"]);
+    assert!(o.ok(), "a diamond is not a cycle: {}", o.combined());
+    for task in ["base", "shared", "left", "right", "top"] {
+        assert!(
+            o.combined().contains(&format!("[{task}]")),
+            "{task} should have run: {}",
+            o.combined()
+        );
+    }
+}
+
+// Two tasks sharing a short name in different namespaces are distinct
+// identities: one calling the other is a chain, not a repeat.
+#[test]
+fn same_task_name_in_two_namespaces_is_not_cyclic() {
+    let dir = stage("cycle_paths");
+    let o = run(&dir, &["names"]);
+    assert!(
+        o.ok(),
+        "one:build -> two:build is not a cycle: {}",
+        o.combined()
+    );
+    assert!(
+        o.combined().contains("one build") && o.combined().contains("two build"),
+        "both tasks should run: {}",
+        o.combined()
+    );
 }
 
 // Ports Go `TestInternalTask`.
@@ -190,4 +318,79 @@ fn migration_preserves_sprig_meaning_after_a_pipe() {
             after.combined()
         );
     }
+}
+
+// The same diamond through `deps:`, which run in parallel. Each branch gets its
+// own copy of the path, so `p-shared` on one branch is invisible to the other;
+// a shared mutable set would reject this, and unpredictably so.
+#[test]
+fn parallel_diamond_is_not_cyclic() {
+    let dir = stage("cycle_paths");
+    let o = run(&dir, &["p-top"]);
+    assert!(
+        o.ok(),
+        "a parallel diamond is not a cycle: {}",
+        o.combined()
+    );
+    for task in ["p-shared", "p-left", "p-right", "p-top"] {
+        assert!(
+            o.combined().contains(&format!("[{task}]")),
+            "{task} should have run: {}",
+            o.combined()
+        );
+    }
+}
+
+// A cycle closed while compiling `sources: [{from: deps}]` recurses during
+// compilation, before the call path is consulted. Without its own guard it
+// overflowed the stack and aborted the process instead of naming the cycle.
+#[test]
+fn cycle_through_from_deps_globs_is_detected() {
+    let dir = stage("cycle_paths");
+    let o = run(&dir, &["g-1"]);
+    assert!(!o.ok(), "expected a cycle error: {}", o.combined());
+    assert_ne!(o.code, 134, "the process must not abort: {}", o.combined());
+    assert!(
+        o.combined().contains("Cyclic dependency detected: "),
+        "expected the cycle to be named, got: {}",
+        o.combined()
+    );
+}
+
+// A task that calls itself with different vars is not a cycle: each turn
+// compiles to a different command, so the path key differs. Task v3 allows
+// this recursion idiom and so does task-rs.
+#[test]
+fn self_call_with_different_vars_is_not_cyclic() {
+    let dir = stage("self_call_progresses");
+    let o = run(&dir, &["countdown"]);
+    assert!(o.ok(), "the countdown should run: {}", o.combined());
+    for want in ["n=3", "n=2", "n=1"] {
+        assert!(
+            o.combined().contains(want),
+            "expected {want:?} in: {}",
+            o.combined()
+        );
+    }
+    assert!(
+        !o.combined().contains("Cyclic"),
+        "must not report a cycle: {}",
+        o.combined()
+    );
+}
+
+// Two tasks expanding `sources: [{from: deps}]` over one shared dep compile
+// concurrently, and that compile yields on an `sh:` var. The glob guard is
+// carried per compilation path, so neither sees the other's in-flight entry;
+// a single shared stack reported a cycle here that does not exist.
+#[test]
+fn parallel_from_deps_globs_are_not_cyclic() {
+    let dir = stage("glob_from_deps_parallel");
+    let o = run(&dir, &["top"]);
+    assert!(o.ok(), "nothing here is cyclic: {}", o.combined());
+    assert!(
+        !o.combined().contains("Cyclic"),
+        "must not report a cycle: {}",
+        o.combined()
+    );
 }
