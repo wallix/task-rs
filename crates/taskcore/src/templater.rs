@@ -881,39 +881,32 @@ fn translate_arg(token: &str, tmpl: &str) -> Result<String, TemplaterError> {
 
 /// Splits an action body into `|`-delimited pipeline segments, keeping quoted
 /// strings and parenthesized sub-expressions intact so a pipe inside a literal
-/// or a nested call is not treated as a delimiter.
+/// or a nested call is not treated as a delimiter. Literals are consumed with
+/// `copy_literal`, so an escaped quote (`"\""`) does not end one early.
 fn split_pipeline(body: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut cur = String::new();
-    let mut in_quote: Option<char> = None;
     let mut depth = 0usize;
-    for c in body.chars() {
-        match in_quote {
-            Some(q) => {
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' | '\'' | '`' => {
                 cur.push(c);
-                if c == q {
-                    in_quote = None;
-                }
+                copy_literal(c, &mut chars, &mut cur);
             }
-            None => match c {
-                '"' | '\'' | '`' => {
-                    in_quote = Some(c);
-                    cur.push(c);
-                }
-                '(' => {
-                    depth = depth.saturating_add(1);
-                    cur.push(c);
-                }
-                ')' => {
-                    depth = depth.saturating_sub(1);
-                    cur.push(c);
-                }
-                '|' if depth == 0 => {
-                    segments.push(cur.trim().to_string());
-                    cur.clear();
-                }
-                _ => cur.push(c),
-            },
+            '(' => {
+                depth = depth.saturating_add(1);
+                cur.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            '|' if depth == 0 => {
+                segments.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(c),
         }
     }
     segments.push(cur.trim().to_string());
@@ -922,40 +915,33 @@ fn split_pipeline(body: &str) -> Vec<String> {
 
 /// Splits a pipeline segment into whitespace-separated tokens, keeping quoted
 /// strings and parenthesized sub-expressions (`(f a b)`) intact as one token.
+/// Literals are consumed with `copy_literal`, so an escaped quote does not end
+/// one early and merge the following literal into this token.
 fn tokenize(segment: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
-    let mut in_quote: Option<char> = None;
     let mut depth = 0usize;
-    for c in segment.chars() {
-        match in_quote {
-            Some(q) => {
+    let mut chars = segment.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' | '\'' | '`' => {
                 cur.push(c);
-                if c == q {
-                    in_quote = None;
+                copy_literal(c, &mut chars, &mut cur);
+            }
+            '(' => {
+                depth = depth.saturating_add(1);
+                cur.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
                 }
             }
-            None => match c {
-                '"' | '\'' | '`' => {
-                    in_quote = Some(c);
-                    cur.push(c);
-                }
-                '(' => {
-                    depth = depth.saturating_add(1);
-                    cur.push(c);
-                }
-                ')' => {
-                    depth = depth.saturating_sub(1);
-                    cur.push(c);
-                }
-                c if c.is_whitespace() && depth == 0 => {
-                    if !cur.is_empty() {
-                        tokens.push(cur.clone());
-                        cur.clear();
-                    }
-                }
-                _ => cur.push(c),
-            },
+            _ => cur.push(c),
         }
     }
     if !cur.is_empty() {
@@ -2006,6 +1992,45 @@ mod tests {
             out.get("GREETING").unwrap().value,
             Some(YamlValue::String("hi bar".to_string()))
         );
+    }
+
+    // An escaped delimiter stays inside its literal: before this, the naive
+    // scan closed the literal at the `\"` and swallowed the next one whole.
+    #[test]
+    fn scanners_keep_escaped_delimiters_inside_literals() {
+        assert_eq!(
+            tokenize(r#"replace "\"" "q""#),
+            vec![r#"replace"#, r#""\"""#, r#""q""#]
+        );
+        // The escape has to precede the `|`: with the pipe inside the literal
+        // first, the old scanner also kept the segment whole.
+        assert_eq!(
+            split_pipeline(r#".X | replace "\"|" "q""#),
+            vec![".X", r#"replace "\"|" "q""#]
+        );
+        // Guarding the raw-literal path rather than the fix: a raw literal
+        // takes no escapes, so the backslash does not hide the closing
+        // backquote. The old scanner got this right too.
+        assert_eq!(
+            tokenize("trimSuffix `a\\` .X"),
+            vec!["trimSuffix", "`a\\`", ".X"]
+        );
+        // An unterminated literal swallows the remainder instead of closing at
+        // the escaped quote, the same way `rewrite_dots` treats it.
+        assert_eq!(tokenize(r#"replace "a\" b"#), vec!["replace", r#""a\" b"#]);
+        // A rune literal escapes too.
+        assert_eq!(
+            tokenize(r#"replace '\'' "q""#),
+            vec!["replace", r#"'\''"#, r#""q""#]
+        );
+    }
+
+    #[test]
+    fn escaped_quote_renders_in_a_go_action() {
+        let mut c = cache_with(&[("P", "a\"b")]);
+        let out = c.replace(r#"{{ .P | replace "\"" "-" }}"#);
+        assert!(!c.is_err(), "recorded {:?}", c.err());
+        assert_eq!(out, "a-b");
     }
 
     #[test]

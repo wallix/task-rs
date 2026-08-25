@@ -6,6 +6,8 @@
   `{{ .FILE | replace ".tar.gz" "" }}` strips what it was given. Affected tasks
   re-run once, and a Taskfile already converted by `task --migrate --write`
   needs checking by hand.
+- **An escaped quote works inside a Go-syntax template string.** A Taskfile
+  already converted by `task --migrate --write` needs checking by hand.
 
 ## v4.0.0 - 2026-08-24
 

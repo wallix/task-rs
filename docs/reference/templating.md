@@ -173,6 +173,10 @@ offered (list/dict/date/math/encoding helpers, `uuid`, `spew`, and so on). Any
 `{% … %}` or `{# … #}` in a Go-dialect file is treated as literal text, exactly
 as Go `text/template` would.
 
+An action also ends at the first `}}`, even one inside a string literal, so
+`{{ .P | replace "}}" "" }}` cannot be written directly — build the braces
+from a variable, or use the Jinja dialect.
+
 ## Special variables
 
 Task provides these variables in every template. They are the same in both

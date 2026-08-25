@@ -150,3 +150,32 @@ fn dot_inside_a_string_literal_renders_and_migrates() {
     assert!(combined.contains("out=report"), "output: {combined}");
     assert!(!combined.contains("out=report."), "dot leaked: {combined}");
 }
+
+/// A Go-dialect Taskfile with an escaped quote inside a template string — the
+/// shape whose literal used to close at the `\"`, merging the next argument in
+/// and failing with "missing argument".
+const ESCAPED_QUOTE_TASKFILE: &str = "version: '3'\n\nvars:\n  P: 'a\"b'\ntasks:\n  strip:\n    cmds:\n      - 'echo out={{ .P | replace \"\\\"\" \"-\" }}'\n";
+
+#[test]
+fn escaped_quote_in_a_string_literal_renders_and_migrates() {
+    // The Go dialect renders it instead of erroring on a merged argument.
+    let go = taskfile_dir(ESCAPED_QUOTE_TASKFILE);
+    let r = common::run(&go, &["strip"]);
+    assert!(r.ok(), "stderr: {}", r.stderr);
+    let combined = format!("{}{}", r.stdout, r.stderr);
+    assert!(combined.contains("out=a-b"), "output: {combined}");
+
+    // Migration keeps both literals separate, and the converted file runs.
+    let jinja = taskfile_dir(ESCAPED_QUOTE_TASKFILE);
+    let w = common::run(&jinja, &["--migrate", "--write"]);
+    assert!(w.ok(), "stderr: {}", w.stderr);
+    let on_disk = std::fs::read_to_string(jinja.join("Taskfile.yml")).unwrap();
+    assert!(
+        on_disk.contains(r#"replace("\"", "-")"#),
+        "migrated to: {on_disk}"
+    );
+    let r = common::run(&jinja, &["strip"]);
+    assert!(r.ok(), "stderr: {}", r.stderr);
+    let combined = format!("{}{}", r.stdout, r.stderr);
+    assert!(combined.contains("out=a-b"), "output: {combined}");
+}
