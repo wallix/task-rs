@@ -106,6 +106,10 @@ pub(crate) struct TaskQueue {
     aborts: std::cell::RefCell<Vec<tokio::task::AbortHandle>>,
     /// Notified whenever a task finishes, so a drain can re-check `live`.
     idle: tokio::sync::Notify,
+    /// Whether any task was abandoned part-way. Its command keeps running —
+    /// nothing in the shell interpreter's API can stop it from here — so the
+    /// drain sweeps for leftovers only when this is set.
+    abandoned: std::cell::Cell<bool>,
 }
 
 /// Decrements the live count when a queued task ends, however it ends.
@@ -182,10 +186,15 @@ impl Executor {
     ///
     /// One run at a time per executor: the queue is shared, so a concurrent run
     /// on the same executor would tear this one's tasks down with its own.
+    ///
+    /// A run that *fails* after abandoning a task stops every process below the
+    /// host process, not only the ones it started — it cannot tell them apart.
+    /// An embedder with children of its own should set `TASK_NO_REAP=1`.
     pub async fn run(self: &Rc<Self>, calls: &[Call]) -> Result<(), ExecutorError> {
         let result = self.run_calls(calls).await;
-        // However the run ended, nothing queued may outlive it.
-        self.drain_queue().await;
+        // However the run ended, nothing queued may outlive it; the commands
+        // behind it are only swept when the run is failing.
+        self.drain_queue(result.is_err()).await;
         result
     }
 
@@ -242,7 +251,7 @@ impl Executor {
         for call in calls {
             tasks.push(self.spawn_task(call.clone(), None));
         }
-        join_queued(tasks, self.failfast).await
+        join_queued(self, tasks, self.failfast).await
     }
 
     fn split_regular_and_watch(
@@ -458,11 +467,21 @@ impl Executor {
         }
     }
 
-    /// Cancels everything still queued and waits for those cancellations to
-    /// run, so every abandoned task has released its lock and permit and will
-    /// start no further command by the time the run returns. A process the
-    /// shell has already started keeps running — nothing here kills it.
-    pub(crate) async fn drain_queue(&self) {
+    /// Cancels everything still queued, waits for those cancellations to run,
+    /// and stops the commands they leave behind, so that by the time the run
+    /// returns every abandoned task has released its lock and permit, will start
+    /// no further command, and has left no process behind.
+    ///
+    /// The sweep runs only when the run is *failing* and something was actually
+    /// abandoned, because it cannot tell a command abandoned mid-flight from a
+    /// process a task deliberately left running in the background. Both halves
+    /// are needed: a deferred command's error is ignored, so a `defer:` onto a
+    /// `failfast:` task abandons siblings and still returns `Ok`, and sweeping
+    /// on that would stop a job a successful run meant to leave running.
+    pub(crate) async fn drain_queue(&self, failed: bool) {
+        if self.queue.live.get() > 0 {
+            self.queue.abandoned.set(true);
+        }
         // Taken rather than iterated under a shared borrow: `abort()` is
         // foreign code, and the other borrow of this cell is a `borrow_mut`.
         let aborts = std::mem::take(&mut *self.queue.aborts.borrow_mut());
@@ -480,6 +499,59 @@ impl Executor {
                 break;
             }
             idle.await;
+        }
+        if self.queue.abandoned.replace(false) && failed {
+            self.report_swept(crate::reap::stop_commands().await);
+        }
+    }
+
+    /// Logs what the sweep did. What it stopped is a detail of a run that was
+    /// being torn down anyway, so it is verbose-only; what it *failed* to stop
+    /// is a process still running that nobody is watching, so it warns.
+    fn report_swept(&self, swept: crate::reap::Swept) {
+        let logger = self.logger();
+        let mut logger = logger.borrow_mut();
+        if swept.asked > 0 {
+            let killed = if swept.killed > 0 {
+                format!("; {} still running afterwards and killed", swept.killed)
+            } else {
+                String::new()
+            };
+            logger.verbose_errf(
+                Color::Yellow,
+                &format!(
+                    "task: signalled {} process(es) left by the cancelled run{killed}\n",
+                    swept.asked
+                ),
+            );
+        }
+        // Verbose rather than a warning, unlike the two below: a process that
+        // adopts orphans is a container entrypoint or a supervised child, where
+        // this holds for every failing run and a warning each time would be
+        // noise about a decision the sweep will never make differently.
+        if swept.declined {
+            logger.verbose_errf(
+                Color::Yellow,
+                "task: this process adopts orphans, so the commands a cancelled \
+                 run left behind were not stopped\n",
+            );
+        }
+        if let Some(found) = swept.truncated_at {
+            logger.warnf(&format!(
+                "task: stopped after {found} processes below this one; the rest were left \
+                 running (the tree was too deep, or part of it could not be read)\n",
+            ));
+        }
+        if !swept.unstoppable.is_empty() {
+            let survivors: Vec<String> = swept
+                .unstoppable
+                .iter()
+                .map(|(pid, reason)| format!("{pid} ({reason})"))
+                .collect();
+            logger.warnf(&format!(
+                "task: could not stop {}, which may still be running\n",
+                survivors.join(", ")
+            ));
         }
     }
 
@@ -921,7 +993,7 @@ impl Executor {
             };
             tasks.push(self.spawn_task(call, ancestors.clone()));
         }
-        join_queued(tasks, self.failfast || t.failfast).await
+        join_queued(self, tasks, self.failfast || t.failfast).await
     }
 
     /// Runs a single deferred command. Deferred commands are left un-templated
@@ -1452,7 +1524,11 @@ fn unwrap_arc(err: Arc<ExecutorError>) -> ExecutorError {
 /// [`Executor::drain_queue`] waits for those. Otherwise waits for all of them
 /// and returns the first error. Ports the `errgroup` used by Go
 /// `runDeps`/`Run`.
-async fn join_queued(tasks: Vec<QueuedTask>, failfast: bool) -> Result<(), ExecutorError> {
+async fn join_queued(
+    executor: &Executor,
+    tasks: Vec<QueuedTask>,
+    failfast: bool,
+) -> Result<(), ExecutorError> {
     use std::future::poll_fn;
     use std::pin::Pin;
     use std::task::Poll;
@@ -1507,6 +1583,11 @@ async fn join_queued(tasks: Vec<QueuedTask>, failfast: bool) -> Result<(), Execu
     .await;
 
     if let Some(e) = fatal {
+        // These siblings are abandoned part-way, so their commands can outlive
+        // them; the drain sweeps for those once the run is over.
+        if !pending.is_empty() {
+            executor.queue.abandoned.set(true);
+        }
         // Cancel the siblings and wait for it: aborting only schedules the
         // cancellation, and returning before it runs would let them start
         // further commands, which dropping an inline future never did. A

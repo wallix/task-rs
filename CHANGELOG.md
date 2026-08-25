@@ -28,6 +28,9 @@
 - **A failing dependency no longer stops its siblings starting.** Under
   `--failfast` they all start and are cancelled when one fails, so a cancelled
   sibling may leave partial work behind.
+- **A failing run stops the commands it leaves behind** instead of orphaning
+  them. It cannot tell those from a job a task backgrounded on purpose, so both
+  are stopped; `TASK_NO_REAP=1` turns that off.
 
 ## v4.0.0 - 2026-08-24
 

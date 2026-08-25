@@ -96,6 +96,17 @@ Valid values are `true` (`1`) or `false` (`0`). By default, this is `true` on
 Windows and `false` on other operating systems. We might consider making this
 enabled by default on all platforms in the future.
 
+### `TASK_NO_REAP`
+
+When a run *fails* after being torn down part-way — a `failfast:` dependency
+failing — the commands it abandoned keep running, so Task walks its own process
+tree and stops what it finds. It cannot attribute a process to the task that
+started it, so a job a task left running deliberately is stopped along with the
+rest. Set `TASK_NO_REAP=1` to turn the sweep off and leave everything running.
+Valid values are `true` (`1`) or `false` (`0`); anything else leaves it on.
+
+A run that succeeds never sweeps, even if a task was abandoned along the way.
+
 ### `TASK_VK_LOCK_TOKEN`
 
 Bearer token for a `cache.lock: vk://...` distributed lock, used when the URL

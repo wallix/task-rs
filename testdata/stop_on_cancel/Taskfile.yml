@@ -1,0 +1,54 @@
+version: '3'
+
+tasks:
+  # `boom` fails while `slow` is part-way through its command, abandoning it.
+  # Nothing should write the marker afterwards: the abandoned command has to be
+  # stopped, not left running past the end of the run.
+  #
+  # The marker is written by a *grandchild* on purpose. Written as two `cmds`
+  # entries it would never appear anyway — the engine drives that second command,
+  # and it is gone — so the test would pass without stopping anything. Written by
+  # the shell the engine spawned, stopping just that shell would be enough. Here
+  # the subshell holding the sleep and the marker is a process below it, so only
+  # walking the tree stops what writes the marker.
+  default:
+    failfast: true
+    deps:
+      - boom
+      - slow
+
+  # Long enough that `slow` has reliably exec'd its shell and written the
+  # started marker before the failure lands, so the positive control below is
+  # not a race.
+  boom:
+    cmds:
+      - sleep 0.6
+      - exit 1
+
+  slow:
+    cmds:
+      - sh -c "(touch started.txt; sleep 2; touch marker.txt) & wait"
+
+  # A run that *succeeds* sweeps nothing, even when it abandoned a task on the
+  # way: the sweep cannot tell an abandoned command from a job a task left
+  # running deliberately, so it needs the run to be failing as well.
+  #
+  # A deferred command's error is ignored, so deferring onto a `failfast:` task
+  # abandons its siblings — setting the "something was abandoned" flag — while
+  # the run itself still succeeds. That is the shape that used to sweep.
+  no_sweep:
+    cmds:
+      # A job left running on purpose, spawned by the engine itself so the walk
+      # would find it. The `sleep` after it gives the spawn time to win the race
+      # against the run's own exit.
+      - sh -c "sleep 2; touch survived.txt" &
+      - sleep 0.5
+      - defer: { task: abandons }
+      - echo done
+
+  # Fails, abandoning `slow`, but as a deferred call its error is swallowed.
+  abandons:
+    failfast: true
+    deps:
+      - boom
+      - slow

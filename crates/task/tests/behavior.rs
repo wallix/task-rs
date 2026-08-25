@@ -9,7 +9,7 @@
 )]
 
 mod common;
-use common::{empty_case_dir, run, stage};
+use common::{empty_case_dir, run, run_with_env, stage};
 
 // Ports Go `TestDry`.
 #[test]
@@ -98,6 +98,91 @@ fn deep_nested_task_chain_does_not_overflow_the_stack() {
         o.ok(),
         "a {CHAIN_DEPTH}-deep chain of `task:` commands should run, got code {}: {}",
         o.code,
+        o.combined()
+    );
+}
+
+// Cancelling a task abandons the command it was running, and the shell
+// interpreter gives no handle to stop it, so the engine sweeps the process tree
+// once a run is torn down. Without that the command runs on past the run.
+#[test]
+fn a_cancelled_run_stops_the_command_it_abandoned() {
+    let dir = stage("stop_on_cancel");
+    let o = run(&dir, &["default"]);
+    assert!(
+        !o.ok(),
+        "the failing dep should fail the run: {}",
+        o.combined()
+    );
+
+    // Positive control: without proof the subshell ran at all, an absent marker
+    // proves nothing about what stopped it. Polled rather than checked once, so
+    // a slow spawn cannot turn a correct sweep into a red test.
+    let started = dir.join("started.txt");
+    for _ in 0..50 {
+        if started.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        started.exists(),
+        "the command never started, so the missing marker proves nothing: {}",
+        o.combined()
+    );
+    // Long enough for the abandoned subshell to have finished its sleep and
+    // written the marker, had anything still been running it.
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert!(
+        !dir.join("marker.txt").exists(),
+        "the abandoned command kept running: {}",
+        o.combined()
+    );
+}
+
+// The sweep stops a process a task left running on purpose just as readily, so
+// `TASK_NO_REAP` turns it off and restores Go's behavior of leaving everything
+// running.
+#[test]
+fn task_no_reap_leaves_the_abandoned_command_running() {
+    let dir = stage("stop_on_cancel");
+    let o = run_with_env(&dir, &["default"], &[("TASK_NO_REAP", "1")]);
+    assert!(
+        !o.ok(),
+        "the failing dep should still fail the run: {}",
+        o.combined()
+    );
+
+    // The same wait as the sweeping case, where the marker never appears.
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert!(
+        dir.join("marker.txt").exists(),
+        "the abandoned command should have been left running: {}",
+        o.combined()
+    );
+}
+
+// The other direction: a run that succeeds leaves a job a task started
+// deliberately alone — even when it abandoned a task along the way.
+//
+// A deferred command's error is ignored, so deferring onto a `failfast:` task
+// abandons its siblings while the run still returns success. Sweeping on
+// "something was abandoned" alone stopped the deliberate job here; the sweep
+// needs the run to be failing too.
+#[test]
+fn a_completed_run_leaves_a_deliberate_job_running() {
+    let dir = stage("stop_on_cancel");
+    let o = run(&dir, &["no_sweep"]);
+    assert!(
+        o.ok(),
+        "a deferred failure must not fail the run: {}",
+        o.combined()
+    );
+    // The job the run left behind on purpose has to write its marker.
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert!(
+        dir.join("survived.txt").exists(),
+        "a completed run must leave a deliberate job running: {}",
         o.combined()
     );
 }

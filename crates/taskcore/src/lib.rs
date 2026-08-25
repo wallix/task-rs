@@ -29,6 +29,7 @@ pub mod migrate;
 pub mod output;
 pub mod precondition;
 pub mod reader;
+pub(crate) mod reap;
 pub mod requires;
 pub mod slicesext;
 pub mod sort;

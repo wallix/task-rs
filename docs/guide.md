@@ -626,9 +626,15 @@ Alternatively, you can use `--failfast`, which also work for `--parallel`.
 
 Dependencies all start together, so `failfast` stops Task *waiting* for the
 rest and cancels them rather than preventing them from starting: a sibling may
-already have run part of its commands and left their side effects behind. A
-command that has already been handed to the shell is not killed, so a
-long-running process one started keeps going after Task exits.
+already have run part of its commands and left their side effects behind. The
+commands those siblings were running are stopped too, rather than left running
+past the end of the run — the sweep cannot tell those from a process a task left
+running on purpose, so `TASK_NO_REAP=1`, in the environment `task` runs in,
+turns it off. It only happens when the run itself fails; a run that succeeds
+leaves everything alone.
+
+Under `--watch` this applies per iteration, so a server a task started in one
+iteration is stopped if a later iteration fails part-way.
 
 ## Platform specific tasks and commands
 

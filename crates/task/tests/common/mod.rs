@@ -144,12 +144,20 @@ pub fn run_merged(dir: &Path, args: &[&str]) -> Merged {
 /// Runs the binary in `dir` with `args`, capturing output. Output is piped (not
 /// a TTY), so color is disabled and the text matches the Go tests' buffers.
 pub fn run(dir: &Path, args: &[&str]) -> Run {
-    let out = Command::new(BIN)
+    run_with_env(dir, args, &[])
+}
+
+/// [`run`] with extra environment variables, for the settings that have no flag.
+pub fn run_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Run {
+    let mut command = Command::new(BIN);
+    command
         .args(args)
         .current_dir(dir)
-        .env("TASK_NO_GO_DEPRECATION", "1")
-        .output()
-        .expect("spawn task binary");
+        .env("TASK_NO_GO_DEPRECATION", "1");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let out = command.output().expect("spawn task binary");
     Run {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),

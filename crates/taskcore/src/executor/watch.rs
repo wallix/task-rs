@@ -119,7 +119,9 @@ impl Executor {
     /// and concurrency permit until that event arrived.
     async fn run_watch_call(self: &Rc<Self>, call: &Call) {
         let result = self.run_task(call.clone()).await;
-        self.drain_queue().await;
+        // A watch iteration is a teardown boundary of its own, so an abandoned
+        // task cannot survive into the next one.
+        self.drain_queue(result.is_err()).await;
         match result {
             Ok(()) => {
                 self.logger().borrow_mut().errf(
