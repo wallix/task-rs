@@ -109,14 +109,85 @@ fn sprig_helpers_work_in_function_position() {
         assert!(out.contains(want), "expected {want:?} in: {out}");
     }
 
-    // The pipeline spelling renders the same text as the function spelling.
+    // The pipeline spelling renders the same text as the function spelling,
+    // including the five that mean something else as a minijinja builtin filter.
     let piped = run(&dir, &["pipes"]);
     assert!(piped.ok(), "output: {}", piped.combined());
-    for want in ["suffix=dir/fr", "prefix=fr.po", "split=dir,fr.po"] {
+    for want in [
+        "suffix=dir/fr",
+        "prefix=fr.po",
+        "split=dir,fr.po",
+        "default=fallback",
+        "title=HELLO World",
+        "first=dir",
+        "last=fr.po",
+        "join=dir/fr.po",
+    ] {
         assert!(
             piped.combined().contains(want),
             "expected {want:?} in: {}",
             piped.combined()
+        );
+    }
+}
+
+// A file written natively in Jinja keeps standard Jinja meaning: only the Go
+// dialect gets sprig's, and it gets it by translating a pipe into a call rather
+// than by overriding the builtin filters.
+#[test]
+fn jinja_filters_keep_their_standard_meaning() {
+    let dir = stage("template_funcs");
+    let o = run(&dir, &["--taskfile", "jinja.yml", "jinja"]);
+    assert!(o.ok(), "output: {}", o.combined());
+    let out = o.combined();
+    for want in [
+        // Empty is not undefined, so the fallback does not fire...
+        "default=\n",
+        // ...nor does it for a legitimate zero.
+        "zero=0",
+        // Undefined still takes it.
+        "missing=fallback",
+        // Jinja's `title` lowercases the tail.
+        "title=Hello World",
+        // The sprig meaning stays reachable in function position.
+        "sprig_default=fallback",
+        "sprig_title=HELLO World",
+        "sprig_join=dir/fr.po",
+    ] {
+        assert!(out.contains(want), "expected {want:?} in: {out}");
+    }
+}
+
+// The Go dialect keeps sprig's meaning after a pipe, and `--migrate` has to
+// carry that meaning into the converted file: the five helpers whose Jinja
+// builtin means something else are translated to a call, not to a filter, so
+// the migrated Taskfile renders exactly what the Go one did.
+#[test]
+fn migration_preserves_sprig_meaning_after_a_pipe() {
+    let go = stage("template_funcs");
+    let before = run(&go, &["pipes"]);
+    assert!(before.ok(), "output: {}", before.combined());
+
+    let migrated = stage("template_funcs");
+    let w = run(&migrated, &["--migrate", "--write"]);
+    assert!(w.ok(), "stderr: {}", w.stderr);
+    let on_disk = std::fs::read_to_string(migrated.join("Taskfile.yml")).unwrap();
+    // A call with the subject last, not `EMPTY | default("fallback")`, which
+    // would mean "only if undefined" once the file is Jinja.
+    assert!(
+        on_disk.contains(r#"default("fallback", EMPTY)"#),
+        "migrated to: {on_disk}"
+    );
+    // A helper whose builtin already matches sprig stays an idiomatic filter.
+    assert!(on_disk.contains("| trimSuffix("), "migrated to: {on_disk}");
+
+    let after = run(&migrated, &["pipes"]);
+    assert!(after.ok(), "output: {}", after.combined());
+    for line in before.combined().lines().filter(|l| l.contains('=')) {
+        assert!(
+            after.combined().contains(line),
+            "migration changed {line:?}; after: {}",
+            after.combined()
         );
     }
 }

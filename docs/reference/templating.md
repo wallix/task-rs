@@ -269,6 +269,10 @@ called as functions (`joinPath(a, b)`) or filters (`value | trimPrefix("x")`); i
 Go they are called in pipeline/space-separated form (`joinPath a b`,
 `.VALUE | trimPrefix "x"`).
 
+`default`, `title`, `join`, `first` and `last` are the exception: in Jinja the
+*filter* of each of those names is Jinja's own, not Task's — see
+[sprig semantics after a pipe](#sprig-semantics-after-a-pipe-go-dialect).
+
 Most helpers that take a subject accept it in either position, but at opposite
 ends: the function form takes it **last** (`trimSuffix ".po" .ITEM`), which is
 what lets the pipeline form take it first (`.ITEM | trimSuffix ".po"`). `trunc`
@@ -301,7 +305,7 @@ and `regexReplaceAll` are function-only.
 | Function / filter | Description |
 | --- | --- |
 | `trim`, `trimAll(cutset)`, `trimPrefix(prefix)`, `trimSuffix(suffix)` | Trim whitespace or a given cutset/affix |
-| `lower`, `upper`, `title` | Change case |
+| `lower`, `upper`, `title`† | Change case |
 | `contains(substr)`, `hasPrefix(prefix)`, `hasSuffix(suffix)` | Substring tests |
 | `replace(old, new)` | Replace all occurrences |
 | `trunc(n, s)` | First `n` characters (or last `-n` if negative) |
@@ -316,8 +320,11 @@ and `regexReplaceAll` are function-only.
 | Function / filter | Description |
 | --- | --- |
 | `splitList(sep, s)`, `s \| splitList(sep)` | Split a string into a list on `sep` |
-| `join(sep, list)`, `list \| join(sep)` | Join a list into a string with `sep` |
-| `first(list)`, `last(list)`, `list \| first`, `list \| last` | The first / last element |
+| `join(sep, list)`†, `list \| join(sep)` | Join a list into a string with `sep` |
+| `first(list)`†, `last(list)`†, `list \| first`, `list \| last` | The first / last element |
+
+† In the Jinja dialect the filter spelling is minijinja's own; only the call
+form carries sprig's meaning.
 | `len(x)` | Length of a list, map, or string |
 | `splitArgs(s)` | Shell-split a string into an argument list |
 | `index(coll, k…)` | Successive index/key lookups (`index(MATCH, 0)`) |
@@ -327,15 +334,45 @@ and `regexReplaceAll` are function-only.
 `and`, `or`, `not`, `eq`, `ne`, `lt`, `le`, `gt`, `ge` are available for the Go
 dialect. In Jinja, use the native operators (`==`, `!=`, `<`, `and`, `or`,
 `not`, `in`) instead. `default(fallback, value)` is a function in both dialects;
-in Jinja the `| default(fallback)` filter is still minijinja's own, which
-substitutes only for an undefined value.
+in Jinja the `| default(fallback)` filter is Jinja's own — see below.
+
+### sprig semantics after a pipe (Go dialect)
+
+`default`, `title`, `join`, `first` and `last` mean something different in
+[slim-sprig] than the minijinja filters of the same name. In a Go-syntax
+Taskfile the sprig meaning wins, in both call and pipe position.
+
+Jinja Taskfiles are **not** affected — `{{ COUNT | default(10) }}` there is
+Jinja's own filter and still yields `0` for a `COUNT` of `0`. The Go dialect
+gets sprig's meaning by translating `{{ .X | default "y" }}` into the call
+`default("y", X)` rather than into a filter, so `task --migrate` writes that
+call into the converted file and the migrated Taskfile keeps rendering what it
+rendered as Go. Keep the call form when editing a migrated file: rewriting it
+to `X | default("y")` silently switches to Jinja's meaning.
+
+Where the two differ:
+
+- `default` substitutes its fallback for any empty value (`""`, `0`, `false`, an
+  empty list), not only an undefined one.
+- `title` uppercases the first letter of every word and leaves the rest of the
+  word alone, so `HELLO world` becomes `HELLO World` where Jinja's `title`
+  gives `Hello World`.
+- `join` treats a non-list as a one-element list, so a string joins to itself
+  instead of to its characters.
+- `first` and `last` render empty for a value they cannot iterate — a number, a
+  boolean, an undefined variable — where Jinja's raise an error. A string still
+  yields its first or last character.
+
+Every other helper keeps one meaning in both dialects, and migrates to the
+idiomatic filter form (`{{ .X | trimSuffix ".po" }}` becomes
+`{{ X | trimSuffix(".po") }}`).
 
 ### Standard Jinja filters
 
 In the Jinja dialect, minijinja's built-in filters and functions are also
-available — for example `default`, `length`, `join`, `first`, `last`, `reverse`,
-`sort`, `unique`, `map`, `select`, `int`, `float`, `tojson`, and `urlencode`.
-See the
+available — for example `default`, `title`, `join`, `first`, `last`, `length`,
+`reverse`, `sort`, `unique`, `map`, `select`, `int`, `float`, `tojson`, and
+`urlencode`, all with their standard Jinja meaning. See the
 [minijinja filter reference](https://docs.rs/minijinja/latest/minijinja/filters/index.html)
 for the full list.
 

@@ -5,6 +5,7 @@ version: '3'
 # spellings must render the same text.
 vars:
   P: 'dir/fr.po'
+  EMPTY: ''
 
 tasks:
   funcs:
@@ -22,3 +23,11 @@ tasks:
       - 'echo suffix={{.P | trimSuffix ".po"}}'
       - 'echo prefix={{.P | trimPrefix "dir/"}}'
       - 'echo split={{.P | splitList "/" | join ","}}'
+      # The five that mean something else as a Jinja filter, after a pipe.
+      # `default` fires on an empty
+      # value, not only a missing one, so the Go and pipe spellings agree.
+      - 'echo default={{.EMPTY | default "fallback"}}'
+      - 'echo title={{"HELLO world" | title}}'
+      - 'echo first={{.P | splitList "/" | first}}'
+      - 'echo last={{.P | splitList "/" | last}}'
+      - 'echo join={{.P | join ","}}'

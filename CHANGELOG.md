@@ -11,6 +11,11 @@
 - **Go-syntax templates can call the string helpers directly**, not only after
   a pipe, so `{{trimSuffix ".po" .ITEM}}` works. `splitList` was splitting the
   wrong argument. Affected tasks re-run once.
+- **`default`, `title`, `join`, `first` and `last` mean the same on either side
+  of a pipe** in Go-syntax Taskfiles — most visibly, `default` substitutes for
+  any empty value, not only an unset one. Jinja Taskfiles keep Jinja's meaning.
+  Affected tasks re-run once, and a Taskfile already converted needs checking by
+  hand.
 
 ## v4.0.0 - 2026-08-24
 

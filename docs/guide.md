@@ -481,8 +481,10 @@ includes:
 Vars declared in the included Taskfile have preference over the variables in the
 including Taskfile! If you want a variable in an included Taskfile to be
 overridable, use the
-[default function](https://sprig.taskfile.dev/defaults.html):
-<span v-pre>`MY_VAR: '{{ MY_VAR | default("my-default-value") }}'`</span>.
+`default` function:
+<span v-pre>`MY_VAR: '{{ default("my-default-value", MY_VAR) }}'`</span>. Written as a
+call it substitutes for an empty override as well as an unset one; the
+`| default(…)` filter spelling is Jinja's own and only covers an unset one.
 
 :::
 

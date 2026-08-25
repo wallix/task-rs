@@ -46,7 +46,9 @@
 //!
 //! These sprig / Task helpers are registered as minijinja globals and filters:
 //! `OS`, `ARCH`, `numCPU`, `catLines`, `splitLines`, `fromSlash`, `toSlash`,
-//! `exeExt`, `default`, `trim`, `trimAll`, `trimPrefix`, `trimSuffix`, `lower`,
+//! `exeExt`, `default` (a global only, as `title`, `join`, `first` and `last`
+//! are — their filter spellings stay minijinja's), `trim`, `trimAll`,
+//! `trimPrefix`, `trimSuffix`, `lower`,
 //! `upper`, `title`, `contains`, `hasPrefix`, `hasSuffix`, `replace`, `quote`,
 //! `squote`, `urlsafe`, `splitList`, `join`, `first`, `last`, `base`, `dir`,
 //! `ext`, and `isAbs`. Every other sprig helper (`range`-style list
@@ -74,6 +76,16 @@ thread_local! {
     static GO_ENV: Rc<Environment<'static>> = Rc::new(build_go_environment());
     static JINJA_ENV: Rc<Environment<'static>> = Rc::new(build_jinja_environment());
 }
+
+/// The sprig helpers whose meaning differs from the minijinja builtin *filter*
+/// of the same name. In pipe position the Go dialect translates these to a call
+/// with the subject last, rather than to a filter, so the Go meaning survives
+/// without the builtins being overridden for a native Jinja Taskfile — and so
+/// `--migrate` writes a file that keeps rendering what it rendered as Go.
+///
+/// Every name here must also be in [`MAPPED_FUNCS`], which the preflight checks
+/// first; one that is not would be rejected before ever reaching the rewrite.
+const SPRIG_ONLY_IN_CALL_POSITION: &[&str] = &["default", "title", "join", "first", "last"];
 
 /// The set of function names this module maps to minijinja. A Go action that
 /// calls any other identifier is rejected by the preflight.
@@ -795,6 +807,10 @@ fn action_body(action: &str) -> &str {
 /// syntax (`f(a, b)`), and the sprig value-last convention is honored by
 /// registering multi-argument filters with the piped value as their first
 /// parameter (which is what minijinja supplies).
+///
+/// The exception is [`SPRIG_ONLY_IN_CALL_POSITION`]: after a pipe those become
+/// a *call* taking the expression built so far as their last argument, because
+/// the minijinja filter of each of those names means something else.
 fn translate_action(body: &str, tmpl: &str) -> Result<String, TemplaterError> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -813,7 +829,10 @@ fn translate_action(body: &str, tmpl: &str) -> Result<String, TemplaterError> {
     }
 
     let segments = split_pipeline(trimmed);
-    let mut parts: Vec<String> = Vec::with_capacity(segments.len());
+    // The expression built so far. A segment after a pipe either becomes a
+    // filter applied to it, or — for the helpers that minijinja spells
+    // differently — a call taking it as the last argument.
+    let mut expr = String::new();
     for (idx, segment) in segments.iter().enumerate() {
         let tokens = tokenize(segment);
         let Some(first) = tokens.first() else {
@@ -832,11 +851,11 @@ fn translate_action(body: &str, tmpl: &str) -> Result<String, TemplaterError> {
                 .iter()
                 .map(|a| translate_arg(a, tmpl))
                 .collect::<Result<_, _>>()?;
-            let expr = match first.as_str() {
+            let rendered = match first.as_str() {
                 "not" => format!("(not {})", rendered_args.join(" ")),
                 op => format!("({})", rendered_args.join(&format!(" {op} "))),
             };
-            parts.push(expr);
+            expr = join_segment(expr, &rendered);
             continue;
         }
         if is_bare_identifier(first) {
@@ -847,11 +866,20 @@ fn translate_action(body: &str, tmpl: &str) -> Result<String, TemplaterError> {
                     template: tmpl.to_string(),
                 });
             }
-            let rendered_args: Vec<String> = args
+            let mut rendered_args: Vec<String> = args
                 .iter()
                 .map(|a| translate_arg(a, tmpl))
                 .collect::<Result<_, _>>()?;
-            parts.push(format!("{first}({})", rendered_args.join(", ")));
+            // After a pipe, these five take the piped value as their last
+            // argument — sprig's own order — instead of becoming a minijinja
+            // filter, whose builtin of the same name means something else.
+            if idx != 0 && SPRIG_ONLY_IN_CALL_POSITION.contains(&first.as_str()) {
+                rendered_args.push(expr);
+                expr = format!("{first}({})", rendered_args.join(", "));
+                continue;
+            }
+            let rendered = format!("{first}({})", rendered_args.join(", "));
+            expr = join_segment(expr, &rendered);
         } else {
             // The head is a value expression (`.Foo`, a literal, a parenthesized
             // sub-call, …). Values are only valid as the first segment; a value
@@ -862,10 +890,20 @@ fn translate_action(body: &str, tmpl: &str) -> Result<String, TemplaterError> {
                     message: format!("cannot translate pipeline segment {segment:?}"),
                 });
             }
-            parts.push(translate_arg(first, tmpl)?);
+            expr = translate_arg(first, tmpl)?;
         }
     }
-    Ok(parts.join(" | "))
+    Ok(expr)
+}
+
+/// Appends a translated segment to the expression built so far: the first
+/// segment *is* the expression, a later one is a filter applied to it.
+fn join_segment(expr: String, rendered: &str) -> String {
+    if expr.is_empty() {
+        rendered.to_string()
+    } else {
+        format!("{expr} | {rendered}")
+    }
 }
 
 /// Translates a single argument token into a minijinja expression. A
@@ -1083,16 +1121,19 @@ fn register_helpers(env: &mut Environment<'static>) {
     // Every mapped *string* helper gets a function registration here: Go
     // Taskfiles call them in function position (`{{urlsafe .TASK}}`) as often
     // as in a pipeline (`{{.TASK | urlsafe}}`), and `translate_action` emits a
-    // call for the head segment and a filter for every segment after a pipe.
+    // call for the head segment and a filter for every segment after a pipe —
+    // except the names in `SPRIG_ONLY_IN_CALL_POSITION`, which become a call
+    // there too.
     // `trunc`, `regexReplaceAll`, `joinPath`, `splitArgs`, `env`, `index` and
     // the comparisons are still function-only, so `{{.P | trunc 3}}` fails with
     // "unknown filter".
     //
-    // The filter side is registered further down, and for `trim`, `lower`,
-    // `upper`, `title`, `first`, `last`, `join`, `default` and `replace` it is
-    // still minijinja's builtin. Those match sprig except for `title`, `first`,
-    // `last`, `join` and `default`, so for those five the two positions do not
-    // yet agree.
+    // The filter side is registered further down; for `trim`, `lower`, `upper`
+    // and `replace` it is minijinja's builtin, which already matches sprig.
+    // `title`, `first`, `last`, `join` and `default` do not match, so those
+    // builtins are deliberately left alone — a native Jinja Taskfile keeps
+    // Jinja's meaning — and the Go dialect reaches sprig's through the call
+    // `translate_action` emits instead of a filter.
     //
     // These are globals, so a Taskfile variable of the same name shadows one —
     // a `vars:` entry called `join` wins over the helper — but an *undefined*
@@ -1125,8 +1166,8 @@ fn register_helpers(env: &mut Environment<'static>) {
 
     // Subject-last sprig helpers, none of which minijinja offers as a function.
     // The first seven have no builtin at all and are registered as filters by
-    // this module; `replace`, `join` and `default` shadow a builtin only in
-    // function position for now.
+    // this module; `replace`, `join` and `default` shadow a builtin in function
+    // position only.
     env.add_function("splitList", func_split_list);
     env.add_function("trimAll", func_trim_all);
     env.add_function("trimPrefix", func_trim_prefix);
@@ -1169,8 +1210,16 @@ fn register_helpers(env: &mut Environment<'static>) {
     env.add_filter("splitList", filter_split_list);
 
     // These sprig-compatible helpers are also usable as filters. minijinja
-    // ships its own `default`, `trim`, `lower`, `upper`, `title`, `join`,
-    // `first`, `last`, and `replace`; register the remaining ones.
+    // ships its own `trim`, `lower`, `upper` and `replace`, which already match
+    // sprig; register the remaining ones. Five of its builtins do *not* match
+    // and are deliberately left in place, so a Jinja Taskfile keeps Jinja's
+    // meaning; the Go dialect gets sprig's from the call `translate_action`
+    // emits instead (see `SPRIG_ONLY_IN_CALL_POSITION`). They differ in that
+    // `default` substitutes only for an undefined value where sprig substitutes
+    // for any empty one; `title` lowercases the tail of each word where sprig
+    // only re-cases the leading letter; `join` iterates a string's characters
+    // where sprig treats it as one element; and `first`/`last` fail on a
+    // non-sequence where the Go dialect renders empty.
     env.add_filter("trimAll", filter_trim_all);
     env.add_filter("trimPrefix", filter_trim_prefix);
     env.add_filter("trimSuffix", filter_trim_suffix);
@@ -1475,17 +1524,9 @@ fn go_string(value: &JinjaValue) -> String {
 /// none and undefined are skipped rather than rendered. A map still iterates,
 /// yielding its keys, where sprig would stringify the whole map.
 fn func_join(sep: String, list: JinjaValue) -> String {
-    filter_join(list, Some(sep))
-}
-
-/// The body of `join`, taking the subject first the way minijinja hands a piped
-/// value to a filter. `sep` is optional to match the arity of minijinja's
-/// builtin `join`, which this stands in for once registered as a filter.
-fn filter_join(list: JinjaValue, sep: Option<String>) -> String {
     if let Some(s) = list.as_str() {
         return s.to_string();
     }
-    let sep = sep.unwrap_or_default();
     match list.try_iter() {
         Ok(items) => items
             .filter(|v| !v.is_none() && !v.is_undefined())
@@ -1501,30 +1542,17 @@ fn filter_join(list: JinjaValue, sep: Option<String>) -> String {
 /// *first* given value is empty); this takes exactly one, so `{{default "d"}}`
 /// and `{{default "d" .A .B}}` are argument-count errors rather than rendering
 /// `d` and `.A`.
-fn func_default(fallback: JinjaValue, value: JinjaValue) -> JinjaValue {
-    filter_default(value, Some(fallback), None)
-}
-
 /// Sprig `default`: substitutes the fallback for any *empty* value — undefined,
 /// none, `""`, `0`, `false`, or an empty list/map — not just an undefined one
-/// like minijinja's builtin filter of the same name.
+/// like minijinja's builtin filter of the same name, which is left in place for
+/// the Jinja dialect.
 ///
-/// The signature mirrors the builtin's 0..=2 arity so that it *can* stand in for
-/// it once registered as a filter: a bare `| default` falls back to the empty
-/// string, a third argument is still rejected, and the builtin's `boolean`
-/// argument is accepted and ignored — sprig always substitutes for an empty
-/// value. Only the function form is registered here, so none of that is
-/// reachable yet.
-fn filter_default(
-    value: JinjaValue,
-    fallback: Option<JinjaValue>,
-    _boolean: Option<bool>,
-) -> JinjaValue {
-    if value.is_true() {
-        value
-    } else {
-        fallback.unwrap_or_else(|| JinjaValue::from(""))
-    }
+/// Both arguments are required, so a Go `{{default "d"}}` or `{{default "d" .A
+/// .B}}` — sprig's `dfault` is variadic — is an argument-count error rather than
+/// rendering `d` or `.A`. `{{ .X | default }}` is the same error for the same
+/// reason; sprig's zero-`given` form is not supported.
+fn func_default(fallback: JinjaValue, value: JinjaValue) -> JinjaValue {
+    if value.is_true() { value } else { fallback }
 }
 
 fn filter_cat_lines(s: String) -> String {
@@ -1995,10 +2023,11 @@ mod tests {
     }
 
     #[test]
-    fn mapped_default_filter() {
+    fn mapped_default_after_a_pipe() {
         let mut c = cache_with(&[]);
         // Go pipeline syntax (`| default "x"`) is rewritten to minijinja's call
-        // form, and minijinja's builtin default filter handles the value.
+        // form with the subject last, which `func_default` handles — minijinja's
+        // builtin filter of the same name is untouched.
         assert_eq!(
             c.replace("{{ .MISSING | default \"fallback\" }}"),
             "fallback"
@@ -2097,15 +2126,115 @@ mod tests {
         assert!(!has_dotted_access(r#"X | replace("a.b", "")"#));
     }
 
-    // sprig re-cases only the leading letter of each word, and breaks words on
-    // any non-alphanumeric character; minijinja's `title` filter lowercases the
-    // tail and breaks on whitespace only.
+    // The same helpers in pipeline position take the subject first, because
+    // that is the order minijinja passes a piped value to a filter. Both
+    // spellings must agree.
+    #[test]
+    fn sprig_helpers_agree_in_both_positions() {
+        let pairs = [
+            (
+                r#"{{ trimSuffix ".po" .P }}"#,
+                r#"{{ .P | trimSuffix ".po" }}"#,
+            ),
+            (
+                r#"{{ trimAll "dpo/." .P }}"#,
+                r#"{{ .P | trimAll "dpo/." }}"#,
+            ),
+            (
+                r#"{{ hasPrefix "dir/" .P }}"#,
+                r#"{{ .P | hasPrefix "dir/" }}"#,
+            ),
+            (r#"{{ contains "/fr" .P }}"#, r#"{{ .P | contains "/fr" }}"#),
+            (
+                r#"{{ replace "/" "_" .P }}"#,
+                r#"{{ .P | replace "/" "_" }}"#,
+            ),
+            (
+                r#"{{ splitList "/" .P | join "," }}"#,
+                r#"{{ .P | splitList "/" | join "," }}"#,
+            ),
+            (
+                r#"{{ default "fb" .MISSING }}"#,
+                r#"{{ .MISSING | default "fb" }}"#,
+            ),
+            (r#"{{ title .P }}"#, r#"{{ .P | title }}"#),
+            // `dir/fr.po` cannot tell the two `title`s apart: minijinja's
+            // builtin also breaks on ASCII punctuation, and an all-lowercase
+            // input hides its tail-lowercasing. These can.
+            (
+                r#"{{ title "HELLO world" }}"#,
+                r#"{{ "HELLO world" | title }}"#,
+            ),
+            (r#"{{ title "a_b c" }}"#, r#"{{ "a_b c" | title }}"#),
+            (r#"{{ upper .P }}"#, r#"{{ .P | upper }}"#),
+            (r#"{{ lower .P }}"#, r#"{{ .P | lower }}"#),
+            (r#"{{ trim .P }}"#, r#"{{ .P | trim }}"#),
+            (
+                r#"{{ trimPrefix "dir/" .P }}"#,
+                r#"{{ .P | trimPrefix "dir/" }}"#,
+            ),
+            (
+                r#"{{ hasSuffix ".po" .P }}"#,
+                r#"{{ .P | hasSuffix ".po" }}"#,
+            ),
+            (r#"{{ first .MISSING }}"#, r#"{{ .MISSING | first }}"#),
+            (r#"{{ last .MISSING }}"#, r#"{{ .MISSING | last }}"#),
+            (
+                r#"{{ first (splitList "/" .P) }}"#,
+                r#"{{ .P | splitList "/" | first }}"#,
+            ),
+            (
+                r#"{{ last (splitList "/" .P) }}"#,
+                r#"{{ .P | splitList "/" | last }}"#,
+            ),
+            (r#"{{ join "," .P }}"#, r#"{{ .P | join "," }}"#),
+        ];
+        for (func_form, pipe_form) in pairs {
+            let mut c = cache_with(&[("P", "dir/fr.po")]);
+            let (a, b) = (c.replace(func_form), c.replace(pipe_form));
+            // Checked first: once the cache records an error `replace` returns
+            // its input, which would make the mismatch the misleading failure.
+            assert!(
+                !c.is_err(),
+                "{func_form} / {pipe_form} recorded {:?}",
+                c.err()
+            );
+            assert_eq!(a, b, "{func_form} vs {pipe_form}");
+        }
+    }
+
+    // A name the preflight does not know is rejected before the rewrite can
+    // see it, so the call-position set has to be a subset of the mapped funcs.
+    #[test]
+    fn sprig_call_position_names_are_all_mapped() {
+        for name in SPRIG_ONLY_IN_CALL_POSITION {
+            assert!(MAPPED_FUNCS.contains(name), "{name} is not a mapped func");
+        }
+    }
+
+    // sprig re-cases only the leading letter of each word; minijinja's builtin
+    // `title` lowercases the tail as well. Both break on ASCII punctuation, so
+    // only an input with an upper-case tail tells them apart.
     #[test]
     fn title_follows_sprig_not_jinja() {
         let mut c = cache_with(&[("P", "hello-world")]);
         assert_eq!(c.replace(r#"{{ title .P }}"#), "Hello-World");
         assert_eq!(c.replace(r#"{{ title "HELLO world" }}"#), "HELLO World");
         assert_eq!(c.replace(r#"{{ title "a.b c" }}"#), "A.B C");
+        assert!(!c.is_err(), "recorded {:?}", c.err());
+    }
+
+    // sprig wraps a non-list operand in a one-element list; minijinja would
+    // iterate a string's characters and reject a scalar outright.
+    #[test]
+    fn join_treats_a_non_list_as_one_element() {
+        let mut c = cache_with(&[("P", "dir/fr.po")]);
+        assert_eq!(c.replace(r#"{{ join "," .P }}"#), "dir/fr.po");
+        assert_eq!(c.replace(r#"{{ .P | join "," }}"#), "dir/fr.po");
+        assert_eq!(
+            c.replace(r#"{{ join "," (splitList "/" .P) }}"#),
+            "dir,fr.po"
+        );
         assert!(!c.is_err(), "recorded {:?}", c.err());
     }
 
@@ -2156,6 +2285,49 @@ mod tests {
         let mut c = Cache::new(vars);
         assert_eq!(c.replace("{{ first .M }}"), "A");
         assert_eq!(c.replace("{{ last .M }}"), "B");
+        assert!(!c.is_err(), "recorded {:?}", c.err());
+    }
+
+    // sprig's `default` substitutes for any empty value, not just an undefined
+    // one; minijinja's builtin filter of the same name only covers undefined.
+    #[test]
+    fn default_substitutes_for_empty_string() {
+        let mut c = cache_with(&[("EMPTY", "")]);
+        assert_eq!(c.replace(r#"{{ .EMPTY | default "fb" }}"#), "fb");
+        assert_eq!(c.replace(r#"{{ default "fb" .EMPTY }}"#), "fb");
+        assert!(!c.is_err(), "recorded {:?}", c.err());
+    }
+
+    // Every empty value sprig covers, through the call form the Go dialect
+    // translates a pipe into — and which a Jinja Taskfile can write directly.
+    #[test]
+    fn default_substitutes_for_every_empty_value() {
+        let mut c = cache_with(&[]);
+        c.set_dialect(Dialect::Jinja);
+        assert_eq!(c.replace(r#"{{ default("fb", 0) }}"#), "fb");
+        assert_eq!(c.replace(r#"{{ default("fb", false) }}"#), "fb");
+        assert_eq!(c.replace(r#"{{ default("fb", []) }}"#), "fb");
+        assert_eq!(c.replace(r#"{{ default("fb", 1) }}"#), "1");
+        assert!(!c.is_err(), "recorded {:?}", c.err());
+    }
+
+    // The five sprig helpers are reachable as functions in the Jinja dialect,
+    // but the *filters* of those names stay minijinja's own: a Taskfile written
+    // natively in Jinja keeps standard Jinja meaning.
+    #[test]
+    fn jinja_filters_are_not_overridden() {
+        let mut c = cache_with(&[("EMPTY", "")]);
+        c.set_dialect(Dialect::Jinja);
+        // Substitutes only for an undefined value, not for every empty one.
+        assert_eq!(c.replace(r#"{{ EMPTY | default("fb") }}"#), "");
+        assert_eq!(c.replace(r#"{{ MISSING | default("fb") }}"#), "fb");
+        assert_eq!(c.replace(r#"{{ 0 | default("fb") }}"#), "0");
+        // Jinja's `title` lowercases the tail of each word; sprig's does not.
+        assert_eq!(c.replace(r#"{{ "HELLO world" | title }}"#), "Hello World");
+        // Jinja's `join` iterates a string by character.
+        assert_eq!(c.replace(r#"{{ "ab" | join("-") }}"#), "a-b");
+        // The builtin's own arities are untouched, since it *is* the builtin.
+        assert_eq!(c.replace(r#"{{ MISSING | default("fb", true) }}"#), "fb");
         assert!(!c.is_err(), "recorded {:?}", c.err());
     }
 

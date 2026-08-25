@@ -1,0 +1,24 @@
+version: '3'
+templater: jinja
+
+# A file written natively in Jinja keeps standard Jinja meaning: the sprig
+# helpers are reachable as functions, but the filters of those names are
+# minijinja's own.
+vars:
+  P: 'dir/fr.po'
+  EMPTY: ''
+  ZERO: 0
+
+tasks:
+  jinja:
+    cmds:
+      # Jinja's `default` substitutes only for an undefined value...
+      - 'echo default={{ EMPTY | default("fallback") }}'
+      - 'echo zero={{ ZERO | default(10) }}'
+      - 'echo missing={{ MISSING | default("fallback") }}'
+      # ...and its `title` lowercases the tail of each word.
+      - 'echo title={{ "HELLO world" | title }}'
+      # The sprig meaning is still available in function position.
+      - 'echo sprig_default={{ default("fallback", EMPTY) }}'
+      - 'echo sprig_title={{ title("HELLO world") }}'
+      - 'echo sprig_join={{ join(",", P) }}'
