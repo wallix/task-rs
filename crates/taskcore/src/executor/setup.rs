@@ -87,7 +87,7 @@ impl Executor {
                 .to_string_lossy()
                 .into_owned();
             self.logger().borrow_mut().warnf(&format!(
-                "{path} uses the deprecated Go template dialect; run `task --migrate {path}` to convert it to Jinja (Go template support will be removed in a future release)"
+                "{path} uses the deprecated Go template dialect; run `task --migrate {path}` to convert it to Jinja (Go template support will be removed in a future release)\n"
             ));
         }
     }

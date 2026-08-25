@@ -16,6 +16,7 @@
   any empty value, not only an unset one. Jinja Taskfiles keep Jinja's meaning.
   Affected tasks re-run once, and a Taskfile already converted needs checking by
   hand.
+- **The Go-template deprecation warning no longer runs into the next line.**
 
 ## v4.0.0 - 2026-08-24
 

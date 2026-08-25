@@ -98,6 +98,13 @@ fn go_dialect_warns_jinja_does_not() {
         stderr.contains("deprecated Go template dialect") && stderr.contains("--migrate"),
         "expected deprecation warning, got: {stderr}"
     );
+    // The warning must occupy a line of its own instead of running into
+    // whatever is written next. Checked as an explicit newline rather than via
+    // `lines()`, which would also accept an unterminated final line.
+    assert!(
+        stderr.contains("will be removed in a future release)\n"),
+        "warning should be newline-terminated, got: {stderr}"
+    );
 
     // After migrating, the file is Jinja and no longer warns.
     let jinja = taskfile_dir(GO_TASKFILE);
