@@ -1,6 +1,13 @@
 # Changelog
 
-## v4.0.0
+## Unreleased
+
+- **Quoted strings in Go-syntax templates keep their dots**, so
+  `{{ .FILE | replace ".tar.gz" "" }}` strips what it was given. Affected tasks
+  re-run once, and a Taskfile already converted by `task --migrate --write`
+  needs checking by hand.
+
+## v4.0.0 - 2026-08-24
 
 Task is now a Rust program. v4.0.0 is a full rewrite that aims to be drop-in
 compatible.

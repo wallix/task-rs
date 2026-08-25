@@ -119,3 +119,34 @@ fn migrate_is_idempotent() {
     assert!(again.ok());
     assert!(again.stderr.contains("already declares"));
 }
+
+/// A Go-dialect Taskfile whose template holds a dot inside a string literal —
+/// the shape that used to lose the dot and render `report.` instead of
+/// `report`, both when run directly and after `--migrate --write`.
+const DOTTED_LITERAL_TASKFILE: &str = "version: '3'\n\nvars:\n  NAME: 'report.tar.gz'\ntasks:\n  strip:\n    cmds:\n      - 'echo out={{ .NAME | replace \".tar.gz\" \"\" }}'\n";
+
+#[test]
+fn dot_inside_a_string_literal_renders_and_migrates() {
+    // The Go dialect renders the literal as written.
+    let go = taskfile_dir(DOTTED_LITERAL_TASKFILE);
+    let r = common::run(&go, &["strip"]);
+    assert!(r.ok(), "stderr: {}", r.stderr);
+    let combined = format!("{}{}", r.stdout, r.stderr);
+    assert!(combined.contains("out=report"), "output: {combined}");
+    assert!(!combined.contains("out=report."), "dot leaked: {combined}");
+
+    // Migration keeps the literal intact, and the converted file still runs.
+    let jinja = taskfile_dir(DOTTED_LITERAL_TASKFILE);
+    let w = common::run(&jinja, &["--migrate", "--write"]);
+    assert!(w.ok(), "stderr: {}", w.stderr);
+    let on_disk = std::fs::read_to_string(jinja.join("Taskfile.yml")).unwrap();
+    assert!(
+        on_disk.contains(r#"replace(".tar.gz", "")"#),
+        "migrated to: {on_disk}"
+    );
+    let r = common::run(&jinja, &["strip"]);
+    assert!(r.ok(), "stderr: {}", r.stderr);
+    let combined = format!("{}{}", r.stdout, r.stderr);
+    assert!(combined.contains("out=report"), "output: {combined}");
+    assert!(!combined.contains("out=report."), "dot leaked: {combined}");
+}

@@ -36,6 +36,12 @@ The dialect is resolved **per file**:
   (`{{/* … */}}`) mark a file as Go; anything else (including a file with no
   templates) is treated as Jinja.
 
+  Detection is textual: a dot that starts an identifier and is not preceded by
+  a letter, digit, `_`, `)`, `"` or `'` marks the file as Go — **even inside a
+  string**. A native Jinja file containing, say,
+  `{{ PATH | replace("/.git", "") }}` is therefore misread and fails to
+  translate. Set `templater: jinja` explicitly on such a file.
+
 Files that resolve to the Go dialect emit a one-time deprecation warning. Go
 template support will be removed in a future release. Convert a Taskfile with:
 

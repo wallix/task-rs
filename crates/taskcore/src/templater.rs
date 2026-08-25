@@ -156,7 +156,7 @@ pub enum TemplaterError {
     },
     /// The translated template failed to render.
     Render {
-        /// The (translated) template string.
+        /// The template string as the user wrote it, before translation.
         template: String,
         /// The underlying engine message.
         message: String,
@@ -558,6 +558,14 @@ fn action_looks_go(body: &str) -> bool {
 /// Reports whether `body` contains Go dotted field access: a `.` that begins an
 /// identifier and is not preceded by an identifier character, a `)`, or a quote
 /// (so `x.y` attribute access, `1.5`, and `"a.b"` do not count).
+///
+/// The check is positional rather than literal-aware, and the preceding-byte set
+/// is narrow: any dot starting an identifier and preceded by something outside
+/// it counts, *including* one inside a literal (`replace("/.git", "")`). A Jinja
+/// file holding such a string is therefore misread as Go. `rewrite_dots` keeps
+/// the literal intact, but the dialect is decided per file, so that action —
+/// and every other native Jinja pipeline in the file — fails to translate, its
+/// variable rejected as an unsupported construct.
 fn has_dotted_access(body: &str) -> bool {
     let b = body.as_bytes();
     for (idx, &c) in b.iter().enumerate() {
@@ -966,14 +974,55 @@ fn is_bare_identifier(token: &str) -> bool {
     token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Copies a Go literal into `out`, starting just after the opening `quote` and
+/// stopping after the matching closing one: interpreted (`"…"`, where a
+/// backslash escapes the next character), raw (backquoted, no escapes), or a
+/// rune (`'…'`). An unterminated literal consumes the rest of the input rather
+/// than guessing where it ended.
+///
+/// A raw literal keeps its backquotes: minijinja has no backquoted string to
+/// translate one into, so the rewrite leaves it alone rather than inventing a
+/// spelling for it. Such an action fails to render either way, and `--migrate`
+/// writes it out unchanged — it is not render-checked.
+fn copy_literal<I: Iterator<Item = char>>(quote: char, chars: &mut I, out: &mut String) {
+    let escapes = quote != '`';
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if escapes && c == '\\' {
+            if let Some(escaped) = chars.next() {
+                out.push(escaped);
+            }
+            continue;
+        }
+        if c == quote {
+            break;
+        }
+    }
+}
+
 /// Rewrites Go dotted field access into minijinja variable access by dropping a
 /// dot that immediately precedes an identifier character. `.Foo.Bar` becomes
 /// `Foo.Bar`; interior dots (`Foo.Bar`) are left untouched.
+///
+/// String literals are copied verbatim, so the `.` in `trimSuffix ".po" .ITEM`
+/// stays part of the suffix instead of being read as field access. An
+/// unterminated literal swallows the remainder, so dots after it are left
+/// alone too — the same way `tokenize` treats it.
 fn rewrite_dots(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut prev: Option<char> = None;
     let mut chars = body.chars().peekable();
     while let Some(c) = chars.next() {
+        // String and rune literals are opaque to the rewrite.
+        if matches!(c, '"' | '\'' | '`') {
+            out.push(c);
+            copy_literal(c, &mut chars, &mut out);
+            // `prev` records the opening quote, not the closing one. Both are
+            // the same character, and neither is an identifier character, so a
+            // `.Foo` right after the literal is still rewritten either way.
+            prev = Some(c);
+            continue;
+        }
         if c == '.' {
             let next_is_ident = chars
                 .peek()
@@ -1748,6 +1797,62 @@ mod tests {
         assert!(!c.is_err());
     }
 
+    // A `.` inside a string literal is part of the literal, not field access.
+    #[test]
+    fn dots_inside_string_literals_are_preserved() {
+        let mut c = cache_with(&[("P", "a.b.c")]);
+        assert_eq!(c.replace(r#"{{ .P | replace ".b." "-" }}"#), "a-c");
+        assert_eq!(c.replace(r#"{{ .P | splitList "." | join "/" }}"#), "a/b/c");
+        assert_eq!(c.replace(r#"{{ if eq .P "a.b.c" }}yes{{ end }}"#), "yes");
+        assert_eq!(c.replace(r#"{{ .P | splitList "." | join "." }}"#), "a.b.c");
+        assert!(!c.is_err(), "recorded {:?}", c.err());
+    }
+
+    // `to_jinja` shares `rewrite_dots`, so `--migrate` preserves them too.
+    #[test]
+    fn migration_preserves_dots_inside_string_literals() {
+        assert_eq!(
+            to_jinja(r#"{{ .P | replace ".b." "-" }}"#).expect("migrates"),
+            r#"{{ P | replace(".b.", "-") }}"#
+        );
+        assert_eq!(
+            to_jinja(r#"{{trimSuffix ".po" .ITEM}}"#).expect("migrates"),
+            r#"{{ trimSuffix(".po", ITEM) }}"#
+        );
+    }
+
+    // A raw (backquoted) Go literal survives the rewrite intact like the other
+    // literal forms, but unlike them it has no minijinja spelling, so the
+    // action fails to render whether or not its body was mangled.
+    #[test]
+    fn raw_literals_survive_the_rewrite_but_do_not_render() {
+        let mut c = cache_with(&[("P", "a.b.c")]);
+        let raw = "{{ .P | replace `.b.` \"-\" }}";
+        // The rewrite carries the `.b.` through untouched...
+        assert_eq!(
+            to_jinja(raw).expect("migrates"),
+            "{{ P | replace(`.b.`, \"-\") }}"
+        );
+        // ...but minijinja cannot parse the result, so the action is left as
+        // written and the failure is recorded.
+        assert_eq!(c.replace(raw), raw);
+        assert!(c.is_err());
+    }
+
+    // A dot starting an identifier and preceded by anything outside the
+    // identifier set still reads as field access, even inside a literal, so a
+    // native Jinja file holding one is misdetected as Go. Locked in as known
+    // behaviour: `templater: jinja` is the way out.
+    #[test]
+    fn dot_after_a_non_identifier_inside_a_literal_looks_go() {
+        assert!(has_dotted_access(r#"X | replace("/.git", "")"#));
+        assert!(has_dotted_access(r#"X | replace(" .b", "")"#));
+        assert!(has_dotted_access(r#"X | replace("*.rs", "")"#));
+        // A dot straight after an identifier character or a quote does not.
+        assert!(!has_dotted_access(r#"X | replace(".b", "")"#));
+        assert!(!has_dotted_access(r#"X | replace("a.b", "")"#));
+    }
+
     #[test]
     fn mapped_trim_prefix() {
         let mut c = cache_with(&[("P", "prefix-value")]);
@@ -1909,5 +2014,16 @@ mod tests {
         assert_eq!(rewrite_dots(".FOO.BAR"), "FOO.BAR");
         assert_eq!(rewrite_dots("FOO.BAR"), "FOO.BAR");
         assert_eq!(rewrite_dots(".FOO | trim"), "FOO | trim");
+        // Every Go literal form is copied verbatim, dots included.
+        assert_eq!(rewrite_dots(r#"".po""#), r#"".po""#);
+        assert_eq!(rewrite_dots("`.po`"), "`.po`");
+        assert_eq!(rewrite_dots("'.'"), "'.'");
+        // A raw literal takes no escapes, and a literal never hides the
+        // rewrite of the field access that follows it.
+        assert_eq!(rewrite_dots(r#"`raw " .x`.Y"#), r#"`raw " .x`Y"#);
+        assert_eq!(rewrite_dots(r#""\".po" .Y"#), r#""\".po" Y"#);
+        // An unterminated literal swallows the rest instead of panicking.
+        assert_eq!(rewrite_dots(r#""open .po"#), r#""open .po"#);
+        assert_eq!(rewrite_dots(r#""trailing \"#), r#""trailing \"#);
     }
 }
