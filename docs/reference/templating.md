@@ -269,6 +269,11 @@ called as functions (`joinPath(a, b)`) or filters (`value | trimPrefix("x")`); i
 Go they are called in pipeline/space-separated form (`joinPath a b`,
 `.VALUE | trimPrefix "x"`).
 
+Most helpers that take a subject accept it in either position, but at opposite
+ends: the function form takes it **last** (`trimSuffix ".po" .ITEM`), which is
+what lets the pipeline form take it first (`.ITEM | trimSuffix ".po"`). `trunc`
+and `regexReplaceAll` are function-only.
+
 ### Platform and environment
 
 | Function | Description |
@@ -310,18 +315,20 @@ Go they are called in pipeline/space-separated form (`joinPath a b`,
 
 | Function / filter | Description |
 | --- | --- |
-| `s \| splitList(sep)` | Split a string into a list on `sep` |
-| `list \| join(sep)` | Join a list into a string with `sep` |
-| `list \| first`, `list \| last` | The first / last element |
+| `splitList(sep, s)`, `s \| splitList(sep)` | Split a string into a list on `sep` |
+| `join(sep, list)`, `list \| join(sep)` | Join a list into a string with `sep` |
+| `first(list)`, `last(list)`, `list \| first`, `list \| last` | The first / last element |
 | `len(x)` | Length of a list, map, or string |
 | `splitArgs(s)` | Shell-split a string into an argument list |
 | `index(coll, k…)` | Successive index/key lookups (`index(MATCH, 0)`) |
 
 ### Comparison and logic (Go dialect)
 
-`and`, `or`, `not`, `eq`, `ne`, `lt`, `le`, `gt`, `ge` and `default(value)` are
-available for the Go dialect. In Jinja, use the native operators (`==`, `!=`,
-`<`, `and`, `or`, `not`, `in`) and the `default` filter instead.
+`and`, `or`, `not`, `eq`, `ne`, `lt`, `le`, `gt`, `ge` are available for the Go
+dialect. In Jinja, use the native operators (`==`, `!=`, `<`, `and`, `or`,
+`not`, `in`) instead. `default(fallback, value)` is a function in both dialects;
+in Jinja the `| default(fallback)` filter is still minijinja's own, which
+substitutes only for an undefined value.
 
 ### Standard Jinja filters
 

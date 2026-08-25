@@ -8,6 +8,9 @@
   needs checking by hand.
 - **An escaped quote works inside a Go-syntax template string.** A Taskfile
   already converted by `task --migrate --write` needs checking by hand.
+- **Go-syntax templates can call the string helpers directly**, not only after
+  a pipe, so `{{trimSuffix ".po" .ITEM}}` works. `splitList` was splitting the
+  wrong argument. Affected tasks re-run once.
 
 ## v4.0.0 - 2026-08-24
 

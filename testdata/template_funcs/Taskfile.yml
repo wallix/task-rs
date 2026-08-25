@@ -1,0 +1,24 @@
+version: '3'
+
+# Each sprig helper is called in function position, where the subject is the
+# last argument, and again after a pipe, where it is the first. The two
+# spellings must render the same text.
+vars:
+  P: 'dir/fr.po'
+
+tasks:
+  funcs:
+    cmds:
+      - 'echo suffix={{trimSuffix ".po" .P}}'
+      - 'echo prefix={{trimPrefix "dir/" .P}}'
+      - 'echo split={{join "," (splitList "/" .P)}}'
+      - 'echo has={{hasPrefix "dir/" .P}}{{hasSuffix ".mo" .P}}'
+      - 'echo first={{first (splitList "/" .P)}}'
+      - 'echo default={{default "fallback" .MISSING}}'
+      - 'echo title={{title "hello wide world"}}'
+
+  pipes:
+    cmds:
+      - 'echo suffix={{.P | trimSuffix ".po"}}'
+      - 'echo prefix={{.P | trimPrefix "dir/"}}'
+      - 'echo split={{.P | splitList "/" | join ","}}'

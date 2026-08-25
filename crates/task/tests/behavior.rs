@@ -88,3 +88,35 @@ fn version_1_schema_is_rejected() {
         o.combined()
     );
 }
+
+// The sprig helpers are reachable in Go function position, not only after a
+// pipe, and take the subject as their last argument there.
+#[test]
+fn sprig_helpers_work_in_function_position() {
+    let dir = stage("template_funcs");
+    let o = run(&dir, &["funcs"]);
+    assert!(o.ok(), "output: {}", o.combined());
+    let out = o.combined();
+    for want in [
+        "suffix=dir/fr",
+        "prefix=fr.po",
+        "split=dir,fr.po",
+        "has=truefalse",
+        "first=dir",
+        "default=fallback",
+        "title=Hello Wide World",
+    ] {
+        assert!(out.contains(want), "expected {want:?} in: {out}");
+    }
+
+    // The pipeline spelling renders the same text as the function spelling.
+    let piped = run(&dir, &["pipes"]);
+    assert!(piped.ok(), "output: {}", piped.combined());
+    for want in ["suffix=dir/fr", "prefix=fr.po", "split=dir,fr.po"] {
+        assert!(
+            piped.combined().contains(want),
+            "expected {want:?} in: {}",
+            piped.combined()
+        );
+    }
+}
