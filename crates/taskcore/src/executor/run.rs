@@ -254,6 +254,20 @@ impl Executor {
         join_queued(self, tasks, self.failfast).await
     }
 
+    /// Whether any of these calls will be watched, so a caller can tell before
+    /// the run starts. Watch mode is entered by the flag *or* by a task's own
+    /// `watch: true`, and the two must be treated alike: the watch loop blocks
+    /// the runtime thread, so anything that needs the runtime to keep turning —
+    /// the interrupt handler — has to be skipped for both.
+    pub fn will_watch(&self, calls: &[Call]) -> bool {
+        if self.watch {
+            return true;
+        }
+        calls
+            .iter()
+            .any(|call| self.get_task(call).is_ok_and(|task| task.watch))
+    }
+
     fn split_regular_and_watch(
         &self,
         calls: &[Call],
@@ -501,14 +515,18 @@ impl Executor {
             idle.await;
         }
         if self.queue.abandoned.replace(false) && failed {
-            self.report_swept(crate::reap::stop_commands().await);
+            self.report_swept(
+                crate::reap::stop_commands().await,
+                "left by the cancelled run",
+            );
         }
     }
 
-    /// Logs what the sweep did. What it stopped is a detail of a run that was
-    /// being torn down anyway, so it is verbose-only; what it *failed* to stop
-    /// is a process still running that nobody is watching, so it warns.
-    fn report_swept(&self, swept: crate::reap::Swept) {
+    /// Logs what a sweep did, `occasion` naming what prompted it. What it
+    /// signalled is a detail of a run that was ending anyway, so it is
+    /// verbose-only; what it *failed* to signal is a process still running that
+    /// nobody is watching, so it warns.
+    pub(super) fn report_swept(&self, swept: crate::reap::Swept, occasion: &str) {
         let logger = self.logger();
         let mut logger = logger.borrow_mut();
         if swept.asked > 0 {
@@ -520,7 +538,7 @@ impl Executor {
             logger.verbose_errf(
                 Color::Yellow,
                 &format!(
-                    "task: signalled {} process(es) left by the cancelled run{killed}\n",
+                    "task: signalled {} process(es) {occasion}{killed}\n",
                     swept.asked
                 ),
             );
@@ -532,8 +550,7 @@ impl Executor {
         if swept.declined {
             logger.verbose_errf(
                 Color::Yellow,
-                "task: this process adopts orphans, so the commands a cancelled \
-                 run left behind were not stopped\n",
+                "task: this process adopts orphans, so no command was signalled\n",
             );
         }
         if let Some(found) = swept.truncated_at {

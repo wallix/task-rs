@@ -2326,6 +2326,33 @@ Dry run mode (`--dry`) compiles and steps through each task, printing the
 commands that would be run without executing them. This is useful for debugging
 your Taskfiles.
 
+## Interrupting a run
+
+Pressing <kbd>Ctrl-C</kbd> escalates over three signals:
+
+1. The first is reported and nothing else — your terminal has already delivered
+   it to every command in the foreground group, and signalling them again would
+   cut short a command's own cleanup.
+2. The second is reported and passed on to the commands Task started. That
+   matters when Task was signalled by pid rather than through a terminal, where
+   nothing reached them the first time.
+3. The third forces shutdown: Task stops the commands still running and exits
+   `1` without waiting for them.
+
+Task v3 reports all three and then exits without touching the commands; steps 2
+and 3 above are additions.
+
+A single `SIGTERM` is only reported, so a supervisor that sends one and then
+`SIGKILL` gets no cleanup at all — nothing runs on a `SIGKILL`. Give Task a
+second signal, or time to act on the first.
+
+Watch sessions get none of this escalation. A `SIGTERM` ends the session and
+leaves its commands running; an interrupt ends an idle session, but one arriving
+while a command is running kills that command and leaves the session watching.
+
+Setting [`TASK_NO_REAP=1`](./reference/environment.md#task-no-reap) turns off
+both the stopping and the passing on.
+
 ## Ignore errors
 
 You have the option to ignore errors during command execution. Given the

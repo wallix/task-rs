@@ -99,13 +99,19 @@ enabled by default on all platforms in the future.
 ### `TASK_NO_REAP`
 
 When a run *fails* after being torn down part-way — a `failfast:` dependency
-failing — the commands it abandoned keep running, so Task walks its own process
-tree and stops what it finds. It cannot attribute a process to the task that
-started it, so a job a task left running deliberately is stopped along with the
-rest. Set `TASK_NO_REAP=1` to turn the sweep off and leave everything running.
-Valid values are `true` (`1`) or `false` (`0`); anything else leaves it on.
+failing, a third interrupt forcing shutdown — the commands it abandoned keep
+running, so Task walks its own process tree and stops what it finds. It cannot
+attribute a process to the task that started it, so a job a task left running
+deliberately is stopped along with the rest. Set `TASK_NO_REAP=1` to turn the
+sweep off and leave everything running, including at a forced shutdown. Valid
+values are `true` (`1`) or `false` (`0`); anything else leaves it on.
 
 A run that succeeds never sweeps, even if a task was abandoned along the way.
+
+`TASK_NO_REAP=1` also stops the signal relay: from the second interrupt on,
+Task passes the signal to the commands it started, and the switch suppresses
+that too, so a command only ever sees what the terminal delivered to it
+directly.
 
 ### `TASK_VK_LOCK_TOKEN`
 

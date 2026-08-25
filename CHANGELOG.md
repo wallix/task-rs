@@ -31,6 +31,8 @@
 - **A failing run stops the commands it leaves behind** instead of orphaning
   them. It cannot tell those from a job a task backgrounded on purpose, so both
   are stopped; `TASK_NO_REAP=1` turns that off.
+- **Ctrl-C reaches the commands, not just the runner.** The second press is
+  passed on to them, and the third stops them before exiting.
 
 ## v4.0.0 - 2026-08-24
 

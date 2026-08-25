@@ -10,6 +10,8 @@
 
 mod common;
 use common::{empty_case_dir, run, run_with_env, stage};
+#[cfg(unix)]
+use std::path::Path;
 
 // Ports Go `TestDry`.
 #[test]
@@ -137,6 +139,214 @@ fn a_cancelled_run_stops_the_command_it_abandoned() {
         !dir.join("marker.txt").exists(),
         "the abandoned command kept running: {}",
         o.combined()
+    );
+}
+
+// Three interrupts force a shutdown: the first two are only reported, and the
+// third stops the commands and exits, whatever the run was about to report.
+//
+// The command ignores `SIGINT` on purpose. One that takes it is killed by the
+// first — a terminal delivers it to the whole group — and the run then fails on
+// the command's status, with nothing left for the third to force out.
+#[cfg(unix)]
+#[test]
+fn the_third_interrupt_forces_shutdown_and_stops_the_commands() {
+    let dir = stage("stop_on_cancel");
+    let child = spawn_in_own_group(&dir, "stubborn");
+    wait_for(&dir.join("started.txt"));
+
+    // Delivered to the whole group, as a terminal's Ctrl-C is.
+    for _ in 0..3 {
+        signal_group(&child, "INT");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let o = child.wait_with_output().expect("wait for task");
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+
+    // Named as Task v3 names it, which is why the signal is quoted.
+    assert_eq!(
+        out.matches("Signal received: \"interrupt\"\n").count(),
+        2,
+        "the first two signals are only reported, got: {out}{err}"
+    );
+    assert!(
+        err.contains("Forcing shutdown"),
+        "the third forces shutdown, got: {out}{err}"
+    );
+    // The run's own error must not win the race with the forced exit.
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "a forced shutdown exits 1, got: {out}{err}"
+    );
+
+    // Long enough for the command to have written its marker, had it been left
+    // running.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    assert!(
+        !dir.join("marker.txt").exists(),
+        "the forced shutdown must stop the command: {out}{err}"
+    );
+}
+
+// One signal is reported and nothing else: the run continues to its own end.
+// This is the documented cost of the escalation — a single `SIGTERM`, which is
+// what a supervisor sends before its `SIGKILL`, no longer stops `task`.
+//
+// Sent to the pid rather than the group, as a supervisor sends it: the command
+// never sees it, so what the run does next is the engine's decision alone.
+#[cfg(unix)]
+#[test]
+fn one_signal_is_only_reported() {
+    let dir = stage("stop_on_cancel");
+    let child = spawn_in_own_group(&dir, "stubborn");
+    wait_for(&dir.join("started.txt"));
+
+    signal_pid(&child, "TERM");
+    let o = child.wait_with_output().expect("wait for task");
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+
+    assert_eq!(
+        out.matches("Signal received: \"terminated\"\n").count(),
+        1,
+        "expected one report, got: {out}{err}"
+    );
+    assert_eq!(o.status.code(), Some(0), "the run finishes: {out}{err}");
+    assert!(
+        dir.join("marker.txt").exists(),
+        "the command ran to its end: {out}{err}"
+    );
+}
+
+// Spawns the binary as its own process-group leader, so signalling that group
+// cannot reach the test harness.
+#[cfg(unix)]
+fn spawn_in_own_group(dir: &Path, task: &str) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    std::process::Command::new(common::BIN)
+        .arg(task)
+        .current_dir(dir)
+        .env("TASK_NO_GO_DEPRECATION", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn task binary")
+}
+
+// Sends `signal` to the child's whole process group, as a terminal would.
+#[cfg(unix)]
+fn signal_group(child: &std::process::Child, signal: &str) {
+    // `-s` and `--`: the negative pid is the process group, not an option.
+    let status = std::process::Command::new("kill")
+        .arg("-s")
+        .arg(signal)
+        .arg("--")
+        .arg(format!("-{}", child.id()))
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "could not signal the task process group");
+}
+
+// Sends `signal` to the task process alone, as a supervisor does.
+#[cfg(unix)]
+fn signal_pid(child: &std::process::Child, signal: &str) {
+    let status = std::process::Command::new("kill")
+        .arg("-s")
+        .arg(signal)
+        .arg(child.id().to_string())
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "could not signal the task process");
+}
+
+// Waits for a file the running command creates, so a signal cannot arrive before
+// there is a command to receive it.
+#[cfg(unix)]
+fn wait_for(path: &Path) {
+    for _ in 0..200 {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("{} never appeared", path.display());
+}
+
+// The headline mechanism: from the second signal on, the signal is passed to
+// the commands. `stubborn` ignores `SIGINT`, so this sends `SIGTERM` by pid —
+// the shape where the terminal delivered nothing to the command itself — and
+// the command has to die of the relayed signal rather than run to its marker.
+#[cfg(unix)]
+#[test]
+fn a_second_signal_is_passed_to_the_commands() {
+    let dir = stage("stop_on_cancel");
+    let child = spawn_in_own_group(&dir, "stubborn");
+    wait_for(&dir.join("started.txt"));
+
+    // Twice: the first is only reported, the second is relayed.
+    for _ in 0..2 {
+        signal_pid(&child, "TERM");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let o = child.wait_with_output().expect("wait for task");
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+
+    assert_eq!(
+        out.matches("Signal received: \"terminated\"\n").count(),
+        2,
+        "both signals are reported, got: {out}{err}"
+    );
+    // Its sleep is 3s; the relay must have cut it short well before that.
+    assert!(
+        !dir.join("marker.txt").exists(),
+        "the relayed signal did not reach the command: {out}{err}"
+    );
+}
+
+// A task's own `watch: true` enters the same loop `--watch` does, so the
+// interrupt handler has to be skipped for it as well. Installing it there
+// replaced the default disposition of both signals with a handler the blocked
+// runtime never polls, leaving the process answering only to `SIGKILL`.
+#[cfg(unix)]
+#[test]
+fn a_watch_task_still_dies_on_sigterm() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = stage("watch_signal");
+    let mut child = spawn_in_own_group(&dir, "watched");
+    // Let the watch loop reach its blocking receive.
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    signal_pid(&child, "TERM");
+
+    // Waited with a deadline rather than `wait_with_output`: the bug this
+    // guards leaves the process deaf to the signal, and a hang is a worse
+    // failure than a red assertion.
+    let mut status = None;
+    for _ in 0..100 {
+        match child.try_wait().expect("poll task binary") {
+            Some(s) => {
+                status = Some(s);
+                break;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("a watch task ignored SIGTERM");
+    };
+    // Terminated by that signal specifically — `code() == None` alone would
+    // also accept the `SIGKILL` a stuck process eventually needs.
+    assert_eq!(
+        status.signal(),
+        Some(15),
+        "a watch task must die of SIGTERM, got {status:?}"
     );
 }
 

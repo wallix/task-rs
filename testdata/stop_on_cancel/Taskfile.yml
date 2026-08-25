@@ -52,3 +52,12 @@ tasks:
     deps:
       - boom
       - slow
+
+  # Ignores the interrupt, so the run survives one — a command that takes it dies
+  # on the first, and the engine reports that failure rather than the signal —
+  # and the forced shutdown has something left to stop. It does take the
+  # `SIGTERM` the sweep starts with. The marker is written only if the command
+  # was allowed to run on.
+  stubborn:
+    cmds:
+      - sh -c "trap '' INT; touch started.txt; sleep 3; touch marker.txt"

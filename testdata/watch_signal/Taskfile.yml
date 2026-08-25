@@ -1,0 +1,13 @@
+version: '3'
+
+tasks:
+  # Watch mode entered by the task rather than by `--watch`. The interrupt
+  # handler must be skipped for this too: the watch loop blocks the runtime, so
+  # a handler installed here would replace the default disposition of both
+  # signals with one that is never polled, leaving `SIGKILL` the only way out.
+  watched:
+    watch: true
+    sources:
+      - src.txt
+    cmds:
+      - echo watching

@@ -195,6 +195,32 @@ async fn run_engine(cli: Cli) -> Result<ExitCode, CliError> {
 
     let executor = Rc::new(executor);
 
+    // Take over SIGINT/SIGTERM before anything runs, so a forced shutdown can
+    // stop the running commands instead of orphaning them. Commands share this
+    // process's group, so a terminal's Ctrl-C already reaches them; what the
+    // handler adds is that final sweep, and a signal for commands that were
+    // never in a terminal's foreground group at all.
+    //
+    // Not in watch mode, matching Task v3: the watch loop blocks the runtime on
+    // a synchronous receive, so the handler would not be polled at all and the
+    // forced-shutdown escape could not fire. What a watch session gets instead
+    // is the disposition it had before — no escalation: a `SIGTERM` ends it and
+    // leaves its commands, and an interrupt ends an idle session, while one with
+    // a command running kills that command and watches on, because the shell
+    // interpreter takes the interrupt for the job it is driving.
+    //
+    // Asked of the calls rather than the flag, because a task's own
+    // `watch: true` enters the same loop: installing the handler there would
+    // replace the default disposition of both signals with one that is never
+    // polled, leaving the process answering to nothing but `SIGKILL`.
+    //
+    // An interactive `prompt:` blocks the runtime the same way, for as long as
+    // it waits on stdin, so signals arriving at a prompt are lost too. Moving
+    // that read off the runtime thread is a change of its own.
+    if !executor.will_watch(&calls) {
+        executor.intercept_interrupt_signals();
+    }
+
     // `--status` reports fingerprint state without running the tasks.
     if cli.status {
         return executor

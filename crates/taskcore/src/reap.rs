@@ -18,8 +18,10 @@
 //! * A terminal's Ctrl-C already reaches them, precisely because they share the
 //!   group. The sweep is therefore not how an interrupt gets delivered; it is for
 //!   the commands nothing signalled at all — those abandoned part-way through a
-//!   run. `SIGTERM` is the signal for that, with a `SIGKILL` for whatever ignores
-//!   it.
+//!   run, and those still running when the engine was signalled by pid rather
+//!   than through a terminal. `SIGTERM` is the signal for tearing a run down,
+//!   with a `SIGKILL` for whatever ignores it; a relayed interrupt passes on the
+//!   signal the engine was itself sent.
 //!
 //! The sweep is deliberately blunt: it stops *every* command still running, with
 //! no way to attribute one to the task that started it — a job a task
@@ -40,7 +42,9 @@
 
 /// How to stop a command.
 #[derive(Clone, Copy, Debug)]
-enum Stop {
+pub(crate) enum Stop {
+    /// Pass on an interrupt, as a terminal's Ctrl-C does.
+    Interrupt,
     /// Ask it to terminate, leaving it a chance to clean up.
     Terminate,
     /// Stop it without giving it a say.
@@ -64,7 +68,7 @@ const MAX_WALK: usize = 4096;
 /// module does not.
 #[derive(Default)]
 pub(crate) struct Swept {
-    /// How many processes were signalled to terminate.
+    /// How many processes were signalled.
     pub(crate) asked: usize,
     /// How many were still running once `GRACE` was up and were killed. Some of
     /// those were spawned during that window, or were exiting cleanly when it
@@ -106,31 +110,67 @@ fn disabled() -> bool {
 /// time this runs the run is over, so there is nothing else for the runtime to
 /// be turning.
 pub(crate) async fn stop_commands() -> Swept {
-    let mut swept = Swept::default();
-    if disabled() {
-        return swept;
-    }
-
-    let walk = descendant_pids();
-    swept.truncated_at = walk.truncated_at;
-    swept.declined = walk.declined;
-    swept.asked = signal_all(&walk.pids, Stop::Terminate, &mut swept.unstoppable);
+    let mut swept = signal_commands(Stop::Terminate);
     if swept.asked > 0 {
         // Windows terminates outright on the first pass — it has no gentler
         // signal to have waited for — so the grace period is pure latency there.
         #[cfg(not(windows))]
         tokio::time::sleep(GRACE).await;
-        // Walked again rather than reusing the first list: what ignored the
-        // terminate may have spawned children while doing so.
-        let again = descendant_pids();
-        swept.truncated_at = swept.truncated_at.or(again.truncated_at);
-        swept.killed = signal_all(&again.pids, Stop::Kill, &mut swept.unstoppable);
+        kill_pass(&mut swept);
     }
-    // A process that refused both signals was recorded by each pass; it is one
-    // survivor to report, not two. Deduped on the pid, since the two passes can
-    // fail on it for different reasons.
+    dedup_survivors(&mut swept);
+    swept
+}
+
+/// A process that refused both signals was recorded by each pass; it is one
+/// survivor to report, not two. Deduped on the pid, since the two passes can
+/// fail on it for different reasons.
+fn dedup_survivors(swept: &mut Swept) {
     swept.unstoppable.sort();
     swept.unstoppable.dedup_by_key(|(pid, _)| *pid);
+}
+
+/// [`stop_commands`] without yielding to the runtime, for a caller that is about
+/// to end the process.
+///
+/// Awaiting the grace period hands the runtime back to the run being torn down,
+/// which can then finish and return through `block_on` before the caller's exit
+/// is ever reached — so a forced shutdown would report whatever that run
+/// happened to produce. Blocking the thread keeps the exit the caller's.
+pub(crate) fn stop_commands_blocking() -> Swept {
+    let mut swept = signal_commands(Stop::Terminate);
+    if swept.asked > 0 {
+        #[cfg(not(windows))]
+        std::thread::sleep(GRACE);
+        kill_pass(&mut swept);
+    }
+    dedup_survivors(&mut swept);
+    swept
+}
+
+/// Kills whatever the grace period left running.
+fn kill_pass(swept: &mut Swept) {
+    // Walked again rather than reusing the first list: what ignored the
+    // terminate may have spawned children while doing so.
+    let again = descendant_pids();
+    swept.truncated_at = swept.truncated_at.or(again.truncated_at);
+    swept.killed = signal_all(&again.pids, Stop::Kill, &mut swept.unstoppable);
+}
+
+/// Passes `stop` on to every command still running, without the terminate-then-
+/// kill escalation [`stop_commands`] does: this is for relaying a signal the
+/// engine itself was sent, where the command is meant to see that signal and
+/// decide what to do about it. On Windows there is no signal to pass on, so a
+/// relayed [`Stop::Interrupt`] terminates the command outright.
+pub(crate) fn signal_commands(stop: Stop) -> Swept {
+    let mut swept = Swept::default();
+    if disabled() {
+        return swept;
+    }
+    let walk = descendant_pids();
+    swept.truncated_at = walk.truncated_at;
+    swept.declined = walk.declined;
+    swept.asked = signal_all(&walk.pids, stop, &mut swept.unstoppable);
     swept
 }
 
@@ -696,6 +736,7 @@ unsafe extern "system" {
 #[cfg(unix)]
 fn signal_process(pid: i32, stop: Stop) -> Signalled {
     const ESRCH: i32 = 3;
+    const SIGINT: i32 = 2;
     const SIGKILL: i32 = 9;
     const SIGTERM: i32 = 15;
     // `kill` reads 0 as "this whole process group" and -1 as "every process we
@@ -706,6 +747,7 @@ fn signal_process(pid: i32, stop: Stop) -> Signalled {
         return Signalled::Gone;
     }
     let sig = match stop {
+        Stop::Interrupt => SIGINT,
         Stop::Terminate => SIGTERM,
         Stop::Kill => SIGKILL,
     };
@@ -735,8 +777,9 @@ unsafe extern "C" {
 
 /// Terminates one process.
 ///
-/// Windows has no gentler equivalent to reach for, so both kinds of [`Stop`] are
-/// the same abrupt termination.
+/// Windows has no gentler equivalent to reach for, and no interrupt to pass on,
+/// so every [`Stop`] is the same abrupt termination — a relayed
+/// [`Stop::Interrupt`] included, which kills rather than interrupting.
 #[cfg(windows)]
 fn signal_process(pid: i32, _stop: Stop) -> Signalled {
     const PROCESS_TERMINATE: u32 = 0x0001;
