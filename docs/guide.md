@@ -2342,9 +2342,14 @@ Pressing <kbd>Ctrl-C</kbd> escalates over three signals:
 Task v3 reports all three and then exits without touching the commands; steps 2
 and 3 above are additions.
 
-A single `SIGTERM` is only reported, so a supervisor that sends one and then
-`SIGKILL` gets no cleanup at all — nothing runs on a `SIGKILL`. Give Task a
-second signal, or time to act on the first.
+A `SIGTERM` is not escalated. It comes from a supervisor, sent to Task's pid, so
+nothing reached the commands and there is no cleanup of theirs to cut short: the
+first one stops the commands and exits `1` without waiting for them. Task v3
+escalates it exactly like a Ctrl-C, which leaves a `SIGTERM`-then-`SIGKILL`
+supervisor with no cleanup at all. Note that this exits `1`, where a Task that
+died of the signal itself reported `143`, and that a forced exit skips the usual
+cleanup: a distributed cache lock is left to expire, and output buffered by
+`--output group` is discarded.
 
 Watch sessions get none of this escalation. A `SIGTERM` ends the session and
 leaves its commands running; an interrupt ends an idle session, but one arriving

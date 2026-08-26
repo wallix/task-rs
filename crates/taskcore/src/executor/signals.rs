@@ -2,17 +2,25 @@
 //!
 //! The engine intercepts SIGINT/SIGTERM so that a running command is given a
 //! chance to clean up rather than the process being killed instantly. The first
-//! two signals log a notice; a third forces an immediate exit. Ports Go
+//! two *interrupts* log a notice and a third forces an immediate exit; a
+//! `SIGTERM` forces one straight away. Ports Go
 //! `InterceptInterruptSignals`, using [`tokio::signal`] in place of the Go
 //! `os/signal` channel.
 //!
-//! The first signal is only reported. A terminal delivers it to the whole
+//! The first *interrupt* is only reported. A terminal delivers it to the whole
 //! foreground process group, which the commands are in, so they have already had
 //! it — and a signal on top of that would cut short a handler still cleaning up.
-//! From the second signal on, the same signal is passed to the commands, which
-//! is what reaches them when the engine was signalled by pid instead of through
-//! a terminal. The forced exit stops whatever is still running first, since
-//! nothing else will once the process is gone.
+//! From the second on, the same signal is passed to the commands. The forced
+//! exit stops whatever is still running first, since nothing else will once the
+//! process is gone.
+//!
+//! A `SIGTERM` is not treated that way, which is where this departs from Task
+//! v3. That reasoning is about a terminal, and a `SIGTERM` does not come from
+//! one: it is sent by pid, by a supervisor, so nothing reached the commands and
+//! there is no handler of theirs to cut short. Reporting it and running on means
+//! a supervisor's `SIGTERM`-then-`SIGKILL` gets no cleanup at all — the commands
+//! keep running and the run keeps starting more. So the first `SIGTERM` acts at
+//! once: the commands are stopped and the process exits.
 
 use std::rc::Rc;
 
@@ -36,9 +44,10 @@ fn signal_name(stop: crate::reap::Stop) -> &'static str {
 
 impl Executor {
     /// Spawns a task that intercepts interrupt signals. The first
-    /// [`MAX_INTERRUPT_SIGNALS`] − 1 signals log a notice; the final one exits
-    /// the process. Returns immediately; the watcher runs until the process
-    /// ends. Ports Go `InterceptInterruptSignals`.
+    /// [`MAX_INTERRUPT_SIGNALS`] − 1 *interrupts* log a notice and the final one
+    /// exits the process, as does the first `SIGTERM`. Returns immediately; the
+    /// watcher runs until the process ends. Ports Go
+    /// `InterceptInterruptSignals`.
     ///
     /// # Panics
     ///
@@ -76,11 +85,23 @@ impl Executor {
                 // so signals arriving faster than this loop is polled coalesce
                 // into one. Go's buffered channel delivers each, so a very fast
                 // triple Ctrl-C can need a fourth press here.
-                if i.saturating_add(1) >= MAX_INTERRUPT_SIGNALS {
+                //
+                // A `SIGTERM` is a supervisor asking the process to stop, and it
+                // reached only this process. Nothing is gained by waiting for a
+                // second one that a supervisor will not send before its
+                // `SIGKILL`, so it is acted on where it arrives.
+                if i.saturating_add(1) >= MAX_INTERRUPT_SIGNALS
+                    || matches!(next, crate::reap::Stop::Terminate)
+                {
+                    let nth = if matches!(next, crate::reap::Stop::Terminate) {
+                        ""
+                    } else {
+                        " for the third time"
+                    };
                     this.logger().borrow_mut().errf(
                         Color::Red,
                         &format!(
-                            "task: Signal received for the third time: {:?}. Forcing shutdown\n",
+                            "task: Signal received{nth}: {:?}. Forcing shutdown\n",
                             signal_name(next)
                         ),
                     );

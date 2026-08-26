@@ -35,6 +35,9 @@
   passed on to them, and the third stops them before exiting.
 - **A confirmation prompt no longer pauses the rest of the run**, and Ctrl-C
   works while one is waiting.
+- **A `SIGTERM` stops the run at once**, exiting `1` — it comes from a
+  supervisor, so there is no second signal to wait for. Ctrl-C keeps its
+  three-press escalation, and watch sessions are unchanged.
 
 ## v4.0.0 - 2026-08-24
 

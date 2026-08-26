@@ -236,15 +236,45 @@ fn signals_are_handled_while_a_prompt_waits() {
     );
 }
 
-// One signal is reported and nothing else: the run continues to its own end.
-// This is the documented cost of the escalation — a single `SIGTERM`, which is
-// what a supervisor sends before its `SIGKILL`, no longer stops `task`.
+// One *interrupt* is reported and nothing else: the run continues to its own
+// end. That is the cost of the escalation — the first Ctrl-C is a warning.
 //
-// Sent to the pid rather than the group, as a supervisor sends it: the command
-// never sees it, so what the run does next is the engine's decision alone.
+// Sent to the pid rather than the group, as nothing but a terminal does: the
+// command never sees it, so what the run does next is the engine's decision
+// alone.
 #[cfg(unix)]
 #[test]
-fn one_signal_is_only_reported() {
+fn one_interrupt_is_only_reported() {
+    let dir = stage("stop_on_cancel");
+    let child = spawn_in_own_group(&dir, "stubborn");
+    wait_for(&dir.join("started.txt"));
+
+    signal_pid(&child, "INT");
+    let o = child.wait_with_output().expect("wait for task");
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+
+    assert_eq!(
+        out.matches("Signal received: \"interrupt\"\n").count(),
+        1,
+        "expected one report, got: {out}{err}"
+    );
+    assert_eq!(o.status.code(), Some(0), "the run finishes: {out}{err}");
+    assert!(
+        dir.join("marker.txt").exists(),
+        "the command ran to its end: {out}{err}"
+    );
+}
+
+// A `SIGTERM` is not an interrupt and is not escalated: it comes from a
+// supervisor, by pid, so nothing reached the commands and there is no handler of
+// theirs to cut short. Waiting for a second one a supervisor will not send
+// before its `SIGKILL` would mean no cleanup at all, so the first one stops the
+// commands and ends the run. This is a deliberate divergence from Task v3, which
+// reports it and runs on.
+#[cfg(unix)]
+#[test]
+fn one_sigterm_stops_the_run_and_its_commands() {
     let dir = stage("stop_on_cancel");
     let child = spawn_in_own_group(&dir, "stubborn");
     wait_for(&dir.join("started.txt"));
@@ -254,15 +284,20 @@ fn one_signal_is_only_reported() {
     let out = String::from_utf8_lossy(&o.stdout).into_owned();
     let err = String::from_utf8_lossy(&o.stderr).into_owned();
 
-    assert_eq!(
-        out.matches("Signal received: \"terminated\"\n").count(),
-        1,
-        "expected one report, got: {out}{err}"
-    );
-    assert_eq!(o.status.code(), Some(0), "the run finishes: {out}{err}");
     assert!(
-        dir.join("marker.txt").exists(),
-        "the command ran to its end: {out}{err}"
+        err.contains("Forcing shutdown"),
+        "one SIGTERM must force shutdown, got: {out}{err}"
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "a forced shutdown exits 1, got: {out}{err}"
+    );
+    // Its sleep is 3s: the marker only appears if the command outlived the run.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    assert!(
+        !dir.join("marker.txt").exists(),
+        "the command must have been stopped, got: {out}{err}"
     );
 }
 
@@ -333,20 +368,20 @@ fn wait_for(path: &Path) {
     panic!("{} never appeared", path.display());
 }
 
-// The headline mechanism: from the second signal on, the signal is passed to
-// the commands. `stubborn` ignores `SIGINT`, so this sends `SIGTERM` by pid —
-// the shape where the terminal delivered nothing to the command itself — and
-// the command has to die of the relayed signal rather than run to its marker.
+// The headline mechanism: from the second interrupt on, the signal is passed to
+// the commands. Sent by pid — the shape where a terminal delivered nothing to
+// the command itself — so the relay is the only way it can reach it, and
+// `relayable` dies of it rather than running on to its marker.
 #[cfg(unix)]
 #[test]
-fn a_second_signal_is_passed_to_the_commands() {
+fn a_second_interrupt_is_passed_to_the_commands() {
     let dir = stage("stop_on_cancel");
-    let child = spawn_in_own_group(&dir, "stubborn");
+    let child = spawn_in_own_group(&dir, "relayable");
     wait_for(&dir.join("started.txt"));
 
     // Twice: the first is only reported, the second is relayed.
     for _ in 0..2 {
-        signal_pid(&child, "TERM");
+        signal_pid(&child, "INT");
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     let o = child.wait_with_output().expect("wait for task");
@@ -354,9 +389,9 @@ fn a_second_signal_is_passed_to_the_commands() {
     let err = String::from_utf8_lossy(&o.stderr).into_owned();
 
     assert_eq!(
-        out.matches("Signal received: \"terminated\"\n").count(),
+        out.matches("Signal received: \"interrupt\"\n").count(),
         2,
-        "both signals are reported, got: {out}{err}"
+        "both interrupts are reported, got: {out}{err}"
     );
     // Its sleep is 3s; the relay must have cut it short well before that.
     assert!(

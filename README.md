@@ -266,6 +266,7 @@ Exports checksum state and generated files for up-to-date tasks as a ZIP archive
 - **`--force` no longer cascades** — `--force` only forces the directly called task; dependent tasks still check their status. Use `--force-all` to force everything (previously the default `--force` behavior).
 - **A dependency cycle is reported as one** — naming the path (`a -> b -> a`) rather than running until the process ran out of stack. A task counts as repeating only if it reaches itself with the same compiled body, so calling itself with different `vars:` still works; recursion that progresses only through external state (a counter in a file) is rejected.
 - **Ctrl-C reaches the commands** — the second press is passed on to them and the third stops them before exiting, where Task v3 only reports and exits.
+- **A `SIGTERM` stops the run at once, exiting `1`** — it comes from a supervisor rather than a terminal, so there is no second signal to wait for. Task v3 escalates it like a Ctrl-C, which leaves a `SIGTERM`-then-`SIGKILL` supervisor with no cleanup at all. Ctrl-C keeps its escalation. Note the exit code: v4.0.0 died of the signal and reported `143`.
 
 ### Improved
 
