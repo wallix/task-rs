@@ -28,17 +28,17 @@ if ! grep -qE "^## v${version}( |\$)" CHANGELOG.md; then
   exit 1
 fi
 
-# Update the version sources. The workspace version is the only top-level
-# `version = "..."` line (dependency versions are inline in `{ ... }`).
-printf '%s\n' "${version}" > crates/taskcore/src/version.txt
+# Update the version. The workspace version is the only top-level
+# `version = "..."` line (dependency versions are inline in `{ ... }`), and every
+# crate inherits it, so this is the single place it lives.
 sed -i -E "s/^version = \"[^\"]*\"/version = \"${version}\"/" Cargo.toml
 
-# Refresh Cargo.lock and confirm the version invariant (version.txt matches the
-# CHANGELOG heading) before committing.
+# Refresh Cargo.lock and confirm the version invariant (the workspace version
+# matches the CHANGELOG heading) before committing.
 cargo build -q -p task
 cargo test -q -p taskcore version::
 
-git add crates/taskcore/src/version.txt Cargo.toml Cargo.lock CHANGELOG.md
+git add Cargo.toml Cargo.lock CHANGELOG.md
 git commit -m "${tag}"
 git tag -a "${tag}" -m "${tag}"
 

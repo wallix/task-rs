@@ -1,14 +1,15 @@
 //! Program version reporting.
 //!
-//! The base version is embedded from `version.txt`, which the release
-//! script keeps up to date. Commit hash and dirty status are injected at
+//! The base version is the workspace version in `Cargo.toml`, which every crate
+//! here inherits with `version.workspace = true`, so there is one place to bump
+//! and nothing to keep in step. Commit hash and dirty status are injected at
 //! build time through the optional `TASK_COMMIT` and `TASK_DIRTY`
 //! environment variables (a build script or CI populates them); when absent
 //! only the base version is reported.
 
-/// The embedded release version, trimmed of surrounding whitespace.
+/// The release version this was built as.
 fn version() -> &'static str {
-    include_str!("version.txt").trim()
+    env!("CARGO_PKG_VERSION")
 }
 
 /// The abbreviated commit hash injected at build time, if any (first seven
@@ -91,7 +92,7 @@ mod tests {
         assert_eq!(
             changelog_version,
             get_version(),
-            "version.txt ({}) does not match latest CHANGELOG entry ({})",
+            "the workspace version ({}) does not match the latest CHANGELOG entry ({})",
             get_version(),
             changelog_version
         );
