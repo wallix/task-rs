@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.1.0 - 2026-08-26
+
 - **Quoted strings in Go-syntax templates keep their dots**, so
   `{{ .FILE | replace ".tar.gz" "" }}` strips what it was given. Affected tasks
   re-run once, and a Taskfile already converted by `task --migrate --write`
