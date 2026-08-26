@@ -61,3 +61,20 @@ tasks:
   stubborn:
     cmds:
       - sh -c "trap '' INT; touch started.txt; sleep 3; touch marker.txt"
+
+  # Waits on an answer that never comes. The prompt read happens off the runtime
+  # thread, so the engine keeps being polled and a signal arriving here is still
+  # handled.
+  guarded:
+    deps:
+      - at_prompt
+    prompt: really?
+    cmds:
+      - sh -c "touch marker.txt"
+
+  # Runs before the prompt is asked, so a test can wait for the run to have
+  # reached it rather than guessing at how long it takes.
+  at_prompt:
+    internal: true
+    cmds:
+      - sh -c "touch at_prompt.txt"

@@ -33,6 +33,8 @@
   are stopped; `TASK_NO_REAP=1` turns that off.
 - **Ctrl-C reaches the commands, not just the runner.** The second press is
   passed on to them, and the third stops them before exiting.
+- **A confirmation prompt no longer pauses the rest of the run**, and Ctrl-C
+  works while one is waiting.
 
 ## v4.0.0 - 2026-08-24
 

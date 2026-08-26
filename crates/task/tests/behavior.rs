@@ -190,6 +190,52 @@ fn the_third_interrupt_forces_shutdown_and_stops_the_commands() {
     );
 }
 
+// A prompt waits on the terminal, which used to wait on the runtime thread: the
+// engine was not polled while it did, and every signal arriving at a prompt was
+// lost. The read happens off that thread now, so the escalation still runs.
+#[cfg(unix)]
+#[test]
+fn signals_are_handled_while_a_prompt_waits() {
+    let dir = stage("stop_on_cancel");
+    // stdin is a pipe nothing is ever written to, so the prompt waits for good.
+    let child = spawn_in_own_group_with_stdin(&dir, "guarded");
+    // The prompt is asked once its dependency has run, so this is the run
+    // sitting at the prompt rather than a guess at how long getting there takes.
+    wait_for(&dir.join("at_prompt.txt"));
+
+    for _ in 0..3 {
+        signal_group(&child, "INT");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let o = child.wait_with_output().expect("wait for task");
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+
+    assert_eq!(
+        out.matches("Signal received: \"interrupt\"\n").count(),
+        2,
+        "the signals must reach the handler, got: {out}{err}"
+    );
+    assert!(
+        err.contains("Forcing shutdown"),
+        "the third forces shutdown, got: {out}{err}"
+    );
+    // Without this the test would pass on a run stalled anywhere at all.
+    assert!(
+        err.contains("really?"),
+        "the run must have been at its prompt, got: {out}{err}"
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "a forced shutdown exits 1, got: {out}{err}"
+    );
+    assert!(
+        !dir.join("marker.txt").exists(),
+        "the guarded command must not have run: {out}{err}"
+    );
+}
+
 // One signal is reported and nothing else: the run continues to its own end.
 // This is the documented cost of the escalation — a single `SIGTERM`, which is
 // what a supervisor sends before its `SIGKILL`, no longer stops `task`.
@@ -224,12 +270,23 @@ fn one_signal_is_only_reported() {
 // cannot reach the test harness.
 #[cfg(unix)]
 fn spawn_in_own_group(dir: &Path, task: &str) -> std::process::Child {
+    spawn_signalable(dir, task, std::process::Stdio::null())
+}
+
+// The same, with stdin a pipe nothing is written to, so a prompt waits for good.
+#[cfg(unix)]
+fn spawn_in_own_group_with_stdin(dir: &Path, task: &str) -> std::process::Child {
+    spawn_signalable(dir, task, std::process::Stdio::piped())
+}
+
+#[cfg(unix)]
+fn spawn_signalable(dir: &Path, task: &str, stdin: std::process::Stdio) -> std::process::Child {
     use std::os::unix::process::CommandExt;
     std::process::Command::new(common::BIN)
         .arg(task)
         .current_dir(dir)
         .env("TASK_NO_GO_DEPRECATION", "1")
-        .stdin(std::process::Stdio::null())
+        .stdin(stdin)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .process_group(0)

@@ -25,6 +25,11 @@
 //! lower-level [`Executor::run_task`], [`Executor::import_cache`] and
 //! [`Executor::export_cache`] leave that to their caller's `LocalSet`.
 //!
+//! One thing deliberately runs off that runtime: an interactive `prompt:` reads
+//! the terminal on a dedicated thread, shared by every prompt, because a
+//! blocking read on the runtime thread would stop everything else on it — the
+//! interrupt watcher included — from being polled. See [`Prompter`].
+//!
 //! Shared engine state lives behind [`std::rc::Rc`] with per-field interior
 //! mutability ([`RefCell`]/[`tokio::sync::Mutex`]). The concurrency cap is a
 //! [`ConcurrencyLimiter`] (a tokio semaphore); the run-once map holds a shared
@@ -42,6 +47,7 @@ mod status;
 mod watch;
 
 pub use error::ExecutorError;
+pub(crate) use prompter::asked_off_thread;
 pub use prompter::{PromptError, Prompter};
 pub use run::MatchingTask;
 pub use watch::should_ignore;
@@ -167,7 +173,7 @@ pub struct Executor {
     /// Variables collected via interactive prompts, injected into calls.
     pub(crate) prompted_vars: RefCell<Option<Vars>>,
     /// The interactive prompter (a non-interactive session when `None`).
-    pub(crate) prompter: Option<Box<dyn Prompter>>,
+    pub(crate) prompter: Option<Arc<dyn Prompter>>,
 
     /// Bounds concurrent task execution.
     pub(crate) limiter: ConcurrencyLimiter,
@@ -175,6 +181,10 @@ pub struct Executor {
     pub(crate) task_call_count: RefCell<HashMap<String, i32>>,
     /// Serializes directory creation per task.
     pub(crate) mkdir_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Serializes asking for missing required vars. The prompt read yields, so
+    /// without this two tasks needing the same variable both pass the
+    /// already-prompted check and ask for it twice.
+    pub(crate) prompt_turn: Mutex<()>,
     /// Deduplicates concurrent executions of the same task hash.
     pub(crate) run_once: Mutex<HashMap<String, Arc<OnceCell<RunOnceResult>>>>,
     /// Tracks the tasks queued on the runtime so an abandoned run can tear them
@@ -225,6 +235,7 @@ impl Default for Executor {
             limiter: ConcurrencyLimiter::unlimited(),
             task_call_count: RefCell::new(HashMap::new()),
             mkdir_locks: Mutex::new(HashMap::new()),
+            prompt_turn: Mutex::new(()),
             run_once: Mutex::new(HashMap::new()),
             queue: run::TaskQueue::default(),
         }
@@ -379,7 +390,7 @@ impl Executor {
 
     /// Sets the interactive prompter. Without one the engine runs
     /// non-interactively.
-    pub fn with_prompter(mut self, prompter: Box<dyn Prompter>) -> Self {
+    pub fn with_prompter(mut self, prompter: Arc<dyn Prompter>) -> Self {
         self.prompter = Some(prompter);
         self
     }

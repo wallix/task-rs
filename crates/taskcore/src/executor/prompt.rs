@@ -3,6 +3,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ast::{Task, Var, Vars};
 use crate::call::Call;
@@ -52,7 +53,7 @@ impl Executor {
         }
 
         for v in &missing {
-            let value = self.prompt_for(&v.name, &v.allowed_values)?;
+            let value = self.prompt_for(&v.name, &v.allowed_values).await?;
             let mut pv = self.prompted_vars.borrow_mut();
             pv.get_or_insert_with(Vars::new)
                 .set(v.name.clone(), Var::from_string(value));
@@ -64,7 +65,7 @@ impl Executor {
     /// sequential commands), adding them to `call.vars` and caching them in
     /// `prompted_vars`. Returns whether anything was prompted, so the caller can
     /// recompile the task with the new values. Ports Go `promptTaskVars`.
-    pub(crate) fn prompt_task_vars(
+    pub(crate) async fn prompt_task_vars(
         &self,
         t: &Task,
         call: &mut Call,
@@ -73,17 +74,31 @@ impl Executor {
             return Ok(false);
         }
 
+        // Held across the whole loop: the read yields, so a check-then-prompt
+        // that let go in between would have two tasks needing the same variable
+        // both find it unasked and both ask. The blocking read this replaced
+        // serialized that by accident.
+        let _turn = self.prompt_turn.lock().await;
         let mut prompted = false;
         for v in requires::missing_required_vars(t) {
-            let already = self
+            // Another task may have asked for this one while this task was
+            // waiting for the turn above. Its answer is taken rather than asked
+            // again — and has to be applied here: `inject_prompted_vars` ran
+            // before that answer existed, so nothing else will put it on this
+            // call.
+            let cached = self
                 .prompted_vars
                 .borrow()
                 .as_ref()
-                .is_some_and(|pv| pv.get(&v.name).is_some());
-            if already {
+                .and_then(|pv| pv.get(&v.name).cloned());
+            if let Some(cached) = cached {
+                if call.vars.get(&v.name).is_none() {
+                    call.vars.set(v.name.clone(), cached);
+                    prompted = true;
+                }
                 continue;
             }
-            let value = self.prompt_for(&v.name, &v.allowed_values)?;
+            let value = self.prompt_for(&v.name, &v.allowed_values).await?;
             call.vars
                 .set(v.name.clone(), Var::from_string(value.clone()));
             self.prompted_vars
@@ -97,14 +112,23 @@ impl Executor {
 
     /// Asks the configured prompter for a variable's value, mapping a cancelled
     /// prompt to [`ExecutorError::Cancelled`].
-    fn prompt_for(&self, name: &str, enum_values: &[String]) -> Result<String, ExecutorError> {
+    async fn prompt_for(
+        &self,
+        name: &str,
+        enum_values: &[String],
+    ) -> Result<String, ExecutorError> {
         let prompter = self
             .prompter
             .as_ref()
             .ok_or_else(|| ExecutorError::Io("no prompter available".to_string()))?;
-        prompter.prompt(name, enum_values).map_err(|e| match e {
-            PromptError::Cancelled => ExecutorError::Cancelled,
-            other => ExecutorError::Io(format!("prompt failed: {other}")),
-        })
+        let prompter = Arc::clone(prompter);
+        let name = name.to_string();
+        let enum_values = enum_values.to_vec();
+        super::asked_off_thread(move || prompter.prompt(&name, &enum_values))
+            .await?
+            .map_err(|e| match e {
+                PromptError::Cancelled => ExecutorError::Cancelled,
+                other => ExecutorError::Io(format!("prompt failed: {other}")),
+            })
     }
 }

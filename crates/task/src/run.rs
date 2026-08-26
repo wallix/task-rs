@@ -3,6 +3,7 @@
 
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use clap::Parser;
 use taskcore::ast::{self, Var};
@@ -147,7 +148,7 @@ async fn run_engine(cli: Cli) -> Result<ExitCode, CliError> {
         .with_task_sorter(sorter)
         .with_failfast(cli.failfast)
         .with_version_check(true)
-        .with_prompter(Box::new(CliPrompter));
+        .with_prompter(Arc::new(CliPrompter));
 
     executor.setup().await.map_err(executor_error_to_cli)?;
 
@@ -213,10 +214,6 @@ async fn run_engine(cli: Cli) -> Result<ExitCode, CliError> {
     // `watch: true` enters the same loop: installing the handler there would
     // replace the default disposition of both signals with one that is never
     // polled, leaving the process answering to nothing but `SIGKILL`.
-    //
-    // An interactive `prompt:` blocks the runtime the same way, for as long as
-    // it waits on stdin, so signals arriving at a prompt are lost too. Moving
-    // that read off the runtime thread is a change of its own.
     if !executor.will_watch(&calls) {
         executor.intercept_interrupt_signals();
     }

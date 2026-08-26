@@ -636,7 +636,7 @@ impl Executor {
 
         // Prompt for missing required vars after the if-check (so a task that
         // will not run does not prompt); recompile when a value was supplied.
-        if self.prompt_task_vars(&t, &mut call)? {
+        if self.prompt_task_vars(&t, &mut call).await? {
             t = self.compiled_task(&call).await?;
         }
 
@@ -847,7 +847,7 @@ impl Executor {
         // Task-level prompts.
         for p in &t.prompt.0 {
             if !p.is_empty() && !self.dry {
-                self.confirm_or_cancel(p, &call.task)?;
+                self.confirm_or_cancel(p, &call.task).await?;
             }
         }
 
@@ -1290,9 +1290,17 @@ impl Executor {
 
     /// Prompts for confirmation of a task-level `prompt:` string, mapping a
     /// decline or unavailable terminal to a cancellation error.
-    fn confirm_or_cancel(&self, message: &str, _task: &str) -> Result<(), ExecutorError> {
+    async fn confirm_or_cancel(&self, message: &str, _task: &str) -> Result<(), ExecutorError> {
         if let Some(prompter) = &self.prompter {
-            match prompter.confirm(message) {
+            let prompter = Arc::clone(prompter);
+            let message = message.to_string();
+            // Mapped like every other prompter failure here, so an unreachable
+            // terminal cancels rather than surfacing a different error, and a
+            // different exit code, than a declined prompt.
+            let answer = super::asked_off_thread(move || prompter.confirm(&message))
+                .await
+                .map_err(|_| ExecutorError::Cancelled)?;
+            match answer {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(ExecutorError::Cancelled),
                 Err(super::PromptError::Cancelled) => Err(ExecutorError::Cancelled),

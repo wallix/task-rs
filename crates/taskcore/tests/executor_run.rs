@@ -19,6 +19,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use taskcore::call::Call;
@@ -113,7 +114,7 @@ tasks:
             .with_silent(true)
             .with_interactive(true)
             .with_assume_term(true)
-            .with_prompter(Box::new(FixedPrompter("world".to_string())));
+            .with_prompter(Arc::new(FixedPrompter("world".to_string())));
         e.setup().await.unwrap();
         let e = Rc::new(e);
         // NAME is required but unset: it is prompted (answered "world") rather
@@ -122,6 +123,77 @@ tasks:
         let out = fs::read_to_string(dir.join("out.txt")).unwrap();
         assert_eq!(out.trim(), "hi world");
     });
+}
+
+/// A prompter that counts how many times it was asked.
+struct CountingPrompter {
+    answer: String,
+    asked: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Prompter for CountingPrompter {
+    fn confirm(&self, _message: &str) -> Result<bool, PromptError> {
+        Ok(true)
+    }
+    fn prompt(&self, _name: &str, _enum_values: &[String]) -> Result<String, PromptError> {
+        self.asked.fetch_add(1, Ordering::Relaxed);
+        Ok(self.answer.clone())
+    }
+}
+
+// Two parallel branches reach the same task through a nested `task:` call, which
+// `prompt_deps_vars` does not walk, so both prompt just-in-time. The read yields
+// now, so without a turn taken around the already-asked check they would both
+// find the variable unasked and ask for it twice — two questions for one
+// variable, and a different answer possible for each.
+#[test]
+fn a_required_var_is_prompted_once_across_parallel_tasks() {
+    let dir = temp_dir();
+    let d = write_taskfile(
+        &dir,
+        r#"
+version: '3'
+tasks:
+  top:
+    deps: [a, b]
+  a:
+    cmds:
+      - task: greet
+  b:
+    cmds:
+      - task: greet
+  greet:
+    requires:
+      vars: [NAME]
+    cmds:
+      - echo "hi {{.NAME}}" >> out.txt
+"#,
+    );
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    block_on(async {
+        let mut e = Executor::new()
+            .with_dir(&d)
+            .with_silent(true)
+            .with_interactive(true)
+            .with_assume_term(true)
+            .with_prompter(Arc::new(CountingPrompter {
+                answer: "world".to_string(),
+                asked: Arc::clone(&asked),
+            }));
+        e.setup().await.unwrap();
+        let e = Rc::new(e);
+        e.run(&[Call::new("top")]).await.unwrap();
+    });
+    assert_eq!(
+        asked.load(Ordering::Relaxed),
+        1,
+        "the variable must be asked for once, not once per branch"
+    );
+    // Both branches still get the answer: the one that waited takes the cached
+    // value rather than being left without it.
+    let out = fs::read_to_string(dir.join("out.txt")).unwrap();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines, ["hi world", "hi world"], "got: {out}");
 }
 
 #[test]
