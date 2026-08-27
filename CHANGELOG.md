@@ -8,6 +8,9 @@
   verbs (`%s`, `%v`, `%q`, `%d`, `%%`, with flags and a width); another verb, a
   precision, an argument its verb cannot render, or a mismatched argument count
   is an error.
+- **An unsupported Go construct is reported as the `{{ … }}` that used it** —
+  with the line it is on when migrating a whole Taskfile — instead of quoting
+  the string it came from, which under `--migrate` was the whole file.
 
 ## v4.1.0 - 2026-08-26
 

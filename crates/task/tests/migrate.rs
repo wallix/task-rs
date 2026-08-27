@@ -117,6 +117,29 @@ fn go_dialect_warns_jinja_does_not() {
     );
 }
 
+// A Taskfile that cannot be converted names the action and the line it is on.
+// The message used to quote the whole file, which for a real Taskfile buried
+// the construct in hundreds of lines of YAML.
+#[test]
+fn migrate_error_points_at_the_offending_action() {
+    let dir = taskfile_dir(
+        "version: '3'\ntasks:\n  build:\n    cmds:\n      - 'echo {{range .LIST}}x{{end}}'\n",
+    );
+    let r = common::run(&dir, &["--migrate"]);
+    assert!(!r.ok(), "expected a failure: {}", r.combined());
+    assert!(
+        r.stderr
+            .contains(r#"unsupported Go construct "range" in "{{range .LIST}}" on line 5"#),
+        "stderr: {}",
+        r.stderr
+    );
+    assert!(
+        !r.stderr.contains("version:"),
+        "whole file quoted: {}",
+        r.stderr
+    );
+}
+
 #[test]
 fn migrate_is_idempotent() {
     let dir = taskfile_dir(GO_TASKFILE);

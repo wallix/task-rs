@@ -172,12 +172,21 @@ pub enum TemplaterError {
     UnsupportedConstruct {
         /// The construct name (e.g. `"range"` or an unmapped function name).
         construct: String,
-        /// The template string that contained it.
-        template: String,
+        /// The `{{ … }}` action that used it, rather than the whole template —
+        /// under `--migrate` that is the entire Taskfile.
+        action: String,
+        /// The action's 1-based line, set when translating for migration
+        /// ([`to_jinja`]), whose input is a whole Taskfile. Rendering
+        /// translates one field's value at a time, whose lines say nothing
+        /// about where in the Taskfile it sits.
+        line: Option<usize>,
     },
-    /// The translated template failed to render.
+    /// The translated template failed to render. Reported without a line, even
+    /// under `--migrate`: a failure here is the engine's, not a construct the
+    /// author has to go and rewrite.
     Render {
-        /// The template string as the user wrote it, before translation.
+        /// The template string as the user wrote it, before translation, or the
+        /// offending `{{ … }}` action alone when the failure is local to one.
         template: String,
         /// The underlying engine message.
         message: String,
@@ -189,11 +198,18 @@ impl fmt::Display for TemplaterError {
         match self {
             Self::UnsupportedConstruct {
                 construct,
-                template,
-            } => write!(
-                f,
-                "template uses unsupported Go construct {construct:?} in {template:?}"
-            ),
+                action,
+                line,
+            } => {
+                write!(
+                    f,
+                    "template uses unsupported Go construct {construct:?} in {action:?}"
+                )?;
+                if let Some(line) = line {
+                    write!(f, " on line {line}")?;
+                }
+                Ok(())
+            }
             Self::Render { template, message } => {
                 write!(f, "template failed to render {template:?}: {message}")
             }
@@ -615,12 +631,17 @@ struct TranslateStyle {
     /// If set, a Go comment is re-emitted as a Jinja comment with these markers;
     /// otherwise it renders to nothing (matching Go's runtime behavior).
     comment: Option<(&'static str, &'static str)>,
+    /// Whether an error carries the line the offending action sits on. Only the
+    /// migration translates a whole Taskfile, so only there does a line in the
+    /// template correspond to a line of the file the user must open.
+    locate: bool,
 }
 
 /// The style used when rendering: sentinel delimiters, comments dropped.
 const RENDER_STYLE: TranslateStyle = TranslateStyle {
     block: (GO_BLOCK_START, GO_BLOCK_END),
     comment: None,
+    locate: false,
 };
 
 /// The style used when migrating a Taskfile to Jinja: readable delimiters,
@@ -628,6 +649,7 @@ const RENDER_STYLE: TranslateStyle = TranslateStyle {
 const MIGRATE_STYLE: TranslateStyle = TranslateStyle {
     block: ("{%", "%}"),
     comment: Some(("{#", "#}")),
+    locate: true,
 };
 
 /// Rewrites a Go `text/template` string into native minijinja syntax, ready to
@@ -673,11 +695,13 @@ fn translate_impl(tmpl: &str, style: &TranslateStyle) -> Result<String, Template
                 // `endif` because `range`/`with` (the other openers) are rejected,
                 // so an open block is always an `if`.
                 Some(Control::If(cond)) => {
-                    let c = translate_action(cond, tmpl)?;
+                    let c =
+                        translate_action(cond, &action).map_err(|e| at_line(e, style, tmpl, i))?;
                     out.push_str(&format!("{block_start} if {} {block_end}", c.trim()));
                 }
                 Some(Control::ElseIf(cond)) => {
-                    let c = translate_action(cond, tmpl)?;
+                    let c =
+                        translate_action(cond, &action).map_err(|e| at_line(e, style, tmpl, i))?;
                     out.push_str(&format!("{block_start} elif {} {block_end}", c.trim()));
                 }
                 Some(Control::Else) => {
@@ -689,11 +713,13 @@ fn translate_impl(tmpl: &str, style: &TranslateStyle) -> Result<String, Template
                 Some(Control::Rejected(word)) => {
                     return Err(TemplaterError::UnsupportedConstruct {
                         construct: word,
-                        template: tmpl.to_string(),
+                        action: action.clone(),
+                        line: line_at(style, tmpl, i),
                     });
                 }
                 None => {
-                    let translated_body = translate_action(body, tmpl)?;
+                    let translated_body =
+                        translate_action(body, &action).map_err(|e| at_line(e, style, tmpl, i))?;
                     out.push_str("{{");
                     // Preserve a single interior space for readability.
                     out.push(' ');
@@ -797,6 +823,44 @@ fn read_action(tmpl: &str, start: usize) -> Result<(String, usize), TemplaterErr
     }
 }
 
+/// Stamps the line the failing action starts on onto an unsupported-construct
+/// error. The error is raised where the action body is translated, which knows
+/// the action but not where in the template it sits — and under `--migrate` the
+/// template is the whole Taskfile.
+fn at_line(
+    err: TemplaterError,
+    style: &TranslateStyle,
+    tmpl: &str,
+    offset: usize,
+) -> TemplaterError {
+    match err {
+        TemplaterError::UnsupportedConstruct {
+            construct, action, ..
+        } => TemplaterError::UnsupportedConstruct {
+            construct,
+            action,
+            line: line_at(style, tmpl, offset),
+        },
+        other => other,
+    }
+}
+
+/// The 1-based line of byte `offset` in `tmpl`, or `None` when the style does
+/// not locate errors or the offset is past the end.
+fn line_at(style: &TranslateStyle, tmpl: &str, offset: usize) -> Option<usize> {
+    if !style.locate {
+        return None;
+    }
+    let before = tmpl.as_bytes().get(..offset)?;
+    Some(
+        before
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count()
+            .saturating_add(1),
+    )
+}
+
 /// Returns the body of an action with the `{{`/`}}` delimiters and any Go
 /// trim markers (`{{-`, `-}}`) removed.
 fn action_body(action: &str) -> &str {
@@ -808,7 +872,10 @@ fn action_body(action: &str) -> &str {
     inner.strip_suffix('-').unwrap_or(inner)
 }
 
-/// Translates a single action body, rejecting unsupported constructs.
+/// Translates a single action body, rejecting unsupported constructs. `action`
+/// is the enclosing `{{ … }}` text, quoted in any error so it points at the
+/// offending action rather than at the whole template. Where in the template
+/// the action sits is not known here; the caller stamps it with [`at_line`].
 ///
 /// The body is split into `|`-delimited pipeline segments. The head segment is
 /// a variable reference or a function call; each following segment is a filter.
@@ -821,7 +888,7 @@ fn action_body(action: &str) -> &str {
 /// taking the expression built so far as their last argument, because the
 /// minijinja filter of each of those names means something else, or does not
 /// exist.
-fn translate_action(body: &str, tmpl: &str) -> Result<String, TemplaterError> {
+fn translate_action(body: &str, action: &str) -> Result<String, TemplaterError> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return Ok(String::new());
@@ -834,7 +901,8 @@ fn translate_action(body: &str, tmpl: &str) -> Result<String, TemplaterError> {
     if REJECTED_KEYWORDS.contains(&head_word) {
         return Err(TemplaterError::UnsupportedConstruct {
             construct: head_word.to_string(),
-            template: tmpl.to_string(),
+            action: action.to_string(),
+            line: None,
         });
     }
 
@@ -847,7 +915,7 @@ fn translate_action(body: &str, tmpl: &str) -> Result<String, TemplaterError> {
         let tokens = tokenize(segment);
         let Some(first) = tokens.first() else {
             return Err(TemplaterError::Render {
-                template: tmpl.to_string(),
+                template: action.to_string(),
                 message: "empty pipeline segment".to_string(),
             });
         };
@@ -859,7 +927,7 @@ fn translate_action(body: &str, tmpl: &str) -> Result<String, TemplaterError> {
         if matches!(first.as_str(), "and" | "or" | "not") {
             let rendered_args: Vec<String> = args
                 .iter()
-                .map(|a| translate_arg(a, tmpl))
+                .map(|a| translate_arg(a, action))
                 .collect::<Result<_, _>>()?;
             let rendered = match first.as_str() {
                 "not" => format!("(not {})", rendered_args.join(" ")),
@@ -873,12 +941,13 @@ fn translate_action(body: &str, tmpl: &str) -> Result<String, TemplaterError> {
             if !MAPPED_FUNCS.contains(&first.as_str()) {
                 return Err(TemplaterError::UnsupportedConstruct {
                     construct: first.clone(),
-                    template: tmpl.to_string(),
+                    action: action.to_string(),
+                    line: None,
                 });
             }
             let mut rendered_args: Vec<String> = args
                 .iter()
-                .map(|a| translate_arg(a, tmpl))
+                .map(|a| translate_arg(a, action))
                 .collect::<Result<_, _>>()?;
             // After a pipe, these take the piped value as their last argument
             // — sprig's own order — instead of becoming a minijinja filter,
@@ -896,11 +965,11 @@ fn translate_action(body: &str, tmpl: &str) -> Result<String, TemplaterError> {
             // after a pipe is invalid.
             if idx != 0 || !args.is_empty() {
                 return Err(TemplaterError::Render {
-                    template: tmpl.to_string(),
+                    template: action.to_string(),
                     message: format!("cannot translate pipeline segment {segment:?}"),
                 });
             }
-            expr = translate_arg(first, tmpl)?;
+            expr = translate_arg(first, action)?;
         }
     }
     Ok(expr)
@@ -920,9 +989,9 @@ fn join_segment(expr: String, rendered: &str) -> String {
 /// parenthesized token is a Go sub-expression (`(trunc 48 .TASK)`) and is
 /// translated recursively into a call (`trunc(48, TASK)`); anything else is a
 /// value with Go dotted-field access rewritten.
-fn translate_arg(token: &str, tmpl: &str) -> Result<String, TemplaterError> {
+fn translate_arg(token: &str, action: &str) -> Result<String, TemplaterError> {
     if let Some(inner) = token.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-        return translate_action(inner, tmpl);
+        return translate_action(inner, action);
     }
     Ok(rewrite_dots(token))
 }
@@ -2532,6 +2601,58 @@ mod tests {
             );
             assert_eq!(a, b, "{func_form} vs {pipe_form}");
         }
+    }
+
+    // The error names the offending action and where it is, not the string it
+    // came from: under `--migrate` that string is the whole Taskfile, which
+    // used to be dumped into the message in full.
+    #[test]
+    fn unsupported_construct_points_at_the_action() {
+        let src = "version: '3'\ntasks:\n  a:\n    cmds:\n      - echo {{range .LIST}}x{{end}}\n";
+        let err = to_jinja(src).expect_err("range is unsupported");
+        match &err {
+            TemplaterError::UnsupportedConstruct {
+                construct,
+                action,
+                line,
+            } => {
+                assert_eq!(construct, "range");
+                assert_eq!(action, "{{range .LIST}}");
+                assert_eq!(*line, Some(5));
+            }
+            other => panic!("expected UnsupportedConstruct, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "template uses unsupported Go construct \"range\" in \"{{range .LIST}}\" on line 5"
+        );
+
+        // An unmapped function is rejected deeper in, where only the action is
+        // known, so the line has to be stamped on by the caller — on the `if`
+        // path as much as on a plain action.
+        for (src, want) in [
+            (
+                "version: '3'\ntasks:\n  a:\n    cmds:\n      - echo {{spew .X}}\n",
+                Some(5),
+            ),
+            (
+                "version: '3'\ntasks:\n  a:\n    cmds:\n      - |\n        echo x\n        {{if uuid}}y{{end}}\n",
+                Some(7),
+            ),
+        ] {
+            match to_jinja(src).expect_err("unmapped function") {
+                TemplaterError::UnsupportedConstruct { line, .. } => assert_eq!(line, want),
+                other => panic!("expected UnsupportedConstruct, got {other:?}"),
+            }
+        }
+
+        // Rendering translates one field at a time, so its lines are not the
+        // Taskfile's and no line is reported.
+        let err = translate("echo {{spew .X}}").expect_err("spew is unmapped");
+        assert_eq!(
+            err.to_string(),
+            "template uses unsupported Go construct \"spew\" in \"{{spew .X}}\""
+        );
     }
 
     // A name the preflight does not know is rejected before the rewrite can
