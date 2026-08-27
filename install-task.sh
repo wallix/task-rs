@@ -2,8 +2,9 @@
 set -e
 # Download a release binary of Task (https://github.com/wallix/task-rs).
 #
-# Archives are named `task-<os>-<arch>.<ext>` and each ships its own
-# `<archive>.sha256` checksum file.
+# Archives are named `task-<os>-<arch>.<ext>`, each with a
+# `task-<os>-<arch>.sha256` sidecar — the archive name without its extension.
+# Keep in sync with `archive:` in .github/workflows/release.yml.
 
 usage() {
   this=$1
@@ -246,12 +247,9 @@ hash_sha256_verify() {
     return 1
   fi
   BASENAME=${TARGET##*/}
+  # The sidecar holds one `sha256sum` line naming the archive, so a miss here
+  # means it describes a different file — fail rather than trust another hash.
   want=$(grep "${BASENAME}" "${checksums}" 2>/dev/null | tr '\t' ' ' | cut -d ' ' -f 1)
-  if [ -z "$want" ]; then
-    # taiki-e's per-archive .sha256 holds a single bare hash on some versions;
-    # fall back to the first field of the first line.
-    want=$(head -n 1 "${checksums}" | tr '\t' ' ' | cut -d ' ' -f 1)
-  fi
   if [ -z "$want" ]; then
     log_err "hash_sha256_verify unable to find checksum for '${TARGET}' in '${checksums}'"
     return 1
@@ -295,7 +293,7 @@ log_info "found version: ${VERSION} for ${TAG}/${OS}/${ARCH}"
 NAME=${BINARY}-${OS}-${ARCH}
 TARBALL=${NAME}.${FORMAT}
 TARBALL_URL=${GITHUB_DOWNLOAD}/${TAG}/${TARBALL}
-CHECKSUM=${TARBALL}.sha256
+CHECKSUM=${NAME}.sha256
 CHECKSUM_URL=${GITHUB_DOWNLOAD}/${TAG}/${CHECKSUM}
 
 execute

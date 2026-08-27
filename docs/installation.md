@@ -12,7 +12,7 @@ Download the archive for your platform from the
 [releases page on GitHub](https://github.com/wallix/task-rs/releases), extract the
 `task` binary, and add it to your `$PATH`. Archives are named
 `task-<os>-<arch>.tar.gz` (`.zip` on Windows) — for example
-`task-linux-x86_64.tar.gz` — and each ships with a matching `.sha256`
+`task-linux-x86_64.tar.gz` — and each ships a `task-<os>-<arch>.sha256`
 checksum file.
 
 ## Build From Source

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **`install-task.sh` installs again** — every run used to fail before it
+  downloaded the archive.
 - **A failing cache registry or cache lock names the reason** — a rejected
   certificate, a refused connection, a name that does not resolve — instead of
   only reporting that the registry could not be reached.
