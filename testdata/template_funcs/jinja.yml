@@ -3,7 +3,8 @@ templater: jinja
 
 # A file written natively in Jinja keeps standard Jinja meaning: the sprig
 # helpers are reachable as functions, but the filters of those names are
-# minijinja's own.
+# minijinja's own — except `trunc` and `regexReplaceAll`, which minijinja has no
+# filter of, so Task registers subject-first ones.
 vars:
   P: 'dir/fr.po'
   EMPTY: ''
@@ -25,3 +26,7 @@ tasks:
       # The sprig meaning of the others is still available in function position.
       - 'echo sprig_title={{ title("HELLO world") }}'
       - 'echo sprig_join={{ join(",", P) }}'
+      # Task registers a subject-first filter for these two, so a Jinja
+      # Taskfile needs neither sprig-ordered call.
+      - 'echo trunc={{ P | trunc(3) }}'
+      - 'echo regex={{ P | regexReplaceAll("[.]po$", ".mo") }}'

@@ -14,6 +14,11 @@
   A Taskfile written or migrated against 4.1.0 / 4.1.1 that calls it now fails
   with `unknown function`; write the value first and add `, true` —
   `X | default("y", true)`.
+- **`trunc` and `regexReplaceAll` work as filters** — `s | trunc(n)` and
+  `s | regexReplaceAll(pattern, repl)`, so a Jinja Taskfile no longer has to
+  spell either as a sprig-ordered call. The functions keep working as before,
+  and a Go Taskfile's `{{ .P | trunc 3 }}`, which used to fail to render, now
+  works and migrates to `{{ P | trunc(3) }}`.
 - **A file's template dialect now covers the `vars:` it passes to an
   `includes:` entry and the `caches:` models it defines.** A tree partway
   through `--migrate` works: the migrated file no longer fails on its own

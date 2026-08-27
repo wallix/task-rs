@@ -285,8 +285,11 @@ filter. See
 
 Most helpers that take a subject accept it in either position, but at opposite
 ends: the function form takes it **last** (`trimSuffix ".po" .ITEM`), which is
-what lets the pipeline form take it first (`.ITEM | trimSuffix ".po"`). `trunc`,
-`regexReplaceAll`, `printf` and `print` are function-only.
+what lets the pipeline form take it first (`.ITEM | trimSuffix ".po"`). `printf`
+and `print` are function-only. `regexReplaceAll` is the one helper whose subject
+moves rather than flips ends: in the **middle** as a function (sprig's order),
+first as a Jinja filter — a Go pipe becomes the sprig-ordered call instead, see
+[sprig semantics after a pipe](#sprig-semantics-after-a-pipe-go-dialect).
 
 ### Platform and environment
 
@@ -318,8 +321,8 @@ what lets the pipeline form take it first (`.ITEM | trimSuffix ".po"`). `trunc`,
 | `lower`, `upper`, `title`† | Change case |
 | `contains(substr)`, `hasPrefix(prefix)`, `hasSuffix(suffix)` | Substring tests |
 | `replace(old, new)` | Replace all occurrences |
-| `trunc(n, s)` | First `n` characters (or last `-n` if negative) |
-| `regexReplaceAll(pattern, s, repl)` | Replace all regex matches |
+| `trunc(n, s)`, `s \| trunc(n)` | First `n` characters (or last `-n` if negative) |
+| `regexReplaceAll(pattern, s, repl)`, `s \| regexReplaceAll(pattern, repl)` | Replace all regex matches |
 | `printf(format, …)` | Format a string: `%s`, `%v`, `%q`, `%d`, `%%`, with the `-` / `0` flags and a width (`%-10s`, `%03d`) |
 | `print(…)` | Concatenate the operands, with a space between two neighbours when neither is a string |
 | `quote(s)`, `squote(s)` | Wrap in double / single quotes |
@@ -419,6 +422,14 @@ The Go builtins `printf` and `print` translate to a call after a pipe for the
 same reason — minijinja has no filter of either name, so a Jinja Taskfile calls
 both in function position — and `{{ .P | printf "%s.mo" }}` migrates to
 `{{ printf("%s.mo", P) }}`.
+
+`regexReplaceAll` stays a call after a pipe for a different reason: sprig takes
+its subject in the middle, so a Go pipe hands it the *replacement* slot and
+`{{ .P | regexReplaceAll "[.]po$" ".mo" }}` substitutes inside `.mo` — odd, but
+what a Go Taskfile renders, and what the migrated call
+`regexReplaceAll("[.]po$", ".mo", P)` keeps. Task's own `regexReplaceAll`
+**filter** takes the subject first (`{{ P | regexReplaceAll("[.]po$", ".mo") }}`),
+which is what to write in a Jinja Taskfile.
 
 Every other helper keeps one meaning in both dialects, and migrates to the
 idiomatic filter form (`{{ .X | trimSuffix ".po" }}` becomes

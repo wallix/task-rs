@@ -703,7 +703,8 @@ fn version_1_schema_is_rejected() {
 }
 
 // The sprig helpers are reachable in Go function position, not only after a
-// pipe, and take the subject as their last argument there.
+// pipe, and take the subject as their last argument there — except
+// `regexReplaceAll`, whose sprig signature puts it in the middle.
 #[test]
 fn sprig_helpers_work_in_function_position() {
     let dir = stage("template_funcs");
@@ -718,12 +719,16 @@ fn sprig_helpers_work_in_function_position() {
         "first=dir",
         "default=fallback",
         "title=Hello Wide World",
+        "trunc=dir",
+        "regex=dir/fr.mo",
     ] {
         assert!(out.contains(want), "expected {want:?} in: {out}");
     }
 
     // The pipeline spelling renders the same text as the function spelling,
-    // including the five that mean something else as a minijinja builtin filter.
+    // including the five that mean something else as a minijinja builtin
+    // filter. `regexReplaceAll` is the one that cannot agree: sprig's subject
+    // is its middle argument, so a Go pipe hands it the replacement slot.
     let piped = run(&dir, &["pipes"]);
     assert!(piped.ok(), "output: {}", piped.combined());
     for want in [
@@ -735,6 +740,11 @@ fn sprig_helpers_work_in_function_position() {
         "first=dir",
         "last=fr.po",
         "join=dir/fr.po",
+        // Subject-last, so the pipe agrees with the call...
+        "trunc=dir",
+        // ...while sprig's middle subject makes the pipe substitute inside the
+        // replacement, which is what Go renders and the migration keeps.
+        "regex=.mo",
     ] {
         assert!(
             piped.combined().contains(want),
@@ -748,7 +758,9 @@ fn sprig_helpers_work_in_function_position() {
 // dialect gets sprig's, and it gets it by translating a pipe into a call rather
 // than by overriding the builtin filters. `default` is the exception both ways:
 // there is no sprig-ordered call, because the builtin filter covers sprig's
-// meaning once its `boolean` argument is set.
+// meaning once its `boolean` argument is set. `trunc` and `regexReplaceAll`
+// override nothing — minijinja has no filter of either name — so Task's own
+// subject-first filters carry sprig's meaning there too.
 #[test]
 fn jinja_filters_keep_their_standard_meaning() {
     let dir = stage("template_funcs");
@@ -770,6 +782,9 @@ fn jinja_filters_keep_their_standard_meaning() {
         // The sprig meaning stays reachable in function position.
         "sprig_title=HELLO World",
         "sprig_join=dir/fr.po",
+        // Task's subject-first filters, sparing the sprig-ordered call.
+        "trunc=dir",
+        "regex=dir/fr.mo",
     ] {
         assert!(out.contains(want), "expected {want:?} in: {out}");
     }
@@ -812,7 +827,9 @@ fn go_printf_renders_and_migrates() {
 // carry that meaning into the converted file: four of the five helpers whose
 // Jinja builtin means something else are translated to a call, and `default`
 // to the builtin filter with its `boolean` argument set, so the migrated
-// Taskfile renders exactly what the Go one did.
+// Taskfile renders exactly what the Go one did. `regexReplaceAll` is translated
+// to a call for a different reason — sprig's subject is its middle argument —
+// and `trunc` to an ordinary filter.
 #[test]
 fn migration_preserves_sprig_meaning_after_a_pipe() {
     let go = stage("template_funcs");

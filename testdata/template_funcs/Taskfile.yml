@@ -2,7 +2,8 @@ version: '3'
 
 # Each sprig helper is called in function position, where the subject is the
 # last argument, and again after a pipe, where it is the first. The two
-# spellings must render the same text.
+# spellings must render the same text — except `regexReplaceAll`, whose subject
+# sprig takes in the middle, so the pipe means something else; see `pipes:`.
 vars:
   P: 'dir/fr.po'
   EMPTY: ''
@@ -19,6 +20,8 @@ tasks:
       - 'echo first={{first (splitList "/" .P)}}'
       - 'echo default={{default "fallback" .MISSING}}'
       - 'echo title={{title "hello wide world"}}'
+      - 'echo trunc={{trunc 3 .P}}'
+      - 'echo regex={{regexReplaceAll "[.]po$" .P ".mo"}}'
 
   pipes:
     cmds:
@@ -34,6 +37,12 @@ tasks:
       - 'echo first={{.P | splitList "/" | first}}'
       - 'echo last={{.P | splitList "/" | last}}'
       - 'echo join={{.P | join ","}}'
+      # `trunc` takes its subject last, so the pipe agrees with the call.
+      - 'echo trunc={{.P | trunc 3}}'
+      # `regexReplaceAll` takes it in the middle, so a pipe hands it the
+      # replacement slot instead: it substitutes inside `.mo`, matching nothing.
+      # Odd, but what Go renders, so the migrated file must keep the call.
+      - 'echo regex={{.P | regexReplaceAll "[.]po$" ".mo"}}'
 
   # `printf` and `print` assemble a path out of several variables — the Go
   # builtins a Taskfile reaches for the most.

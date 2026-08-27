@@ -49,9 +49,12 @@
 //! `exeExt`, `trim`, `trimAll`, `trimPrefix`, `trimSuffix`, `lower`,
 //! `upper`, `title`, `contains`, `hasPrefix`, `hasSuffix`, `replace`, `quote`,
 //! `squote`, `urlsafe`, `splitList`, `join`, `first`, `last`, `base`, `dir`,
-//! `ext`, `isAbs`, and the Go builtins `printf` and `print`. `title`, `join`,
-//! `first` and `last` are globals only, their filter spellings staying
-//! minijinja's; sprig's `default` is not registered at all, since minijinja's
+//! `ext`, `isAbs`, `trunc`, `regexReplaceAll`, and the Go builtins `printf` and
+//! `print`. `trunc` takes its subject last as a function and first as a filter;
+//! `regexReplaceAll` takes it in the *middle* as a function (sprig's order) and
+//! first as a filter. `title`, `join`, `first` and `last` are globals only,
+//! their filter spellings staying minijinja's; sprig's `default` is not
+//! registered at all, since minijinja's
 //! builtin `default` filter *is* it once the `boolean` argument is set, which
 //! is what both Go spellings translate to. Every other sprig helper
 //! (`range`-style list builders, YAML/UUID/spew helpers, shell quoting,
@@ -90,6 +93,12 @@ thread_local! {
 /// pass it first. Either way `--migrate` writes a file that keeps rendering
 /// what it rendered as Go.
 ///
+/// `regexReplaceAll` is here for a different reason: sprig puts its subject in
+/// the *middle* (`regexReplaceAll pattern s repl`), so a Go pipe hands it the
+/// subject as the replacement, and the subject-first filter this module
+/// registers would silently rewrite the wrong string. The call keeps whatever
+/// the Go dialect rendered, however odd.
+///
 /// `default` is deliberately absent: minijinja's builtin filter reproduces
 /// sprig's meaning exactly once its `boolean` argument is set, so both Go
 /// spellings translate to that filter instead (see [`translate_default`]) and
@@ -97,7 +106,15 @@ thread_local! {
 ///
 /// Every name here must also be in [`MAPPED_FUNCS`], which the preflight checks
 /// first; one that is not would be rejected before ever reaching the rewrite.
-const CALL_AFTER_PIPE: &[&str] = &["title", "join", "first", "last", "printf", "print"];
+const CALL_AFTER_PIPE: &[&str] = &[
+    "title",
+    "join",
+    "first",
+    "last",
+    "printf",
+    "print",
+    "regexReplaceAll",
+];
 
 /// The set of function names this module maps to minijinja. A Go action that
 /// calls any other identifier is rejected by the preflight.
@@ -1254,9 +1271,8 @@ fn register_helpers(env: &mut Environment<'static>) {
     // as in a pipeline (`{{.TASK | urlsafe}}`), and `translate_action` emits a
     // call for the head segment and a filter for every segment after a pipe —
     // except the names in `CALL_AFTER_PIPE`, which become a call there too.
-    // `trunc`, `regexReplaceAll`, `joinPath`, `splitArgs`, `env`, `index` and
-    // the comparisons are still function-only, so `{{.P | trunc 3}}` fails with
-    // "unknown filter".
+    // `joinPath`, `splitArgs`, `env`, `index` and the comparisons are still
+    // function-only, so `{{.P | joinPath "x"}}` fails with "unknown filter".
     //
     // The filter side is registered further down; for `trim`, `lower`, `upper`
     // and `replace` it is minijinja's builtin, which already matches sprig.
@@ -1328,13 +1344,23 @@ fn register_helpers(env: &mut Environment<'static>) {
 
     // Task `joinPath` (filepath.Join), the sprig helpers `trunc`,
     // `regexReplaceAll` and `env`, and the Go builtins `printf` and `print`,
-    // all called in function position.
+    // in sprig's own argument order.
     env.add_function("joinPath", func_join_path);
     env.add_function("trunc", func_trunc);
     env.add_function("regexReplaceAll", func_regex_replace_all);
     env.add_function("env", func_env);
     env.add_function("printf", func_printf);
     env.add_function("print", func_print);
+
+    // minijinja passes a filter's subject *first*, so the sprig-ordered
+    // functions above cannot double as filters; these two spellings do what
+    // every other mapped helper's `filter_*` does, sparing a Jinja Taskfile the
+    // call form. A Go `{{.P | trunc 3}}` now lands here, which is what sprig
+    // means by it anyway; `regexReplaceAll` is in `CALL_AFTER_PIPE`, since
+    // sprig's subject is its middle argument and a Go pipe passes the subject
+    // last.
+    env.add_filter("trunc", filter_trunc);
+    env.add_filter("regexReplaceAll", filter_regex_replace_all);
 
     env.add_filter("catLines", filter_cat_lines);
     env.add_filter("splitLines", filter_split_lines);
@@ -1903,6 +1929,21 @@ fn func_join(sep: String, list: JinjaValue) -> String {
         // Not iterable: sprig joins the one-element list holding it.
         Err(_) => go_string(&list),
     }
+}
+
+/// Subject-first spelling of [`func_trunc`] for `s | trunc(n)`.
+fn filter_trunc(s: String, n: i64) -> String {
+    func_trunc(n, s)
+}
+
+/// Subject-first spelling of [`func_regex_replace_all`], moving the subject out
+/// of the middle: `s | regexReplaceAll(pattern, repl)`.
+fn filter_regex_replace_all(
+    s: String,
+    pattern: String,
+    repl: String,
+) -> Result<String, minijinja::Error> {
+    func_regex_replace_all(pattern, s, repl)
 }
 
 fn filter_cat_lines(s: String) -> String {
@@ -2859,6 +2900,49 @@ mod tests {
         );
         // Positionally it means what it says.
         assert_eq!(c.replace(r#"{{ EMPTY | default("fb", false) }}"#), "");
+        assert!(!c.is_err(), "recorded {:?}", c.err());
+    }
+
+    // minijinja passes a filter's subject first, so neither sprig-ordered
+    // function can double as a filter; these subject-first spellings spare a
+    // Jinja Taskfile the call form.
+    #[test]
+    fn trunc_and_regex_replace_all_are_filters_too() {
+        let mut c = cache_with(&[("P", "abcdef")]);
+        c.set_dialect(Dialect::Jinja);
+        assert_eq!(c.replace(r#"{{ P | trunc(3) }}"#), "abc");
+        assert_eq!(c.replace(r#"{{ P | trunc(-2) }}"#), "ef");
+        assert_eq!(
+            c.replace(r#"{{ P | regexReplaceAll("[bd]", "-") }}"#),
+            "a-c-ef"
+        );
+        // Same results as the sprig-ordered calls the Go dialect uses.
+        assert_eq!(c.replace(r#"{{ trunc(3, P) }}"#), "abc");
+        assert_eq!(
+            c.replace(r#"{{ regexReplaceAll("[bd]", P, "-") }}"#),
+            "a-c-ef"
+        );
+        assert!(!c.is_err(), "recorded {:?}", c.err());
+    }
+
+    // A Go pipe passes the subject last, which is sprig's `trunc` order but
+    // lands in `regexReplaceAll`'s replacement slot, so only the first becomes
+    // the new filter; the second stays the sprig-ordered call and keeps
+    // rendering what Go renders.
+    #[test]
+    fn go_pipes_keep_their_meaning_for_the_new_filters() {
+        assert_eq!(
+            to_jinja(r#"{{ .P | trunc 3 }}"#).expect("migrates"),
+            r#"{{ P | trunc(3) }}"#
+        );
+        assert_eq!(
+            to_jinja(r#"{{ .P | regexReplaceAll "[bd]" "-" }}"#).expect("migrates"),
+            r#"{{ regexReplaceAll("[bd]", "-", P) }}"#
+        );
+        let mut c = cache_with(&[("P", "abcdef")]);
+        assert_eq!(c.replace(r#"{{ .P | trunc 3 }}"#), "abc");
+        // Substitutes inside the replacement, matching nothing.
+        assert_eq!(c.replace(r#"{{ .P | regexReplaceAll "[bd]" "-" }}"#), "-");
         assert!(!c.is_err(), "recorded {:?}", c.err());
     }
 
