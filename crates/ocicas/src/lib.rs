@@ -28,6 +28,7 @@ mod error;
 mod index;
 mod lock;
 mod store;
+mod tls;
 
 pub use cas::{assemble, build, digest_hex};
 pub use chunker::{AVG_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};

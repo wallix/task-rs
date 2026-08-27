@@ -5,6 +5,9 @@
 - **A failing cache registry or cache lock names the reason** — a rejected
   certificate, a refused connection, a name that does not resolve — instead of
   only reporting that the registry could not be reached.
+- **A `vks://` lock trusts the same certificate as the cache**, so one registry
+  behind a private CA serves both the cache and the build-once lock. Such a lock
+  could not connect before, and every run took a local lock instead.
 - **Go-syntax Taskfiles can call `printf` and `print`**, so a Taskfile that
   builds a path out of several variables renders and migrates instead of being
   rejected as an unsupported construct. `printf` covers the string-composing

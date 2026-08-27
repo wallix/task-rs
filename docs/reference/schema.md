@@ -721,7 +721,7 @@ Cache fields:
 | `inherit` | `string` | Name of a cache model to inherit from                              |
 | `enabled` | `bool`   | Explicitly enable or disable the cache block                       |
 | `url`     | `string` | Template string resolving to the cache URL (`file://`, `oci://`)   |
-| `lock`    | `string` | Lock URL (`file://`, `redis://`, `vk://`); see below               |
+| `lock`    | `string` | Lock URL (`file://`, `redis://`, `vk://`, `vks://`); see below     |
 | `ttl`     | `string` | TTL for cached assets (e.g. `48h`, `7d`); default `48h`           |
 
 Supported `url` (storage) schemes:
@@ -737,12 +737,14 @@ Supported `lock` schemes:
 
 - `file://<dir>` — local lockfiles (single host only).
 - `redis://[user:pass@]host[:port]/<prefix>` — Redis `SET NX EX` with a heartbeat.
-- `vk://host[:port]/<prefix>` (`vks://` for HTTPS) — the vk-registry HTTP lock
-  API, so one vk-registry serves both the `oci://` cache and the lock with no
-  separate Redis. Authenticates with `vk://user:pass@host/...` (Basic) or
-  `$TASK_VK_LOCK_TOKEN` (bearer). Either travels in the clear over `vk://`, on
-  every acquire, renew and release — use `vks://` unless the credentials are
-  confined to a trusted network.
+- `vk://host[:port]/<prefix>` (`vks://host[:port]/<prefix>[?ca=<file>]` for
+  HTTPS) — the vk-registry HTTP lock API, so one vk-registry serves both the
+  `oci://` cache and the lock with no separate Redis. Authenticates with
+  `vk://user:pass@host/...` (Basic) or `$TASK_VK_LOCK_TOKEN` (bearer). Either
+  travels in the clear over `vk://`, on every acquire, renew and release — use
+  `vks://` unless the credentials are confined to a trusted network. A `vks://`
+  lock trusts `?ca=<file>`, else `$TASK_CACHE_OCI_CA`, on top of the system
+  store.
 
 All template fields (`url`, `lock`, `enabled`) support standard Task variables
 plus `{{.TASK}}`, `{{.CHECKSUM}}`, and the `urlsafe` template function.

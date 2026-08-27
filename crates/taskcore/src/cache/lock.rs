@@ -3,7 +3,9 @@
 //! * `file://` — a local exclusive lockfile with retry/backoff. Distinct lock
 //!   names never contend; the same name serializes across processes.
 //! * `vk://` / `vks://` — a distributed build-once lock backed by a vk-registry
-//!   HTTP lock API ([`ocicas::Locker`]).
+//!   HTTP lock API ([`ocicas::Locker`]). `vks://` takes its trust anchor from
+//!   `?ca=` or `$TASK_CACHE_OCI_CA`, the same registry certificate the
+//!   `oci://` cache uses.
 //! * `redis://` — a distributed lock via Redis `SET NX EX` with a heartbeat
 //!   ([`RedisLocker`]).
 
@@ -112,11 +114,21 @@ impl CacheLock {
                 timeout,
             })),
             "vk" | "vks" => {
-                let scheme = if u.scheme == "vks" { "https" } else { "http" };
+                let tls = u.scheme == "vks";
+                let scheme = if tls { "https" } else { "http" };
                 let base = format!("{scheme}://{}", u.host);
                 let prefix = u.path.trim_matches('/').to_string();
+                // Same registry as the `oci://` cache, so the same trust
+                // anchor: `?ca=` here, else `$TASK_CACHE_OCI_CA`. Without it a
+                // `vks://` lock on a private CA fails to connect, and the run
+                // falls back to a local file lock. A plain `vk://` lock has no
+                // TLS to anchor, so it reads neither.
+                let ca = tls
+                    .then(|| super::oci::ca_file(u.query().get("ca").map_or("", String::as_str)))
+                    .flatten();
                 let locker = ocicas::Locker::new(base, prefix)?
                     .with_timeout(timeout)
+                    .with_ca(ca.as_deref())?
                     // `vk://user:pass@host/...` authenticates with Basic; with
                     // no user the locker keeps its `$TASK_VK_LOCK_TOKEN`
                     // bearer default.

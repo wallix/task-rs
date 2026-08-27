@@ -100,9 +100,21 @@ impl Store {
         let registry = parsed.resolve_registry().to_string();
         let repository = parsed.repository().to_string();
 
+        // One read for both clients: `oci-client` takes the PEM bytes, the
+        // plain `reqwest` client the parsed certificates.
+        let ca = opts
+            .ca_file
+            .as_deref()
+            .map(crate::tls::ca_roots)
+            .transpose()?;
+
+        let (ca_pem, ca_certs) = match ca {
+            Some(ca) => (Some(ca.pem), ca.certs),
+            None => (None, Vec::new()),
+        };
+
         let mut cfg = ClientConfig::default();
-        if let Some(ca) = &opts.ca_file {
-            let pem = std::fs::read(ca)?;
+        if let Some(pem) = ca_pem {
             cfg.extra_root_certificates.push(Certificate {
                 encoding: CertificateEncoding::Pem,
                 data: pem,
@@ -118,10 +130,8 @@ impl Store {
         let mut builder = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT);
-        if let Some(ca) = &opts.ca_file {
-            let pem = std::fs::read(ca)?;
-            builder = builder
-                .add_root_certificate(reqwest::Certificate::from_pem(&pem).map_err(req_err)?);
+        for root in ca_certs {
+            builder = builder.add_root_certificate(root);
         }
         let http = builder.build().map_err(req_err)?;
 

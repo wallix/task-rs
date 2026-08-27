@@ -1398,7 +1398,22 @@ impl Executor {
         } else {
             crate::goext::parse_duration(&c.lock_timeout).ok()
         };
-        CacheLock::from_url(&c.lock, timeout).ok().flatten()
+        // An unusable lock URL — an unreadable `?ca=` file, an unknown scheme
+        // — must not read as "no lock configured": the run degrades to the
+        // local file lock, so say why.
+        match CacheLock::from_url(&c.lock, timeout) {
+            Ok(locker) => locker,
+            Err(e) => {
+                // A lock URL carries credentials (`vk://user:pass@host/...`).
+                let shown = cache::CacheUri::parse(c.lock.trim())
+                    .map_or_else(|| c.lock.trim().to_string(), |u| u.redacted());
+                self.logger().borrow_mut().verbose_errf(
+                    Color::Yellow,
+                    &format!("task: cache lock {shown:?} unusable: {e} (falling back to local)\n"),
+                );
+                None
+            }
+        }
     }
 
     /// Validates cache metadata against the task's current state and records the

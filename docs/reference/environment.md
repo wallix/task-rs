@@ -120,6 +120,23 @@ Bearer token for a `cache.lock: vk://...` distributed lock, used when the URL
 carries no `user:pass@` credentials of its own. Sent on every acquire, renew and
 release, in the clear unless the URL is `vks://`.
 
+### `TASK_CACHE_OCI_CA`
+
+Path to a PEM file holding an extra trust anchor for a `cache.url: oci://...`
+registry whose certificate the system store does not chain to (a self-signed
+corp registry), used when the URL carries no `?ca=` of its own. A relative path
+is relative to the directory `task` is invoked from.
+
+A `cache.lock: vks://...` reads the same variable, since the lock API is served
+by the same registry.
+
+The certificate the registry presents must be a leaf (`CA:FALSE`); a CA
+certificate served as the TLS end-entity is rejected (`CaUsedAsEndEntity`)
+whether or not it is also the configured anchor.
+
+The registry's other settings — credentials, the local chunk store, plain HTTP
+— are documented with `cache` in the [schema reference](schema.md#cache).
+
 ### `FORCE_COLOR`
 
 Force color output usage.

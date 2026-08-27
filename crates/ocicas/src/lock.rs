@@ -20,6 +20,7 @@
 //! time, so the server's atomic multi-name batch is unused (a single name is
 //! just a one-name batch).
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -90,14 +91,7 @@ impl Locker {
     /// provider must already be installed (the `task` binary installs ring at
     /// startup); building a client without one panics inside `reqwest`.
     pub fn new(base: impl Into<String>, prefix: impl Into<String>) -> Result<Self> {
-        // Only a connect timeout: a lock acquire is a deliberate long-poll (up
-        // to POLL_CAP), so no client-wide read timeout — every request sets its
-        // own `.timeout()` instead, sized to what that action may legitimately
-        // take.
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(req_err)?;
+        let http = http_client(Vec::new())?;
         let auth = std::env::var("TASK_VK_LOCK_TOKEN")
             .ok()
             .filter(|t| !t.is_empty())
@@ -125,6 +119,18 @@ impl Locker {
     fn with_heartbeat(mut self, freq: Duration) -> Self {
         self.heartbeat = freq;
         self
+    }
+
+    /// Trust the PEM in `ca_file` in addition to the system store, for a lock
+    /// API served with a certificate the platform does not chain to. Rebuilds
+    /// the HTTP client, so call it before handing the locker out. `None` leaves
+    /// the client on the system trust store alone.
+    pub fn with_ca(mut self, ca_file: Option<&Path>) -> Result<Self> {
+        let Some(ca_file) = ca_file else {
+            return Ok(self);
+        };
+        self.http = http_client(crate::tls::ca_roots(ca_file)?.certs)?;
+        Ok(self)
     }
 
     /// Authenticate with `user`/`pass` (from the `cache.lock` URL) instead of
@@ -476,6 +482,19 @@ fn req_err(e: reqwest::Error) -> Error {
     Error::format(with_causes("vk lock", &e))
 }
 
+/// The lock client, trusting `extra_roots` on top of the system store.
+///
+/// Only a connect timeout: a lock acquire is a deliberate long-poll (up to
+/// POLL_CAP), so no client-wide read timeout — every request sets its own
+/// `.timeout()` instead, sized to what that action may legitimately take.
+fn http_client(extra_roots: Vec<reqwest::Certificate>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT);
+    for root in extra_roots {
+        builder = builder.add_root_certificate(root);
+    }
+    builder.build().map_err(req_err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,6 +637,41 @@ mod tests {
     /// the ring provider at startup, so a test that builds a client must too.
     fn install_crypto() {
         let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    // `crates/ocicas/src/tls.rs` owns the message contract; this is the wiring
+    // — a rejected CA file must fail the locker, not be dropped.
+    #[test]
+    fn with_ca_rejects_a_file_that_is_not_a_certificate() {
+        install_crypto();
+        // A predictable shared-temp name is a redirect waiting to happen.
+        let junk =
+            std::env::temp_dir().join(format!("ocicas-not-a-cert-{}.pem", std::process::id()));
+        let _ = std::fs::remove_file(&junk);
+        std::fs::File::create_new(&junk)
+            .unwrap()
+            .write_all(b"-----BEGIN CERTIFICATE-----\nnot base64\n")
+            .unwrap();
+        let built = Locker::new("https://reg", "p")
+            .unwrap()
+            .with_ca(Some(&junk));
+        let _ = std::fs::remove_file(&junk);
+        let err = match built {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a malformed certificate must fail, not be ignored"),
+        };
+        assert!(err.contains("ocicas-not-a-cert"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn with_ca_none_is_a_no_op() {
+        install_crypto();
+        assert!(
+            Locker::new("https://reg", "p")
+                .unwrap()
+                .with_ca(None)
+                .is_ok()
+        );
     }
 
     fn locker(base: String) -> Locker {

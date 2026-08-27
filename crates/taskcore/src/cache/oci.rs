@@ -52,13 +52,7 @@ pub fn parse_oci_cache_url(u: &CacheUri) -> Result<(String, String, RemoteOption
     }
 
     let q = u.query();
-    let ca = q.get("ca").cloned().unwrap_or_default();
-    let ca = if ca.is_empty() {
-        env("TASK_CACHE_OCI_CA")
-    } else {
-        ca
-    };
-    opts.ca_file = (!ca.is_empty()).then(|| PathBuf::from(ca));
+    opts.ca_file = ca_file(q.get("ca").map_or("", String::as_str));
 
     opts.plain_http = q.get("plainhttp").map(String::as_str) == Some("1");
 
@@ -78,6 +72,18 @@ pub fn parse_oci_cache_url(u: &CacheUri) -> Result<(String, String, RemoteOption
     opts.cache_dir = (!cas.is_empty()).then(|| PathBuf::from(cas));
 
     Ok((repo, tag.to_string(), opts))
+}
+
+/// The trust anchor for a registry URL: the `?ca=` parameter when set,
+/// otherwise `$TASK_CACHE_OCI_CA`. Shared with the `vk://` lock, which talks to
+/// the same registry and so uses the same certificate.
+pub(super) fn ca_file(explicit: &str) -> Option<PathBuf> {
+    let ca = if explicit.is_empty() {
+        env("TASK_CACHE_OCI_CA")
+    } else {
+        explicit.to_string()
+    };
+    (!ca.is_empty()).then(|| PathBuf::from(ca))
 }
 
 fn env(key: &str) -> String {
@@ -138,6 +144,29 @@ mod tests {
         }
         let (_, _, opts) = parse("oci://host/repo:tag").unwrap();
         assert!(opts.cache_dir.is_some(), "expected a default chunk CAS dir");
+    }
+
+    // The `vk://` lock reads its anchor through this same helper, so the
+    // precedence is the contract between the two backends.
+    #[test]
+    fn ca_file_prefers_the_url_over_the_env() {
+        // SAFETY: single-threaded test setup.
+        unsafe {
+            std::env::set_var("TASK_CACHE_OCI_CA", "/env/ca.crt");
+        }
+        assert_eq!(
+            ca_file("/url/ca.crt").as_deref(),
+            Some(std::path::Path::new("/url/ca.crt"))
+        );
+        assert_eq!(
+            ca_file("").as_deref(),
+            Some(std::path::Path::new("/env/ca.crt"))
+        );
+        // SAFETY: single-threaded test setup.
+        unsafe {
+            std::env::remove_var("TASK_CACHE_OCI_CA");
+        }
+        assert_eq!(ca_file(""), None);
     }
 
     #[test]
