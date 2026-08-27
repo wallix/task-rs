@@ -746,7 +746,9 @@ fn sprig_helpers_work_in_function_position() {
 
 // A file written natively in Jinja keeps standard Jinja meaning: only the Go
 // dialect gets sprig's, and it gets it by translating a pipe into a call rather
-// than by overriding the builtin filters.
+// than by overriding the builtin filters. `default` is the exception both ways:
+// there is no sprig-ordered call, because the builtin filter covers sprig's
+// meaning once its `boolean` argument is set.
 #[test]
 fn jinja_filters_keep_their_standard_meaning() {
     let dir = stage("template_funcs");
@@ -762,8 +764,10 @@ fn jinja_filters_keep_their_standard_meaning() {
         "missing=fallback",
         // Jinja's `title` lowercases the tail.
         "title=Hello World",
+        // The `boolean` argument gives sprig's reach over any empty value.
+        "lax_default=fallback",
+        "lax_zero=10",
         // The sprig meaning stays reachable in function position.
-        "sprig_default=fallback",
         "sprig_title=HELLO World",
         "sprig_join=dir/fr.po",
     ] {
@@ -805,9 +809,10 @@ fn go_printf_renders_and_migrates() {
 }
 
 // The Go dialect keeps sprig's meaning after a pipe, and `--migrate` has to
-// carry that meaning into the converted file: the five helpers whose Jinja
-// builtin means something else are translated to a call, not to a filter, so
-// the migrated Taskfile renders exactly what the Go one did.
+// carry that meaning into the converted file: four of the five helpers whose
+// Jinja builtin means something else are translated to a call, and `default`
+// to the builtin filter with its `boolean` argument set, so the migrated
+// Taskfile renders exactly what the Go one did.
 #[test]
 fn migration_preserves_sprig_meaning_after_a_pipe() {
     let go = stage("template_funcs");
@@ -818,10 +823,11 @@ fn migration_preserves_sprig_meaning_after_a_pipe() {
     let w = run(&migrated, &["--migrate", "--write"]);
     assert!(w.ok(), "stderr: {}", w.stderr);
     let on_disk = std::fs::read_to_string(migrated.join("Taskfile.yml")).unwrap();
-    // A call with the subject last, not `EMPTY | default("fallback")`, which
-    // would mean "only if undefined" once the file is Jinja.
+    // The builtin filter with its `boolean` argument set, not the bare
+    // `EMPTY | default("fallback")`, which would mean "only if undefined" once
+    // the file is Jinja.
     assert!(
-        on_disk.contains(r#"default("fallback", EMPTY)"#),
+        on_disk.contains(r#"EMPTY | default("fallback", true)"#),
         "migrated to: {on_disk}"
     );
     // A helper whose builtin already matches sprig stays an idiomatic filter.

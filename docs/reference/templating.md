@@ -86,9 +86,10 @@ Values are transformed with the pipe (`|`) filter syntax:
 
 ```yaml
 cmds:
-  - 'echo {{ NAME | upper }}'                 # JOHN DOE
-  - 'echo {{ MESSAGE | trim }}'               # trims surrounding whitespace
-  - 'echo {{ MISSING | default("fallback") }}'
+  - 'echo {{ NAME | upper }}'                       # JOHN DOE
+  - 'echo {{ MESSAGE | trim }}'                     # trims whitespace
+  - 'echo {{ MISSING | default("fallback") }}'      # only when unset
+  - 'echo {{ EMPTY | default("fallback", true) }}'  # also when empty
 ```
 
 Filters can be chained: `{{ CSV | splitList(",") | join(" ") }}`.
@@ -276,8 +277,10 @@ called as functions (`joinPath(a, b)`) or filters (`value | trimPrefix("x")`); i
 Go they are called in pipeline/space-separated form (`joinPath a b`,
 `.VALUE | trimPrefix "x"`).
 
-`default`, `title`, `join`, `first` and `last` are the exception: in Jinja the
-*filter* of each of those names is Jinja's own, not Task's — see
+`title`, `join`, `first` and `last` are the exception: in Jinja the *filter* of
+each of those names is Jinja's own, not Task's. `default` goes further — Task
+registers no function of that name in Jinja at all, only minijinja's builtin
+filter. See
 [sprig semantics after a pipe](#sprig-semantics-after-a-pipe-go-dialect).
 
 Most helpers that take a subject accept it in either position, but at opposite
@@ -339,19 +342,30 @@ takes scalars only.
 | `splitList(sep, s)`, `s \| splitList(sep)` | Split a string into a list on `sep` |
 | `join(sep, list)`†, `list \| join(sep)` | Join a list into a string with `sep` |
 | `first(list)`†, `last(list)`†, `list \| first`, `list \| last` | The first / last element |
-
-† In the Jinja dialect the filter spelling is minijinja's own; only the call
-form carries sprig's meaning.
 | `len(x)` | Length of a list, map, or string |
 | `splitArgs(s)` | Shell-split a string into an argument list |
 | `index(coll, k…)` | Successive index/key lookups (`index(MATCH, 0)`) |
+
+† In the Jinja dialect the filter spelling is minijinja's own; only the call
+form carries sprig's meaning.
+
+### Fallbacks
+
+| Filter | Description |
+| --- | --- |
+| `x \| default(fb)` | `fb` when `x` is unset |
+| `x \| default(fb, true)` | `fb` when `x` is unset or empty (`""`, `0`, `false`, an empty list) — sprig's rule |
+
+Both Go spellings of sprig's `default` migrate to the second form; there is no
+`default` function. See
+[sprig semantics after a pipe](#sprig-semantics-after-a-pipe-go-dialect).
 
 ### Comparison and logic (Go dialect)
 
 `and`, `or`, `not`, `eq`, `ne`, `lt`, `le`, `gt`, `ge` are available for the Go
 dialect. In Jinja, use the native operators (`==`, `!=`, `<`, `and`, `or`,
-`not`, `in`) instead. `default(fallback, value)` is a function in both dialects;
-in Jinja the `| default(fallback)` filter is Jinja's own — see below.
+`not`, `in`) instead. In Jinja `default` is a filter, not a function; the Go
+dialect takes either spelling and both migrate to the filter — see below.
 
 ### sprig semantics after a pipe (Go dialect)
 
@@ -360,17 +374,38 @@ in Jinja the `| default(fallback)` filter is Jinja's own — see below.
 Taskfile the sprig meaning wins, in both call and pipe position.
 
 Jinja Taskfiles are **not** affected — `{{ COUNT | default(10) }}` there is
-Jinja's own filter and still yields `0` for a `COUNT` of `0`. The Go dialect
-gets sprig's meaning by translating `{{ .X | default "y" }}` into the call
-`default("y", X)` rather than into a filter, so `task --migrate` writes that
-call into the converted file and the migrated Taskfile keeps rendering what it
-rendered as Go. Keep the call form when editing a migrated file: rewriting it
-to `X | default("y")` silently switches to Jinja's meaning.
+Jinja's own filter and still yields `0` for a `COUNT` of `0`. For `title`,
+`join`, `first` and `last` the Go dialect gets sprig's meaning by translating
+the pipe into a *call*, `{{ .P | join "," }}` becoming `join(",", P)`, so
+`task --migrate` writes that call into the converted file and the migrated
+Taskfile keeps rendering what it rendered as Go. Keep the call form when editing
+one of those in a migrated file: rewriting it to `P | join(",")` switches to
+Jinja's meaning.
+
+`default` needs no call, because Jinja's own filter takes a second argument that
+widens it to every empty value — exactly sprig's rule. Both Go spellings,
+`{{ .X | default "y" }}` and `{{ default "y" .X }}`, translate to
+`{{ X | default("y", true) }}`.
+
+Write that form in a Jinja Taskfile whenever an empty value should take the
+fallback, and the plain `{{ X | default("y") }}` when only an unset one should.
+There is no `default` function: a sprig-ordered `default("y", X)` — carried by a
+Taskfile written or migrated against task 4.1.0 / 4.1.1, which is also the form
+this page used to recommend for hand-written Jinja — fails with
+`unknown function`.
+
+Pass that second argument **positionally**. Filter arguments are positional
+throughout, and most filters reject a keyword outright —
+`{{ P | trimPrefix(prefix="dir/") }}` is an error — but `default` reads its
+second argument loosely enough that a keyword lands there as a value that is
+always on, so `{{ X | default("y", boolean=false) }}` substitutes for an empty
+`X` instead of leaving it: the opposite of what it says.
 
 Where the two differ:
 
 - `default` substitutes its fallback for any empty value (`""`, `0`, `false`, an
-  empty list), not only an undefined one.
+  empty list), not only an undefined one. This is what the second argument to
+  the filter selects.
 - `title` uppercases the first letter of every word and leaves the rest of the
   word alone, so `HELLO world` becomes `HELLO World` where Jinja's `title`
   gives `Hello World`.

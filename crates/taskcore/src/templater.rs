@@ -46,13 +46,15 @@
 //!
 //! These sprig / Task helpers are registered as minijinja globals and filters:
 //! `OS`, `ARCH`, `numCPU`, `catLines`, `splitLines`, `fromSlash`, `toSlash`,
-//! `exeExt`, `default` (a global only, as `title`, `join`, `first` and `last`
-//! are — their filter spellings stay minijinja's), `trim`, `trimAll`,
-//! `trimPrefix`, `trimSuffix`, `lower`,
+//! `exeExt`, `trim`, `trimAll`, `trimPrefix`, `trimSuffix`, `lower`,
 //! `upper`, `title`, `contains`, `hasPrefix`, `hasSuffix`, `replace`, `quote`,
 //! `squote`, `urlsafe`, `splitList`, `join`, `first`, `last`, `base`, `dir`,
-//! `ext`, `isAbs`, and the Go builtins `printf` and `print`. Every other sprig
-//! helper (`range`-style list builders, YAML/UUID/spew helpers, shell quoting,
+//! `ext`, `isAbs`, and the Go builtins `printf` and `print`. `title`, `join`,
+//! `first` and `last` are globals only, their filter spellings staying
+//! minijinja's; sprig's `default` is not registered at all, since minijinja's
+//! builtin `default` filter *is* it once the `boolean` argument is set, which
+//! is what both Go spellings translate to. Every other sprig helper
+//! (`range`-style list builders, YAML/UUID/spew helpers, shell quoting,
 //! `merge`, …) is intentionally left unmapped so it hits the preflight error
 //! rather than being dropped.
 //!
@@ -81,18 +83,21 @@ thread_local! {
 /// The helpers that stay a *call* after a pipe, taking the subject as their
 /// last argument — sprig's own order — instead of becoming a minijinja filter.
 ///
-/// The first five are sprig helpers whose meaning differs from the minijinja
+/// The first four are sprig helpers whose meaning differs from the minijinja
 /// builtin filter of the same name, so the Go meaning survives without the
 /// builtins being overridden for a native Jinja Taskfile. `printf` and `print`
 /// take the subject last too, and minijinja has no filter of either name to
 /// pass it first. Either way `--migrate` writes a file that keeps rendering
 /// what it rendered as Go.
 ///
+/// `default` is deliberately absent: minijinja's builtin filter reproduces
+/// sprig's meaning exactly once its `boolean` argument is set, so both Go
+/// spellings translate to that filter instead (see [`translate_default`]) and
+/// no `default` global is registered at all.
+///
 /// Every name here must also be in [`MAPPED_FUNCS`], which the preflight checks
 /// first; one that is not would be rejected before ever reaching the rewrite.
-const CALL_AFTER_PIPE: &[&str] = &[
-    "default", "title", "join", "first", "last", "printf", "print",
-];
+const CALL_AFTER_PIPE: &[&str] = &["title", "join", "first", "last", "printf", "print"];
 
 /// The set of function names this module maps to minijinja. A Go action that
 /// calls any other identifier is rejected by the preflight.
@@ -105,6 +110,8 @@ const MAPPED_FUNCS: &[&str] = &[
     "fromSlash",
     "toSlash",
     "exeExt",
+    // Accepted in Go source but not registered: `translate_default` rewrites it
+    // to minijinja's builtin `default` filter.
     "default",
     "trim",
     "trimAll",
@@ -949,6 +956,12 @@ fn translate_action(body: &str, action: &str) -> Result<String, TemplaterError> 
                 .iter()
                 .map(|a| translate_arg(a, action))
                 .collect::<Result<_, _>>()?;
+            // `default` is the one helper with no call spelling in the target
+            // environment, so both Go forms become the builtin filter instead.
+            if first == "default" {
+                expr = translate_default(idx, rendered_args, expr, action)?;
+                continue;
+            }
             // After a pipe, these take the piped value as their last argument
             // — sprig's own order — instead of becoming a minijinja filter,
             // whose builtin of the same name means something else, or is absent.
@@ -973,6 +986,45 @@ fn translate_action(body: &str, action: &str) -> Result<String, TemplaterError> 
         }
     }
     Ok(expr)
+}
+
+/// Emits sprig's `default` as minijinja's builtin `default` filter with the
+/// `boolean` argument set, which substitutes for any empty value exactly as
+/// sprig does — where the bare filter would only cover an undefined one. No
+/// `default` global is registered, so this is the only spelling that carries
+/// the Go meaning into a migrated Taskfile.
+///
+/// `args` are the already-translated arguments and `expr` the expression built
+/// so far. The subject is that expression after a pipe (`.X | default "y"`) or
+/// `default`'s second argument in call position (`default "y" .X`). sprig's
+/// `default` is variadic but consults only the first given value, and a bare
+/// `default "y"` with no subject at all yields its fallback, so that form
+/// translates to the fallback alone. Its remaining arities — `default "y" .A
+/// .B`, and `.X | default` with no fallback — stay unsupported, as they were
+/// before the translation existed, rather than being guessed at.
+fn translate_default(
+    idx: usize,
+    args: Vec<String>,
+    expr: String,
+    action: &str,
+) -> Result<String, TemplaterError> {
+    let len = args.len();
+    let mut args = args.into_iter();
+    let (fallback, subject) = match (idx, len, args.next(), args.next()) {
+        (0, 1, Some(fallback), _) => return Ok(fallback),
+        (0, 2, Some(fallback), Some(subject)) => (fallback, subject),
+        (_, 1, Some(fallback), _) => (fallback, expr),
+        _ => {
+            return Err(TemplaterError::Render {
+                template: action.to_string(),
+                message: format!(
+                    "cannot translate `default` with {len} argument(s): it takes one after a \
+                     pipe, or one or two in call position"
+                ),
+            });
+        }
+    };
+    Ok(format!("{subject} | default({fallback}, true)"))
 }
 
 /// Appends a translated segment to the expression built so far: the first
@@ -1208,10 +1260,12 @@ fn register_helpers(env: &mut Environment<'static>) {
     //
     // The filter side is registered further down; for `trim`, `lower`, `upper`
     // and `replace` it is minijinja's builtin, which already matches sprig.
-    // `title`, `first`, `last`, `join` and `default` do not match, so those
-    // builtins are deliberately left alone — a native Jinja Taskfile keeps
-    // Jinja's meaning — and the Go dialect reaches sprig's through the call
-    // `translate_action` emits instead of a filter.
+    // `title`, `first`, `last` and `join` do not match, so those builtins are
+    // deliberately left alone — a native Jinja Taskfile keeps Jinja's meaning —
+    // and the Go dialect reaches sprig's through the call `translate_action`
+    // emits instead of a filter. `default` is a fifth mismatch, and the one
+    // mapped helper with no function registration at all: the builtin filter's
+    // `boolean` argument closes it, which is what `translate_default` emits.
     //
     // These are globals, so a Taskfile variable of the same name shadows one —
     // a `vars:` entry called `join` wins over the helper — but an *undefined*
@@ -1244,8 +1298,8 @@ fn register_helpers(env: &mut Environment<'static>) {
 
     // Subject-last sprig helpers, none of which minijinja offers as a function.
     // The first seven have no builtin at all and are registered as filters by
-    // this module; `replace`, `join` and `default` shadow a builtin in function
-    // position only.
+    // this module; `replace` and `join` shadow a builtin in function position
+    // only.
     env.add_function("splitList", func_split_list);
     env.add_function("trimAll", func_trim_all);
     env.add_function("trimPrefix", func_trim_prefix);
@@ -1255,7 +1309,6 @@ fn register_helpers(env: &mut Environment<'static>) {
     env.add_function("contains", func_contains);
     env.add_function("replace", func_replace);
     env.add_function("join", func_join);
-    env.add_function("default", func_default);
 
     // Go builtin `index` and the comparison functions (`eq`/`ne`/`lt`/…), used
     // in function position (e.g. `{{index .MATCH 0}}`, `{{ne .X ""}}`).
@@ -1292,15 +1345,16 @@ fn register_helpers(env: &mut Environment<'static>) {
 
     // These sprig-compatible helpers are also usable as filters. minijinja
     // ships its own `trim`, `lower`, `upper` and `replace`, which already match
-    // sprig; register the remaining ones. Five of its builtins do *not* match
+    // sprig; register the remaining ones. Four of its builtins do *not* match
     // and are deliberately left in place, so a Jinja Taskfile keeps Jinja's
     // meaning; the Go dialect gets sprig's from the call `translate_action`
-    // emits instead (see `CALL_AFTER_PIPE`). They differ in that `default`
-    // substitutes only for an undefined value where sprig substitutes for any
-    // empty one; `title` lowercases the tail of each word where sprig only
-    // re-cases the leading letter; `join` iterates a string's characters
-    // where sprig treats it as one element; and `first`/`last` fail on a
-    // non-sequence where the Go dialect renders empty.
+    // emits instead (see `CALL_AFTER_PIPE`). They differ in that `title`
+    // lowercases the tail of each word where sprig only re-cases the leading
+    // letter; `join` iterates a string's characters where sprig treats it as
+    // one element; and `first`/`last` fail on a non-sequence where the Go
+    // dialect renders empty. minijinja's `default` is a fifth mismatch, but
+    // its `boolean` argument closes the gap, so `translate_default` targets
+    // the builtin rather than shadowing it.
     env.add_filter("trimAll", filter_trim_all);
     env.add_filter("trimPrefix", filter_trim_prefix);
     env.add_filter("trimSuffix", filter_trim_suffix);
@@ -1851,23 +1905,6 @@ fn func_join(sep: String, list: JinjaValue) -> String {
     }
 }
 
-/// Sprig's `dfault` is variadic (`default d given...`, falling back when the
-/// *first* given value is empty); this takes exactly one, so `{{default "d"}}`
-/// and `{{default "d" .A .B}}` are argument-count errors rather than rendering
-/// `d` and `.A`.
-/// Sprig `default`: substitutes the fallback for any *empty* value — undefined,
-/// none, `""`, `0`, `false`, or an empty list/map — not just an undefined one
-/// like minijinja's builtin filter of the same name, which is left in place for
-/// the Jinja dialect.
-///
-/// Both arguments are required, so a Go `{{default "d"}}` or `{{default "d" .A
-/// .B}}` — sprig's `dfault` is variadic — is an argument-count error rather than
-/// rendering `d` or `.A`. `{{ .X | default }}` is the same error for the same
-/// reason; sprig's zero-`given` form is not supported.
-fn func_default(fallback: JinjaValue, value: JinjaValue) -> JinjaValue {
-    if value.is_true() { value } else { fallback }
-}
-
 fn filter_cat_lines(s: String) -> String {
     s.replace("\r\n", " ").replace('\n', " ")
 }
@@ -2338,9 +2375,9 @@ mod tests {
     #[test]
     fn mapped_default_after_a_pipe() {
         let mut c = cache_with(&[]);
-        // Go pipeline syntax (`| default "x"`) is rewritten to minijinja's call
-        // form with the subject last, which `func_default` handles — minijinja's
-        // builtin filter of the same name is untouched.
+        // Go pipeline syntax (`| default "x"`) is rewritten to minijinja's
+        // builtin `default` filter with the `boolean` argument set, which is
+        // what gives it sprig's any-empty-value meaning.
         assert_eq!(
             c.replace("{{ .MISSING | default \"fallback\" }}"),
             "fallback"
@@ -2484,7 +2521,7 @@ mod tests {
         );
         assert_eq!(
             to_jinja(r#"{{.KEY | default (print (joinPath .DIR "k.pem"))}}"#).expect("migrates"),
-            r#"{{ default(print(joinPath(DIR, "k.pem")), KEY) }}"#
+            r#"{{ KEY | default(print(joinPath(DIR, "k.pem")), true) }}"#
         );
         // After a pipe too: the subject is the last argument, not a filter's
         // first one.
@@ -2741,7 +2778,8 @@ mod tests {
     }
 
     // sprig's `default` substitutes for any empty value, not just an undefined
-    // one; minijinja's builtin filter of the same name only covers undefined.
+    // one; minijinja's builtin filter reaches that only with its `boolean`
+    // argument set, which is what both Go spellings translate to.
     #[test]
     fn default_substitutes_for_empty_string() {
         let mut c = cache_with(&[("EMPTY", "")]);
@@ -2750,22 +2788,84 @@ mod tests {
         assert!(!c.is_err(), "recorded {:?}", c.err());
     }
 
-    // Every empty value sprig covers, through the call form the Go dialect
-    // translates a pipe into — and which a Jinja Taskfile can write directly.
+    // Every empty value sprig covers, through the filter spelling both Go forms
+    // translate to — and which a Jinja Taskfile writes directly.
     #[test]
     fn default_substitutes_for_every_empty_value() {
         let mut c = cache_with(&[]);
         c.set_dialect(Dialect::Jinja);
-        assert_eq!(c.replace(r#"{{ default("fb", 0) }}"#), "fb");
-        assert_eq!(c.replace(r#"{{ default("fb", false) }}"#), "fb");
-        assert_eq!(c.replace(r#"{{ default("fb", []) }}"#), "fb");
-        assert_eq!(c.replace(r#"{{ default("fb", 1) }}"#), "1");
+        assert_eq!(c.replace(r#"{{ 0 | default("fb", true) }}"#), "fb");
+        assert_eq!(c.replace(r#"{{ false | default("fb", true) }}"#), "fb");
+        assert_eq!(c.replace(r#"{{ [] | default("fb", true) }}"#), "fb");
+        assert_eq!(c.replace(r#"{{ 1 | default("fb", true) }}"#), "1");
         assert!(!c.is_err(), "recorded {:?}", c.err());
     }
 
-    // The five sprig helpers are reachable as functions in the Jinja dialect,
-    // but the *filters* of those names stay minijinja's own: a Taskfile written
-    // natively in Jinja keeps standard Jinja meaning.
+    // No `default` global is registered, so the sprig-ordered call a Taskfile
+    // migrated by an older release carries fails loudly instead of silently
+    // taking the fallback for the value.
+    #[test]
+    fn sprig_ordered_default_call_is_not_a_function() {
+        let mut c = cache_with(&[("EMPTY", "")]);
+        c.set_dialect(Dialect::Jinja);
+        c.replace(r#"{{ default("fb", EMPTY) }}"#);
+        let err = c.err().expect("unknown function").to_string();
+        assert!(err.contains("unknown function"), "{err}");
+    }
+
+    // Both Go spellings — piped and called — translate to the one filter form,
+    // and it renders what Go rendered.
+    #[test]
+    fn default_translates_to_the_builtin_filter() {
+        assert_eq!(
+            to_jinja(r#"{{ .EMPTY | default "fb" }}"#).expect("migrates"),
+            r#"{{ EMPTY | default("fb", true) }}"#
+        );
+        assert_eq!(
+            to_jinja(r#"{{ default "fb" .EMPTY }}"#).expect("migrates"),
+            r#"{{ EMPTY | default("fb", true) }}"#
+        );
+        // A fallback with no value at all is what sprig returns: the fallback.
+        assert_eq!(
+            to_jinja(r#"{{ default "fb" }}"#).expect("migrates"),
+            r#"{{ "fb" }}"#
+        );
+        // Chained, and nested inside another call.
+        assert_eq!(
+            to_jinja(r#"{{ .EMPTY | default "fb" | upper }}"#).expect("migrates"),
+            r#"{{ EMPTY | default("fb", true) | upper() }}"#
+        );
+        assert_eq!(
+            to_jinja(r#"{{ printf "%s" (default "fb" .EMPTY) }}"#).expect("migrates"),
+            r#"{{ printf("%s", EMPTY | default("fb", true)) }}"#
+        );
+        // The variadic arity stays unsupported, as it was before, not guessed at.
+        assert!(to_jinja(r#"{{ default "a" .X "b" }}"#).is_err());
+    }
+
+    // minijinja takes the builtin `default` filter's arguments as a `Rest`, so
+    // a keyword argument arrives as a map that its second argument reads as a
+    // truthy value: `boolean=false` turns the empty-value substitution *on*.
+    // The templating reference warns against the keyword form because of this;
+    // if a minijinja release starts rejecting or honouring it, update that
+    // warning along with this test.
+    #[test]
+    fn default_keyword_argument_is_read_as_on() {
+        let mut c = cache_with(&[("EMPTY", "")]);
+        c.set_dialect(Dialect::Jinja);
+        assert_eq!(
+            c.replace(r#"{{ EMPTY | default("fb", boolean=false) }}"#),
+            "fb"
+        );
+        // Positionally it means what it says.
+        assert_eq!(c.replace(r#"{{ EMPTY | default("fb", false) }}"#), "");
+        assert!(!c.is_err(), "recorded {:?}", c.err());
+    }
+
+    // The four sprig helpers reached through a call are still functions in the
+    // Jinja dialect, but the *filters* of those names stay minijinja's own, and
+    // `default` is minijinja's filter alone: a Taskfile written natively in
+    // Jinja keeps standard Jinja meaning.
     #[test]
     fn jinja_filters_are_not_overridden() {
         let mut c = cache_with(&[("EMPTY", "")]);

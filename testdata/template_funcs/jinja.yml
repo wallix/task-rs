@@ -18,7 +18,10 @@ tasks:
       - 'echo missing={{ MISSING | default("fallback") }}'
       # ...and its `title` lowercases the tail of each word.
       - 'echo title={{ "HELLO world" | title }}'
-      # The sprig meaning is still available in function position.
-      - 'echo sprig_default={{ default("fallback", EMPTY) }}'
+      # ...while the `boolean` argument gives sprig's reach over any empty
+      # value, which is what a migrated Taskfile carries.
+      - 'echo lax_default={{ EMPTY | default("fallback", true) }}'
+      - 'echo lax_zero={{ ZERO | default(10, true) }}'
+      # The sprig meaning of the others is still available in function position.
       - 'echo sprig_title={{ title("HELLO world") }}'
       - 'echo sprig_join={{ join(",", P) }}'

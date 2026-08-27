@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **`default` is a filter, not a backwards-looking call** — `--migrate` now
+  converts both Go spellings, `{{ .X | default "y" }}` and
+  `{{ default "y" .X }}`, to `{{ X | default("y", true) }}`. That second
+  argument makes Jinja's own filter mean what sprig's `default` means —
+  substituting for any empty value, not only an unset one — so a migrated
+  Taskfile renders what it always did while reading in the natural order. A Go
+  `{{ default "y" }}` with no value at all now renders `y`, as sprig does,
+  instead of failing.
+- **Breaking:** the sprig-ordered `default(fallback, value)` function is gone.
+  A Taskfile written or migrated against 4.1.0 / 4.1.1 that calls it now fails
+  with `unknown function`; write the value first and add `, true` —
+  `X | default("y", true)`.
 - **A file's template dialect now covers the `vars:` it passes to an
   `includes:` entry and the `caches:` models it defines.** A tree partway
   through `--migrate` works: the migrated file no longer fails on its own

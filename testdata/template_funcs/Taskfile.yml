@@ -26,8 +26,9 @@ tasks:
       - 'echo prefix={{.P | trimPrefix "dir/"}}'
       - 'echo split={{.P | splitList "/" | join ","}}'
       # The five that mean something else as a Jinja filter, after a pipe.
-      # `default` fires on an empty
-      # value, not only a missing one, so the Go and pipe spellings agree.
+      # `default` fires on an empty value, not only a missing one, so the Go
+      # and pipe spellings agree; it migrates to the builtin filter and the
+      # other four to a call.
       - 'echo default={{.EMPTY | default "fallback"}}'
       - 'echo title={{"HELLO world" | title}}'
       - 'echo first={{.P | splitList "/" | first}}'
