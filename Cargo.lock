@@ -2022,7 +2022,7 @@ dependencies = [
 
 [[package]]
 name = "ocicas"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "fastcdc",
  "oci-client",
@@ -2922,7 +2922,7 @@ dependencies = [
 
 [[package]]
 name = "task"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2939,7 +2939,7 @@ dependencies = [
 
 [[package]]
 name = "taskcore"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "brush-builtins",
  "brush-core",

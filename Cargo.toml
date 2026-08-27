@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ocicas", "crates/taskcore", "crates/task"]
 
 [workspace.package]
-version = "4.1.0"
+version = "4.1.1"
 edition = "2024"
 authors = [
     "Vincent Vanackere <vvanackere@wallix.com>",

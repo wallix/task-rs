@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.1.1 - 2026-08-27
+
 - **`task --update` replaces the binary with a published release** — the latest,
   or `--update=<version>` for a specific one. It asks before touching anything
   (`--yes` skips that), checks the download against the `sha256` published
