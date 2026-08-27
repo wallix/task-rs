@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **A failing cache registry or cache lock names the reason** — a rejected
+  certificate, a refused connection, a name that does not resolve — instead of
+  only reporting that the registry could not be reached.
 - **Go-syntax Taskfiles can call `printf` and `print`**, so a Taskfile that
   builds a path out of several variables renders and migrates instead of being
   rejected as an unsupported construct. `printf` covers the string-composing

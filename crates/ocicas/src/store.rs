@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinSet};
 
 use crate::cas::{assemble, build, digest_hex, sha256_hex};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, with_causes};
 use crate::index::{
     ARTIFACT_TYPE, ChunkRef, Index, MEDIA_TYPE_CHUNK, MEDIA_TYPE_INDEX, unmarshal_index,
 };
@@ -610,19 +610,23 @@ fn read_cas(dir: &Path, digest: &str) -> Result<Vec<u8>> {
 }
 
 fn oci_err(e: OciDistributionError) -> Error {
+    // `RequestError` is transparent over the `reqwest` error, so its chain
+    // carries the same reason a direct request's does.
+    let msg = with_causes("oci", &e);
     if let OciDistributionError::RequestError(re) = &e
         && (re.is_connect() || re.is_timeout())
     {
-        return Error::network(format!("oci: {e}"));
+        return Error::network(msg);
     }
-    Error::format(format!("oci: {e}"))
+    Error::format(msg)
 }
 
 fn req_err(e: reqwest::Error) -> Error {
+    let msg = with_causes("http", &e);
     if e.is_connect() || e.is_timeout() {
-        return Error::network(format!("http: {e}"));
+        return Error::network(msg);
     }
-    Error::format(format!("http: {e}"))
+    Error::format(msg)
 }
 
 fn join_err(e: JoinError) -> Error {

@@ -28,7 +28,7 @@ use serde::Deserialize;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, with_causes};
 
 /// Lease requested on acquire; renewed by the heartbeat below.
 const LEASE_TTL: Duration = Duration::from_secs(30);
@@ -473,7 +473,7 @@ fn make_key(prefix: &str, name: &str) -> String {
 }
 
 fn req_err(e: reqwest::Error) -> Error {
-    Error::format(format!("vk lock: {e}"))
+    Error::format(with_causes("vk lock", &e))
 }
 
 #[cfg(test)]
