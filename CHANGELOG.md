@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.2.0 - 2026-08-27
+
 - **`default` is a filter, not a backwards-looking call** — `--migrate` now
   converts both Go spellings, `{{ .X | default "y" }}` and
   `{{ default "y" .X }}`, to `{{ X | default("y", true) }}`. That second
