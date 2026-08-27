@@ -53,8 +53,14 @@ minijinja = { version = "2", features = ["custom_syntax"] }
 # stdlib equivalent).
 semver = "1"
 notify = "8"
-# Zip archive format for the classic (non-OCI) remote build cache. No stdlib zip.
+# Zip archive format for the classic (non-OCI) remote build cache, and the
+# Windows release archive `task --update` installs from. No stdlib zip.
 zip = "2"
+# gzip decoding for the release archive `task --update` installs from (the tar
+# walk itself is hand-rolled in `crates/task/src/update.rs`). Already in the tree
+# as zip's deflate backend, and pure Rust (miniz_oxide), so the musl-static build
+# stays free of system C libraries.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Redis client for the distributed `cache.lock` backend (SET NX EX + heartbeat).
 # No stdlib equivalent; tokio async to match the engine runtime.
 redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }

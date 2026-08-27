@@ -15,6 +15,21 @@ Download the archive for your platform from the
 `task-linux-x86_64.tar.gz` — and each ships a `task-<os>-<arch>.sha256`
 checksum file.
 
+## Updating
+
+An installed `task` replaces itself from the same releases:
+
+```shell
+task --update              # install the latest release
+task --update=4.1.0        # install a specific version
+task --update --check      # only report whether a newer one exists
+```
+
+The download is checked against the published `.sha256` and has to report its own
+version before it replaces the binary, and the replacement needs write access to
+the directory `task` is installed in. See
+[`--update`](./reference/cli.md#task-update).
+
 ## Build From Source
 
 Task is written in Rust. Ensure you have the toolchain pinned in

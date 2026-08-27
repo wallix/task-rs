@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **`task --update` replaces the binary with a published release** — the latest,
+  or `--update=<version>` for a specific one. It asks before touching anything
+  (`--yes` skips that), checks the download against the `sha256` published
+  beside it, and runs the new binary to confirm it works here before putting it
+  in place.
+  `task --update --check` only reports what is available, exiting `1` when a
+  newer release exists. A task named `update` still runs as it always did.
 - **`install-task.sh` installs again** — every run used to fail before it
   downloaded the archive.
 - **A failing cache registry or cache lock names the reason** — a rejected

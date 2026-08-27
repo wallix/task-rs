@@ -17,6 +17,7 @@ use crate::cli::Cli;
 use crate::fuzzy;
 use crate::init;
 use crate::prompter::CliPrompter;
+use crate::update;
 
 /// A top-level CLI error carrying the exit code to surface.
 pub struct CliError {
@@ -86,6 +87,13 @@ pub fn run() -> Result<ExitCode, CliError> {
         return run_migrate(&cli);
     }
 
+    // `--update` replaces the binary and reads no Taskfile — handled before the
+    // engine, so a Taskfile that no longer parses cannot block the upgrade that
+    // fixes it.
+    if let Some(version) = cli.update.clone() {
+        return run_update(&cli, version.as_deref());
+    }
+
     // The engine is single-threaded, so drive its async API on a current-thread
     // runtime inside a LocalSet.
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -94,6 +102,39 @@ pub fn run() -> Result<ExitCode, CliError> {
         .map_err(|e| CliError::new(format!("task: failed to start runtime: {e}")))?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, run_engine(cli))
+}
+
+/// Runs `--update` (or `--update --check`) on a runtime of its own: it talks to
+/// GitHub over HTTPS and never touches the engine.
+///
+/// Exit codes are the update's own, not the Taskfile ones: 1 means `--check`
+/// found a newer release, so a script can branch on "an update is available"
+/// without reading it as a failure, which leaves 2 for a failed update or check.
+fn run_update(cli: &Cli, version: Option<&str>) -> Result<ExitCode, CliError> {
+    /// Exit code for an update or check that could not be completed.
+    const FAILED: u8 = 2;
+
+    // FAILED, not the default 1: 1 is this flag's "a newer release is available",
+    // so a script branching on it must not read a runtime that would not start
+    // as an update being available.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| CliError::with_code(format!("task: failed to start runtime: {e}"), FAILED))?;
+    let failed = |e: anyhow::Error| CliError::with_code(format!("task: {e:#}"), FAILED);
+    rt.block_on(async {
+        if cli.check {
+            return match update::check(version).await {
+                Ok(false) => Ok(ExitCode::SUCCESS),
+                Ok(true) => Ok(ExitCode::from(1)),
+                Err(e) => Err(failed(e)),
+            };
+        }
+        update::update(version, cli.yes)
+            .await
+            .map(|()| ExitCode::SUCCESS)
+            .map_err(failed)
+    })
 }
 
 /// Builds and drives the executor for a normal (non-init) invocation.

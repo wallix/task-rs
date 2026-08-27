@@ -72,6 +72,32 @@ task --init
 task -i
 ```
 
+### `task --update`
+
+Replace this `task` binary with a published
+[GitHub release](https://github.com/wallix/task-rs/releases) build. Installs the
+latest release, or the version given with `=` (an older one downgrades).
+
+```bash
+task --update              # install the latest release
+task --update=4.1.0        # install a specific one
+task --update --check      # only report what is available
+task --update --yes        # skip the confirmation prompt
+```
+
+Task prints what it is about to install and asks before touching anything. The
+download is checked against the `.sha256` published beside it and has to report
+its own version when run before it replaces the binary in place, so a corrupted
+transfer or a build that cannot run on this host never becomes the installed
+`task`. Needs write access to the directory `task` is installed in; a run already
+in flight is unaffected. When `task` is reached through a symlink, the file the
+link points at is what gets replaced, not the link.
+
+`--update --check` reads only the release's metadata — it downloads no archive
+and installs nothing — and is meant for cron jobs and login banners. It exits
+**1** when a newer release is available, so a script can branch on it. See
+[Exit Codes](#exit-codes).
+
 ::: tip
 
 Combine `--list` or `--list-all` with `--silent` (`-ls` or `-as` for shortants)
@@ -389,6 +415,14 @@ Task uses specific exit codes to indicate different types of errors:
 
 When using `-x/--exit-code`, failed command exit codes are passed through
 instead of the above codes.
+
+:::
+
+::: info
+
+[`--update`](#task-update) reports its own outcome instead: **0** already up to
+date, installed, or declined at the prompt; **1** a newer release is available
+(`--check` only); **2** the update or the check itself failed.
 
 :::
 

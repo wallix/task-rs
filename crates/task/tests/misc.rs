@@ -574,3 +574,31 @@ fn flock_serializes_parallel_tasks() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// `--update` flag surface
+// ---------------------------------------------------------------------------
+
+/// The self-update is a flag, not a subcommand, so a Taskfile that defines a
+/// task called `update` still runs it — `task update` means what it always did.
+#[test]
+fn a_task_named_update_still_runs() {
+    let dir = scratch("version: '3'\ntasks:\n  update:\n    cmds:\n      - echo updated\n");
+    let out = run(&dir, &["--silent", "update"]);
+    assert!(out.ok(), "run failed: {}", out.combined());
+    assert_eq!(out.stdout, "updated\n");
+}
+
+/// `--check` only qualifies `--update`; on its own it is rejected rather than
+/// silently ignored (or taken for a task name).
+#[test]
+fn check_without_update_is_rejected() {
+    let dir = scratch("version: '3'\ntasks:\n  default:\n    cmds:\n      - echo ran\n");
+    let out = run(&dir, &["--check"]);
+    assert!(!out.ok(), "expected a failure: {}", out.combined());
+    assert!(
+        out.combined().contains("--check only applies to --update"),
+        "{}",
+        out.combined()
+    );
+}

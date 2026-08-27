@@ -9,7 +9,10 @@ and formatting requirements that apply to all code.
 
 - Single responsibility per module; avoid cyclic dependencies. Logic belongs in
   `taskcore`; the `task` crate stays a thin CLI over it, and `ocicas` stays free
-  of task-specific concerns (it is meant to be shared back with virtkit).
+  of task-specific concerns (it is meant to be shared back with virtkit). The
+  one deliberate exception is `crates/task/src/update.rs`: replacing the `task`
+  binary is a property of the binary, not of the runner library, and no Taskfile
+  run touches it.
 - When you change a function's signature or return type, update every call site.
   A successful build does not prove all callers are covered — use repo-wide
   search or find-references first.
@@ -91,13 +94,13 @@ rationale. Concrete guidance:
 - `std::sync` (`Mutex`, `RwLock`, `Arc`) over `parking_lot` unless contention is
   measured.
 - `thiserror` only when an error enum has many variants and the boilerplate
-  genuinely hurts. Neither `thiserror` nor `anyhow` is used today: every crate
-  hand-rolls its error enum, and the `task` binary maps it to an exit code
-  (`crates/task/src/main.rs`). `anyhow` is declared in
-  `[workspace.dependencies]` but unused — if it ever lands, only at application
-  boundaries (the `task` binary, top-level handlers), never in `taskcore` or
-  `ocicas` APIs. For small error types, hand-written `Display`/`From` impls are
-  fine.
+  genuinely hurts. `thiserror` is not used today: every crate hand-rolls its
+  error enum, and the `task` binary maps it to an exit code
+  (`crates/task/src/main.rs`). `anyhow` is used in exactly one place —
+  `crates/task/src/update.rs`, where `--update` reports a chain of I/O, HTTP and
+  archive failures straight to the user — which is the application boundary it
+  is allowed at; never in `taskcore` or `ocicas` APIs. For small error types,
+  hand-written `Display`/`From` impls are fine.
 - `std::process::Command` over `duct`/`subprocess`. Shell command bodies go
   through the `brush` interpreter, not by shelling out to `/bin/sh`.
 - `serde` + `serde_json` / `serde_yaml_ng` for structured I/O — but resist a

@@ -179,6 +179,23 @@ pub struct Cli {
     #[arg(long)]
     pub write: bool,
 
+    /// Replaces this task binary with a published GitHub release build: the
+    /// latest release, or `--update=<VERSION>` for a specific one (an older one
+    /// downgrades). Prints what it is about to install and asks before touching
+    /// anything, unless --yes is given; the download is checked against the
+    /// digest published beside it and must report its own version before it
+    /// replaces the running binary. A symlinked install has its target replaced.
+    /// Needs write access to the directory task is installed in. Exit: 0 up to
+    /// date, installed, or declined; 1 a newer release is available (--check);
+    /// 2 the update or check itself failed.
+    #[arg(long, value_name = "VERSION", num_args = 0..=1, require_equals = true)]
+    pub update: Option<Option<String>>,
+
+    /// With --update, reports whether a newer release is available and exits,
+    /// downloading and installing nothing.
+    #[arg(long)]
+    pub check: bool,
+
     /// Task names and `VAR=value` overrides. Arguments after `--` are collected
     /// separately as pass-through CLI args.
     #[arg(trailing_var_arg = false)]
@@ -231,11 +248,58 @@ impl Cli {
         if self.json && !self.list && !self.list_all && !self.status {
             return Err("task: --json only applies to --list, --list-all, or --status".to_string());
         }
+        if self.check && self.update.is_none() {
+            return Err("task: --check only applies to --update".to_string());
+        }
         if self.nested && !self.json {
             return Err(
                 "task: --nested only applies to --json with --list or --list-all".to_string(),
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--update` takes its version with `=` and nothing otherwise: `task`'s
+    /// positionals are task names, so a flag that could swallow the next token
+    /// would make `task --update build` mean something the user did not ask for.
+    #[test]
+    fn update_takes_an_optional_version_with_an_equals_sign() {
+        let cli = Cli::try_parse_from(["task", "--update"]).unwrap();
+        assert_eq!(cli.update, Some(None));
+        assert!(!cli.check);
+
+        let cli = Cli::try_parse_from(["task", "--update=4.0.0"]).unwrap();
+        assert_eq!(cli.update, Some(Some("4.0.0".to_string())));
+
+        // the bare form leaves the next token alone
+        let cli = Cli::try_parse_from(["task", "--update", "build"]).unwrap();
+        assert_eq!(cli.update, Some(None));
+        assert_eq!(cli.args, ["build"]);
+
+        let cli = Cli::try_parse_from(["task", "--update", "--check"]).unwrap();
+        assert_eq!(cli.update, Some(None));
+        assert!(cli.check);
+
+        // and no flag at all is the ordinary run
+        let cli = Cli::try_parse_from(["task", "update"]).unwrap();
+        assert_eq!(cli.update, None);
+        assert_eq!(cli.args, ["update"]);
+    }
+
+    /// `--check` qualifies `--update` and means nothing without it.
+    #[test]
+    fn check_only_applies_to_update() {
+        let cli = Cli::try_parse_from(["task", "--check"]).unwrap();
+        assert_eq!(
+            cli.validate().unwrap_err(),
+            "task: --check only applies to --update"
+        );
+        let cli = Cli::try_parse_from(["task", "--update", "--check"]).unwrap();
+        cli.validate().unwrap();
     }
 }

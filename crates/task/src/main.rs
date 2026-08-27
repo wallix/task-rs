@@ -21,6 +21,7 @@ mod fuzzy;
 mod init;
 mod prompter;
 mod run;
+mod update;
 
 use std::process::ExitCode;
 

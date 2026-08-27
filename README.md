@@ -261,6 +261,19 @@ task --import-cache state.zip
 
 Exports checksum state and generated files for up-to-date tasks as a ZIP archive.
 
+#### `--update` flag
+
+Replace the running binary with a published [release](https://github.com/wallix/task-rs/releases):
+
+```bash
+task --update              # install the latest release
+task --update=4.1.0        # install a specific version (an older one downgrades)
+task --update --check      # report what is available; exits 1 if newer, installing nothing
+task --update --yes        # skip the confirmation prompt
+```
+
+It prints what it is about to install and asks first, unless `--yes` is given. The archive is checked against the `.sha256` published beside it and the binary it carries has to report its own version before it replaces the one in place, so a corrupted transfer or a foreign build never gets installed. Needs write access to the install directory; a run already in flight is unaffected.
+
 ### Changed
 
 - **`--force` no longer cascades** — `--force` only forces the directly called task; dependent tasks still check their status. Use `--force-all` to force everything (previously the default `--force` behavior).
