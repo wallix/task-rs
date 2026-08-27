@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **A file's template dialect now covers the `vars:` it passes to an
+  `includes:` entry and the `caches:` models it defines.** A tree partway
+  through `--migrate` works: the migrated file no longer fails on its own
+  include vars, and a not-yet-migrated task no longer fails on the cache URL it
+  inherits. A file that declares one dialect but writes those in the other used
+  to be read as Go regardless, and now errors — run `task --migrate` on it.
+
 ## v4.1.1 - 2026-08-27
 
 - **`task --update` replaces the binary with a published release** — the latest,

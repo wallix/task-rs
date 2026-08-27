@@ -211,6 +211,8 @@ impl Reader {
         let dialect = tf.templater;
         tf.vars.set_dialect(dialect);
         tf.env.set_dialect(dialect);
+        tf.caches.set_dialect(dialect);
+        tf.includes.set_dialect(dialect);
         // Recover each task's line/column by scanning the source: decoding
         // through `serde_yaml_ng::Value` loses YAML node positions, which editor
         // integrations need to jump to a task definition.

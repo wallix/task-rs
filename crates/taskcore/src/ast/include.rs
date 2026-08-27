@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer};
 use serde_yaml_ng::Value;
 
+use super::dialect::Dialect;
 use super::error::TaskfileDecodeError;
 use super::vars::Vars;
 
@@ -137,6 +138,16 @@ impl Includes {
     /// Iterates over the values in insertion order.
     pub fn values(&self) -> impl Iterator<Item = &Include> {
         self.om.values()
+    }
+
+    /// Stamps the template dialect of every include's `vars:`. They are written
+    /// in the *including* file, so they render in its dialect like its own vars.
+    pub fn set_dialect(&mut self, dialect: Dialect) {
+        for include in self.om.values_mut() {
+            if let Some(vars) = &mut include.vars {
+                vars.set_dialect(dialect);
+            }
+        }
     }
 }
 

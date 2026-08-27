@@ -746,8 +746,12 @@ Supported `lock` schemes:
   lock trusts `?ca=<file>`, else `$TASK_CACHE_OCI_CA`, on top of the system
   store.
 
-All template fields (`url`, `lock`, `enabled`) support standard Task variables
-plus `{{.TASK}}`, `{{.CHECKSUM}}`, and the `urlsafe` template function.
+All template fields (`url`, `lock`, `enabled`, `lock_timeout`) support standard
+Task variables plus `{{.TASK}}`, `{{.CHECKSUM}}`, and the `urlsafe` template
+function.
+
+Each renders in the dialect of the file it was written in: a `caches:` model in
+the file defining it, a task-level override in the task's own file.
 
 If the remote lock (e.g. Redis) is unavailable, Task logs a warning and falls
 back to a local file lock so the task still runs.

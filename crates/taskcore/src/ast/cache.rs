@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer};
 use serde_yaml_ng::Value;
 
+use super::dialect::Dialect;
 use super::error::TaskfileDecodeError;
 
 /// Remote cache and distributed-lock settings.
@@ -30,6 +31,12 @@ pub struct Cache {
     pub ttl: String,
     /// Maximum wait for lock contention (e.g. `5m`, `1h`).
     pub lock_timeout: String,
+    /// The template dialect this block's `url`/`lock`/`if`/`lock_timeout`
+    /// strings are authored in, stamped from the owning Taskfile's dialect when
+    /// the file is read. A task-level block inherits its own file's dialect from
+    /// the task; a `caches:` model keeps the dialect of the file that defined
+    /// it, which is not the same file when a task inherits it across an include.
+    pub dialect: Dialect,
 }
 
 impl<'de> Deserialize<'de> for Cache {
@@ -97,6 +104,17 @@ impl Caches {
     /// Returns the model with the given name, if present.
     pub fn get(&self, name: &str) -> Option<&Cache> {
         self.0.get(name)
+    }
+
+    /// Stamps every model's template dialect. Called when a Taskfile is read so
+    /// a model resolves in its defining file's dialect even when the task that
+    /// inherits it comes from an included file written in the other dialect.
+    /// Only the entrypoint's `caches:` survive the include merge today, but the
+    /// dialect travels with the model regardless.
+    pub fn set_dialect(&mut self, dialect: Dialect) {
+        for model in self.0.values_mut() {
+            model.dialect = dialect;
+        }
     }
 }
 

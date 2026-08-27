@@ -209,3 +209,42 @@ fn escaped_quote_in_a_string_literal_renders_and_migrates() {
     let combined = format!("{}{}", r.stdout, r.stderr);
     assert!(combined.contains("out=a-b"), "output: {combined}");
 }
+
+/// A Go root with `includes:` vars and a `caches:` model — the two constructs
+/// that used to be read as Go whatever dialect their file declared.
+const ROOT_WITH_INCLUDE_AND_CACHE: &str = "version: '3'\nvars:\n  ROOT: r\n  REPO: myrepo\n  CACHE_DIR: '{{.ROOT_DIR}}/cache'\ncaches:\n  default:\n    enabled: false\n    url: 'file://{{.CACHE_DIR}}/{{.REPO}}.zip'\nincludes:\n  doc:\n    taskfile: ./sub.yml\n    vars:\n      FROM_INCLUDE: '{{.ROOT}}-x'\ntasks:\n  local:\n    cmds:\n      - echo local\n";
+
+/// A Go include whose task inherits both of them, so it stays in the old
+/// dialect while the root is migrated.
+const GO_INCLUDE: &str = "version: '3'\ntasks:\n  enforce:\n    cache: default\n    cmds:\n      - 'echo iv={{.FROM_INCLUDE}}'\n";
+
+#[test]
+fn migrated_root_renders_include_vars_and_cache_model_for_a_go_include() {
+    // `--migrate` rewrites the `includes:` vars and the `caches:` models along
+    // with everything else, so both have to resolve in the migrated file's
+    // dialect. The include is left in Go, since a tree is migrated file by
+    // file, and it is the task there that pulls both of them in. The model is
+    // disabled, but its fields are still templated when the task compiles,
+    // which is what makes the run cover the model's dialect.
+    let dir = taskfile_dir(ROOT_WITH_INCLUDE_AND_CACHE);
+    std::fs::write(dir.join("sub.yml"), GO_INCLUDE).unwrap();
+
+    let w = common::run(&dir, &["--migrate", "--write"]);
+    assert!(w.ok(), "stderr: {}", w.stderr);
+    let on_disk = std::fs::read_to_string(dir.join("Taskfile.yml")).unwrap();
+    assert!(
+        on_disk.contains("FROM_INCLUDE: '{{ ROOT }}-x'"),
+        "include vars not converted: {on_disk}"
+    );
+    assert!(
+        on_disk.contains("url: 'file://{{ CACHE_DIR }}/{{ REPO }}.zip'"),
+        "cache model not converted: {on_disk}"
+    );
+    // The include keeps the Go dialect it was written in.
+    let sub = std::fs::read_to_string(dir.join("sub.yml")).unwrap();
+    assert_eq!(sub, GO_INCLUDE);
+
+    let r = common::run(&dir, &["--silent", "doc:enforce"]);
+    assert!(r.ok(), "stderr: {}", r.stderr);
+    assert!(r.stdout.contains("iv=r-x"), "stdout: {}", r.stdout);
+}

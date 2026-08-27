@@ -408,10 +408,13 @@ pub async fn compiled_task(
     // Resolve the cache block: merge a named model from the taskfile `caches:`
     // map (task-level fields override), then template the URL/lock/if fields.
     if let Some(orig_cache) = &orig_task.cache {
+        let model = if orig_cache.inherit.is_empty() {
+            None
+        } else {
+            ctx.caches.get(&orig_cache.inherit)
+        };
         let mut resolved = orig_cache.clone();
-        if !resolved.inherit.is_empty()
-            && let Some(model) = ctx.caches.0.get(&resolved.inherit)
-        {
+        if let Some(model) = model {
             let mut merged = model.clone();
             if !resolved.url.is_empty() {
                 merged.url = resolved.url.clone();
@@ -431,10 +434,35 @@ pub async fn compiled_task(
             resolved = merged;
         }
         resolved.inherit = String::new();
+        // Each field renders in the dialect of the block it was written in: the
+        // task's own file for a task-level value, the defining file for one
+        // inherited from `caches:`. The two differ while a tree is partway
+        // through `--migrate`, so a single dialect for the merged block would
+        // render the inherited half through the wrong templater. Without a
+        // model the two are the same file, so the task's dialect applies.
+        // `dialect_of` mirrors the merge above — a non-empty task value
+        // overrides — and has to stay in step with it.
+        let model_dialect = model.map_or(orig_task.dialect, |m| m.dialect);
+        let dialect_of = |task_value: &str| {
+            if task_value.is_empty() {
+                model_dialect
+            } else {
+                orig_task.dialect
+            }
+        };
+        cache.set_dialect(dialect_of(&orig_cache.url));
         resolved.url = cache.replace(&resolved.url);
+        cache.set_dialect(dialect_of(&orig_cache.lock));
         resolved.lock = cache.replace(&resolved.lock);
+        cache.set_dialect(dialect_of(&orig_cache.if_));
         resolved.if_ = cache.replace(&resolved.if_);
+        cache.set_dialect(dialect_of(&orig_cache.lock_timeout));
         resolved.lock_timeout = cache.replace(&resolved.lock_timeout);
+        // Leave the templater on the task's dialect for anything rendered after
+        // this block, and record it on the compiled block, whose strings are all
+        // resolved by now.
+        cache.set_dialect(orig_task.dialect);
+        resolved.dialect = orig_task.dialect;
         new.cache = Some(resolved);
     }
 
@@ -884,8 +912,10 @@ fn unquote_dotenv(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
-    use crate::ast::{Cmd, For, Var, VarElement, Vars};
+    use crate::ast::{Cmd, Dialect, For, Var, VarElement, Vars};
     use crate::compiler::Compiler;
 
     fn silent_logger() -> Logger {
@@ -908,14 +938,21 @@ mod tests {
     }
 
     fn ctx<'a>(taskfile_env: &'a Vars, tmp: &'a str) -> CompileContext<'a> {
-        static EMPTY: std::sync::LazyLock<crate::ast::Caches> =
-            std::sync::LazyLock::new(crate::ast::Caches::default);
+        static EMPTY: std::sync::LazyLock<Caches> = std::sync::LazyLock::new(Caches::default);
+        ctx_with_caches(taskfile_env, tmp, &EMPTY)
+    }
+
+    fn ctx_with_caches<'a>(
+        taskfile_env: &'a Vars,
+        tmp: &'a str,
+        caches: &'a Caches,
+    ) -> CompileContext<'a> {
         CompileContext {
             dir: "",
             taskfile_env,
             fingerprint_temp_dir: tmp,
             env_precedence: false,
-            caches: &EMPTY,
+            caches,
         }
     }
 
@@ -924,6 +961,64 @@ mod tests {
             value: Some(Value::String(v.to_string())),
             ..Default::default()
         }
+    }
+
+    /// A `caches:` model keeps the dialect of the file that defined it, so a Go
+    /// task inheriting a Jinja model — a tree partway through `--migrate` —
+    /// still renders the model as Jinja, while a field the task overrides
+    /// renders in the task's own dialect.
+    #[tokio::test]
+    async fn cache_fields_render_in_the_dialect_of_their_origin_block() {
+        let caches = Caches(HashMap::from([(
+            "default".to_string(),
+            crate::ast::Cache {
+                url: "oci://{{ REPO }}/task".to_string(),
+                lock: "redis://{{ REPO }}/lock".to_string(),
+                if_: "{{ REPO != \"\" }}".to_string(),
+                lock_timeout: "{{ LOCK_WAIT }}".to_string(),
+                dialect: Dialect::Jinja,
+                ..Default::default()
+            },
+        )]));
+        let orig = Task {
+            task: "build".to_string(),
+            dialect: Dialect::Go,
+            cache: Some(crate::ast::Cache {
+                inherit: "default".to_string(),
+                lock: "redis://{{.REPO}}/task-lock".to_string(),
+                lock_timeout: "{{.LOCK_WAIT}}".to_string(),
+                dialect: Dialect::Go,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let vars = Vars::from_elements([
+            VarElement {
+                key: "REPO".to_string(),
+                value: string_var("reg.example/cache"),
+            },
+            VarElement {
+                key: "LOCK_WAIT".to_string(),
+                value: string_var("5m"),
+            },
+        ]);
+        let env = Vars::new();
+        let c = compiler();
+        let mut logger = silent_logger();
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let ctx = ctx_with_caches(&env, &tmp, &caches);
+        let out = compiled_task(&orig, vars, true, &ctx, &c, &mut logger, None)
+            .await
+            .unwrap();
+        let cache = out.cache.unwrap();
+        // Inherited from the Jinja model, so rendered as Jinja.
+        assert_eq!(cache.url, "oci://reg.example/cache/task");
+        assert_eq!(cache.if_, "true");
+        // Overridden by the Go task, so rendered as Go.
+        assert_eq!(cache.lock, "redis://reg.example/cache/task-lock");
+        assert_eq!(cache.lock_timeout, "5m");
+        // The merged block is normalised onto the task's dialect.
+        assert_eq!(cache.dialect, Dialect::Go);
     }
 
     #[tokio::test]

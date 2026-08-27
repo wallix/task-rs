@@ -211,3 +211,60 @@ fn invalid_yaml_reports_snippet() {
 
     fs::remove_dir_all(&d).ok();
 }
+
+#[test]
+fn include_vars_carry_the_including_files_dialect() {
+    // An include's `vars:` are written in the file that declares the include,
+    // so they must render in that file's dialect — not the default Go one, and
+    // not the included file's.
+    let d = scratch("include-vars-dialect");
+    write(
+        &d,
+        "sub.yml",
+        "version: '3'\ntemplater: go\ntasks:\n  enforce:\n    cmds:\n      - echo {{.FROM_INCLUDE}}\n",
+    );
+    let tf = write(
+        &d,
+        "Taskfile.yml",
+        "version: '3'\ntemplater: jinja\nvars:\n  ROOT: r\nincludes:\n  doc:\n    taskfile: ./sub.yml\n    vars:\n      FROM_INCLUDE: '{{ ROOT }}-x'\ntasks:\n  local:\n    cmds:\n      - echo local\n",
+    );
+
+    let node = new_root_node(&tf.to_string_lossy(), "").unwrap();
+    let mut graph = Reader::new().read(node.as_ref()).unwrap();
+    let merged = graph.merge().unwrap();
+
+    let task = merged.tasks.get("doc:enforce").unwrap();
+    let include_vars = task.include_vars.as_ref().unwrap();
+    assert_eq!(
+        include_vars.get("FROM_INCLUDE").unwrap().dialect,
+        ast::Dialect::Jinja
+    );
+    // The included file's own tasks keep their own dialect.
+    assert_eq!(task.dialect, ast::Dialect::Go);
+
+    fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn cache_models_carry_their_defining_files_dialect() {
+    // A `caches:` model is templated when a task inherits it, and that task can
+    // come from an included file in the other dialect, so the model has to
+    // carry the dialect of the file that defined it.
+    let d = scratch("caches-dialect");
+    let tf = write(
+        &d,
+        "Taskfile.yml",
+        "version: '3'\ntemplater: jinja\ncaches:\n  default:\n    url: 'oci://{{ REPO }}/task'\ntasks:\n  build:\n    cmds:\n      - echo build\n",
+    );
+
+    let node = FileNode::new(&tf.to_string_lossy(), "").unwrap();
+    let mut graph = Reader::new().read(&node).unwrap();
+    let merged = graph.merge().unwrap();
+
+    assert_eq!(
+        merged.caches.get("default").unwrap().dialect,
+        ast::Dialect::Jinja
+    );
+
+    fs::remove_dir_all(&d).ok();
+}

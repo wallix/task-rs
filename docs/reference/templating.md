@@ -42,6 +42,13 @@ The dialect is resolved **per file**:
   `{{ PATH | replace("/.git", "") }}` is therefore misread and fails to
   translate. Set `templater: jinja` explicitly on such a file.
 
+A file's dialect governs every template string written in that file — its
+`vars:` and `env:`, its tasks, the `vars:` it passes to an `includes:` entry,
+and the `caches:` models it defines. It does not follow the include: a task in
+an included file renders its own strings in its file's dialect, and a `caches:`
+model it inherits in the dialect of the file that defined the model. That lets
+a tree be migrated one file at a time.
+
 Files that resolve to the Go dialect emit a one-time deprecation warning. Go
 template support will be removed in a future release. Convert a Taskfile with:
 
