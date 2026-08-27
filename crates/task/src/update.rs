@@ -1129,9 +1129,11 @@ mod tests {
     use super::*;
 
     /// The version the fake release server publishes, and the one its stand-in
-    /// binary reports.
-    const FAKE_TAG: &str = "v4.2.0";
-    const FAKE_VERSION: &str = "4.2.0";
+    /// binary reports. A major past anything this repo will ship, so releasing
+    /// the version the tests once used cannot turn `resolve`'s `Step::Newer`
+    /// into a `Step::Same`.
+    const FAKE_TAG: &str = "v99.0.0";
+    const FAKE_VERSION: &str = "99.0.0";
 
     // A user-given version reaches the API as the tag CI publishes (`v<version>`),
     // whichever of the two forms they typed; other tag shapes pass through.
@@ -1746,7 +1748,7 @@ mod tests {
             // JSON-escaped, since a raw control byte would not be valid JSON —
             // it reaches `resolve` as the control character all the same.
             let tag = match fault {
-                Fault::ControlTag => r"v4.2.0\u001b[2K",
+                Fault::ControlTag => r"v99.0.0\u001b[2K",
                 _ => FAKE_TAG,
             };
             let json = format!(
@@ -1999,7 +2001,7 @@ mod tests {
         for (fault, want) in [
             (Fault::WrongBody, "does not match the published digest"),
             (Fault::Oversized, "longer than the"),
-            (Fault::WrongVersion, "did not report version 4.2.0"),
+            (Fault::WrongVersion, "did not report version 99.0.0"),
             (Fault::NoBinary, "no task member"),
             (Fault::AssetError, "500"),
             (Fault::SidecarError, "500"),
@@ -2169,11 +2171,11 @@ mod tests {
     #[test]
     fn the_smoke_test_accepts_a_build_with_commit_metadata() {
         let s = Scratch::new("metadata");
-        fs::write(&s.exe, fake_binary("4.2.0+abc1234.dirty")).unwrap();
+        fs::write(&s.exe, fake_binary("99.0.0+abc1234.dirty")).unwrap();
         set_mode(&s.exe, 0o755);
         smoke_test(&s.exe, FAKE_VERSION).unwrap();
-        let err = format!("{:#}", smoke_test(&s.exe, "4.2").unwrap_err());
-        assert!(err.contains("did not report version 4.2 "), "{err}");
+        let err = format!("{:#}", smoke_test(&s.exe, "99.0").unwrap_err());
+        assert!(err.contains("did not report version 99.0 "), "{err}");
     }
 
     // A tag that was never released and an exhausted API quota are different
