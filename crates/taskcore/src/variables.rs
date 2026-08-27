@@ -428,6 +428,9 @@ pub async fn compiled_task(
             if resolved.enabled.is_some() {
                 merged.enabled = resolved.enabled;
             }
+            if !resolved.ttl.is_empty() {
+                merged.ttl = resolved.ttl.clone();
+            }
             if !resolved.lock_timeout.is_empty() {
                 merged.lock_timeout = resolved.lock_timeout.clone();
             }
@@ -961,6 +964,56 @@ mod tests {
             value: Some(Value::String(v.to_string())),
             ..Default::default()
         }
+    }
+
+    /// Every field a task sets overrides the model it inherits, and every field
+    /// it leaves out comes from the model.
+    #[tokio::test]
+    async fn task_cache_fields_override_the_inherited_model() {
+        let caches = Caches(HashMap::from([(
+            "default".to_string(),
+            crate::ast::Cache {
+                url: "file:///model.zip".to_string(),
+                lock: "redis://model/lock".to_string(),
+                if_: "false".to_string(),
+                enabled: Some(false),
+                ttl: "72h".to_string(),
+                lock_timeout: "5m".to_string(),
+                ..Default::default()
+            },
+        )]));
+        let orig = Task {
+            task: "build".to_string(),
+            cache: Some(crate::ast::Cache {
+                inherit: "default".to_string(),
+                url: "file:///task.zip".to_string(),
+                lock: "redis://task/lock".to_string(),
+                if_: "true".to_string(),
+                enabled: Some(true),
+                ttl: "1h".to_string(),
+                // Left out, so it comes from the model.
+                lock_timeout: String::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let env = Vars::new();
+        let c = compiler();
+        let mut logger = silent_logger();
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let ctx = ctx_with_caches(&env, &tmp, &caches);
+        let out = compiled_task(&orig, Vars::new(), true, &ctx, &c, &mut logger, None)
+            .await
+            .unwrap();
+        let cache = out.cache.unwrap();
+        assert_eq!(cache.url, "file:///task.zip");
+        assert_eq!(cache.lock, "redis://task/lock");
+        assert_eq!(cache.if_, "true");
+        assert_eq!(cache.enabled, Some(true));
+        assert_eq!(cache.ttl, "1h");
+        assert_eq!(cache.lock_timeout, "5m");
+        // The name is consumed by the merge, not carried into the compiled task.
+        assert!(cache.inherit.is_empty());
     }
 
     /// A `caches:` model keeps the dialect of the file that defined it, so a Go
