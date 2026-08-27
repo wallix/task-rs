@@ -771,6 +771,39 @@ fn jinja_filters_keep_their_standard_meaning() {
     }
 }
 
+// Go's `printf` and `print` render, and `--migrate` converts them, so a
+// Taskfile that composes a path out of several variables survives the switch to
+// Jinja unchanged.
+#[test]
+fn go_printf_renders_and_migrates() {
+    let dir = stage("template_funcs");
+    let before = run(&dir, &["printf"]);
+    assert!(before.ok(), "output: {}", before.combined());
+    let out = before.combined();
+    for want in [
+        "dist=/usr/lib/python3.11/dist-packages",
+        "ext=uid.cpython-311.so",
+        "pct=50%",
+        "print=dir/key.pem",
+        "piped=dir/fr.po.mo",
+    ] {
+        assert!(out.contains(want), "expected {want:?} in: {out}");
+    }
+
+    let migrated = stage("template_funcs");
+    let w = run(&migrated, &["--migrate", "--write"]);
+    assert!(w.ok(), "stderr: {}", w.stderr);
+    let after = run(&migrated, &["printf"]);
+    assert!(after.ok(), "output: {}", after.combined());
+    for line in out.lines().filter(|l| l.contains('=')) {
+        assert!(
+            after.combined().contains(line),
+            "migration changed {line:?}; after: {}",
+            after.combined()
+        );
+    }
+}
+
 // The Go dialect keeps sprig's meaning after a pipe, and `--migrate` has to
 // carry that meaning into the converted file: the five helpers whose Jinja
 // builtin means something else are translated to a call, not to a filter, so

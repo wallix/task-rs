@@ -164,7 +164,7 @@ Supported Go constructs:
 - Pipelines and the mapped functions listed under
   [Functions and filters](#functions-and-filters).
 - The builtins `and`, `or`, `not`, `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `index`,
-  `len`, and Go comments `{{/* … */}}`.
+  `len`, `printf`, `print`, and Go comments `{{/* … */}}`.
 - Parenthesised sub-expressions: `{{ regexReplaceAll "[^a-z]" (trunc 48 .TASK) "-" }}`.
 
 **Not supported** (these raise an error — migrate to Jinja instead): `range` and
@@ -275,8 +275,8 @@ Go they are called in pipeline/space-separated form (`joinPath a b`,
 
 Most helpers that take a subject accept it in either position, but at opposite
 ends: the function form takes it **last** (`trimSuffix ".po" .ITEM`), which is
-what lets the pipeline form take it first (`.ITEM | trimSuffix ".po"`). `trunc`
-and `regexReplaceAll` are function-only.
+what lets the pipeline form take it first (`.ITEM | trimSuffix ".po"`). `trunc`,
+`regexReplaceAll`, `printf` and `print` are function-only.
 
 ### Platform and environment
 
@@ -310,10 +310,20 @@ and `regexReplaceAll` are function-only.
 | `replace(old, new)` | Replace all occurrences |
 | `trunc(n, s)` | First `n` characters (or last `-n` if negative) |
 | `regexReplaceAll(pattern, s, repl)` | Replace all regex matches |
+| `printf(format, …)` | Format a string: `%s`, `%v`, `%q`, `%d`, `%%`, with the `-` / `0` flags and a width (`%-10s`, `%03d`) |
+| `print(…)` | Concatenate the operands, with a space between two neighbours when neither is a string |
 | `quote(s)`, `squote(s)` | Wrap in double / single quotes |
 | `urlsafe(s)` | Percent-encode for use in URLs and cache keys |
 | `catLines(s)` | Replace newlines with spaces |
 | `splitLines(s)` | Split into a list of lines |
+
+`printf` covers the verbs a Taskfile composes strings with. Any other verb
+(`%f`, `%x`), a precision (`%.2s`), an argument its verb cannot render (a list
+for `%s`, a string for `%d`), or an argument count that does not match the
+format is an error rather than the `%!d(string=x)` marker Go writes into its
+output. `%s` and `%v` are more permissive than Go the other way: they render a
+number or a boolean, where Go writes a `%!s(int=3)` marker. `print` likewise
+takes scalars only.
 
 ### Lists
 
@@ -362,6 +372,11 @@ Where the two differ:
 - `first` and `last` render empty for a value they cannot iterate — a number, a
   boolean, an undefined variable — where Jinja's raise an error. A string still
   yields its first or last character.
+
+The Go builtins `printf` and `print` translate to a call after a pipe for the
+same reason — minijinja has no filter of either name, so a Jinja Taskfile calls
+both in function position — and `{{ .P | printf "%s.mo" }}` migrates to
+`{{ printf("%s.mo", P) }}`.
 
 Every other helper keeps one meaning in both dialects, and migrates to the
 idiomatic filter form (`{{ .X | trimSuffix ".po" }}` becomes

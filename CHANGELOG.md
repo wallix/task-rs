@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Go-syntax Taskfiles can call `printf` and `print`**, so a Taskfile that
+  builds a path out of several variables renders and migrates instead of being
+  rejected as an unsupported construct. `printf` covers the string-composing
+  verbs (`%s`, `%v`, `%q`, `%d`, `%%`, with flags and a width); another verb, a
+  precision, an argument its verb cannot render, or a mismatched argument count
+  is an error.
+
 ## v4.1.0 - 2026-08-26
 
 - **Quoted strings in Go-syntax templates keep their dots**, so

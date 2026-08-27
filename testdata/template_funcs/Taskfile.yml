@@ -6,6 +6,8 @@ version: '3'
 vars:
   P: 'dir/fr.po'
   EMPTY: ''
+  MAJOR: '3'
+  MINOR: '11'
 
 tasks:
   funcs:
@@ -31,3 +33,13 @@ tasks:
       - 'echo first={{.P | splitList "/" | first}}'
       - 'echo last={{.P | splitList "/" | last}}'
       - 'echo join={{.P | join ","}}'
+
+  # `printf` and `print` assemble a path out of several variables — the Go
+  # builtins a Taskfile reaches for the most.
+  printf:
+    cmds:
+      - 'echo dist={{printf "/usr/lib/python%s.%s/dist-packages" .MAJOR .MINOR}}'
+      - 'echo ext={{printf "uid.cpython-%s%s.so" .MAJOR .MINOR}}'
+      - 'echo pct={{printf "%d%%" 50}}'
+      - 'echo print={{print (joinPath "dir" "key.pem")}}'
+      - 'echo piped={{.P | printf "%s.mo"}}'

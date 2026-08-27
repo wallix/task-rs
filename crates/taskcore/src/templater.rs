@@ -51,9 +51,10 @@
 //! `trimPrefix`, `trimSuffix`, `lower`,
 //! `upper`, `title`, `contains`, `hasPrefix`, `hasSuffix`, `replace`, `quote`,
 //! `squote`, `urlsafe`, `splitList`, `join`, `first`, `last`, `base`, `dir`,
-//! `ext`, and `isAbs`. Every other sprig helper (`range`-style list
-//! builders, YAML/UUID/spew helpers, shell quoting, `merge`, …) is intentionally
-//! left unmapped so it hits the preflight error rather than being dropped.
+//! `ext`, `isAbs`, and the Go builtins `printf` and `print`. Every other sprig
+//! helper (`range`-style list builders, YAML/UUID/spew helpers, shell quoting,
+//! `merge`, …) is intentionally left unmapped so it hits the preflight error
+//! rather than being dropped.
 //!
 //! [slim-sprig]: https://github.com/go-task/slim-sprig
 //! [`minijinja`]: https://docs.rs/minijinja
@@ -77,15 +78,21 @@ thread_local! {
     static JINJA_ENV: Rc<Environment<'static>> = Rc::new(build_jinja_environment());
 }
 
-/// The sprig helpers whose meaning differs from the minijinja builtin *filter*
-/// of the same name. In pipe position the Go dialect translates these to a call
-/// with the subject last, rather than to a filter, so the Go meaning survives
-/// without the builtins being overridden for a native Jinja Taskfile — and so
-/// `--migrate` writes a file that keeps rendering what it rendered as Go.
+/// The helpers that stay a *call* after a pipe, taking the subject as their
+/// last argument — sprig's own order — instead of becoming a minijinja filter.
+///
+/// The first five are sprig helpers whose meaning differs from the minijinja
+/// builtin filter of the same name, so the Go meaning survives without the
+/// builtins being overridden for a native Jinja Taskfile. `printf` and `print`
+/// take the subject last too, and minijinja has no filter of either name to
+/// pass it first. Either way `--migrate` writes a file that keeps rendering
+/// what it rendered as Go.
 ///
 /// Every name here must also be in [`MAPPED_FUNCS`], which the preflight checks
 /// first; one that is not would be rejected before ever reaching the rewrite.
-const SPRIG_ONLY_IN_CALL_POSITION: &[&str] = &["default", "title", "join", "first", "last"];
+const CALL_AFTER_PIPE: &[&str] = &[
+    "default", "title", "join", "first", "last", "printf", "print",
+];
 
 /// The set of function names this module maps to minijinja. A Go action that
 /// calls any other identifier is rejected by the preflight.
@@ -130,6 +137,8 @@ const MAPPED_FUNCS: &[&str] = &[
     "ge",
     "splitArgs",
     "len",
+    "printf",
+    "print",
     "joinPath",
     "trunc",
     "regexReplaceAll",
@@ -808,9 +817,10 @@ fn action_body(action: &str) -> &str {
 /// registering multi-argument filters with the piped value as their first
 /// parameter (which is what minijinja supplies).
 ///
-/// The exception is [`SPRIG_ONLY_IN_CALL_POSITION`]: after a pipe those become
-/// a *call* taking the expression built so far as their last argument, because
-/// the minijinja filter of each of those names means something else.
+/// The exception is [`CALL_AFTER_PIPE`]: after a pipe those become a *call*
+/// taking the expression built so far as their last argument, because the
+/// minijinja filter of each of those names means something else, or does not
+/// exist.
 fn translate_action(body: &str, tmpl: &str) -> Result<String, TemplaterError> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -870,10 +880,10 @@ fn translate_action(body: &str, tmpl: &str) -> Result<String, TemplaterError> {
                 .iter()
                 .map(|a| translate_arg(a, tmpl))
                 .collect::<Result<_, _>>()?;
-            // After a pipe, these five take the piped value as their last
-            // argument — sprig's own order — instead of becoming a minijinja
-            // filter, whose builtin of the same name means something else.
-            if idx != 0 && SPRIG_ONLY_IN_CALL_POSITION.contains(&first.as_str()) {
+            // After a pipe, these take the piped value as their last argument
+            // — sprig's own order — instead of becoming a minijinja filter,
+            // whose builtin of the same name means something else, or is absent.
+            if idx != 0 && CALL_AFTER_PIPE.contains(&first.as_str()) {
                 rendered_args.push(expr);
                 expr = format!("{first}({})", rendered_args.join(", "));
                 continue;
@@ -1122,8 +1132,7 @@ fn register_helpers(env: &mut Environment<'static>) {
     // Taskfiles call them in function position (`{{urlsafe .TASK}}`) as often
     // as in a pipeline (`{{.TASK | urlsafe}}`), and `translate_action` emits a
     // call for the head segment and a filter for every segment after a pipe —
-    // except the names in `SPRIG_ONLY_IN_CALL_POSITION`, which become a call
-    // there too.
+    // except the names in `CALL_AFTER_PIPE`, which become a call there too.
     // `trunc`, `regexReplaceAll`, `joinPath`, `splitArgs`, `env`, `index` and
     // the comparisons are still function-only, so `{{.P | trunc 3}}` fails with
     // "unknown filter".
@@ -1195,12 +1204,15 @@ fn register_helpers(env: &mut Environment<'static>) {
     env.add_function("len", func_len);
     env.add_filter("len", func_len);
 
-    // Task `joinPath` (filepath.Join) and the sprig helpers `trunc`,
-    // `regexReplaceAll`, and `env`, all called in function position.
+    // Task `joinPath` (filepath.Join), the sprig helpers `trunc`,
+    // `regexReplaceAll` and `env`, and the Go builtins `printf` and `print`,
+    // all called in function position.
     env.add_function("joinPath", func_join_path);
     env.add_function("trunc", func_trunc);
     env.add_function("regexReplaceAll", func_regex_replace_all);
     env.add_function("env", func_env);
+    env.add_function("printf", func_printf);
+    env.add_function("print", func_print);
 
     env.add_filter("catLines", filter_cat_lines);
     env.add_filter("splitLines", filter_split_lines);
@@ -1214,10 +1226,10 @@ fn register_helpers(env: &mut Environment<'static>) {
     // sprig; register the remaining ones. Five of its builtins do *not* match
     // and are deliberately left in place, so a Jinja Taskfile keeps Jinja's
     // meaning; the Go dialect gets sprig's from the call `translate_action`
-    // emits instead (see `SPRIG_ONLY_IN_CALL_POSITION`). They differ in that
-    // `default` substitutes only for an undefined value where sprig substitutes
-    // for any empty one; `title` lowercases the tail of each word where sprig
-    // only re-cases the leading letter; `join` iterates a string's characters
+    // emits instead (see `CALL_AFTER_PIPE`). They differ in that `default`
+    // substitutes only for an undefined value where sprig substitutes for any
+    // empty one; `title` lowercases the tail of each word where sprig only
+    // re-cases the leading letter; `join` iterates a string's characters
     // where sprig treats it as one element; and `first`/`last` fail on a
     // non-sequence where the Go dialect renders empty.
     env.add_filter("trimAll", filter_trim_all);
@@ -1349,6 +1361,238 @@ fn func_regex_replace_all(
 /// it is unset.
 fn func_env(name: String) -> String {
     std::env::var(&name).unwrap_or_default()
+}
+
+/// Go builtin `printf` (`fmt.Sprintf`) over the verbs a Taskfile composes
+/// strings with: `%s`, `%v`, `%q`, `%d` and `%%`, each with the `-` and `0`
+/// flags and a minimum width (`%-10s`, `%03d`). A precision, any other verb, a
+/// width no Taskfile would ask for, an argument its verb cannot render, and an
+/// argument count that does not match the format are render errors, rather
+/// than the `%!f(int=1)` / `%!(EXTRA …)` markers Go writes into its output —
+/// this module reports what it cannot render faithfully.
+///
+/// `%s` and `%v` render a scalar the way the rest of this module does
+/// (Go-cased booleans, empty for a missing variable) instead of applying Go's
+/// per-type formatting, and `%q` escapes the way Rust does, which differs from
+/// Go for control and non-ASCII characters (`\u{1}` where Go writes `\x01`).
+fn func_printf(format: String, args: Rest<JinjaValue>) -> Result<String, minijinja::Error> {
+    let mut out = String::with_capacity(format.len());
+    let mut used = 0usize;
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let spec = parse_printf_spec(&mut chars, &format)?;
+        // `%%` is a literal percent — whatever flags and width precede it, as
+        // in Go — and consumes no argument.
+        if spec.verb == '%' {
+            out.push('%');
+            continue;
+        }
+        let Some(arg) = args.get(used) else {
+            return Err(printf_error(format!(
+                "format {format:?} wants more arguments than the {} given",
+                args.len()
+            )));
+        };
+        used = used.saturating_add(1);
+        out.push_str(&format_printf_arg(&spec, arg, &format)?);
+    }
+    if used != args.len() {
+        return Err(printf_error(format!(
+            "format {format:?} takes {used} argument(s), {} given",
+            args.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// Go builtin `print` (`fmt.Sprint`): the operands concatenated, with a space
+/// added between two neighbours when neither of them is a string. A non-scalar
+/// operand is a render error for the same reason it is under `%v` — see
+/// [`is_printf_scalar`].
+fn func_print(args: Rest<JinjaValue>) -> Result<String, minijinja::Error> {
+    let mut out = String::new();
+    let mut prev_was_string = true;
+    for (idx, arg) in args.iter().enumerate() {
+        if !is_printf_scalar(arg) {
+            return Err(printf_error(format!("print wants scalars, given {arg}")));
+        }
+        let is_string = arg.as_str().is_some();
+        if idx != 0 && !is_string && !prev_was_string {
+            out.push(' ');
+        }
+        out.push_str(&go_string(arg));
+        prev_was_string = is_string;
+    }
+    Ok(out)
+}
+
+/// One `%…` verb of a [`func_printf`] format string.
+struct PrintfSpec {
+    /// The `-` flag: pad on the right instead of the left.
+    left: bool,
+    /// The `0` flag: pad with leading zeros instead of spaces.
+    zero: bool,
+    /// The minimum field width, or `0` for none.
+    width: usize,
+    /// The verb character, one of [`PRINTF_VERBS`].
+    verb: char,
+}
+
+/// The verbs [`func_printf`] renders. `%` is the literal-percent verb, which
+/// consumes no argument.
+const PRINTF_VERBS: &[char] = &['s', 'v', 'q', 'd', '%'];
+
+/// The widest field [`func_printf`] pads to. Go gives up on a width around ten
+/// million and writes a `%!(NOVERB)` marker instead of formatting; this stops a
+/// magnitude earlier, since no Taskfile pads that far, so that a runaway
+/// `%99999…9d` is a render error rather than an allocation the size of the
+/// number.
+const PRINTF_MAX_WIDTH: usize = 1_000_000;
+
+/// Parses the flags, width and verb just past a `%`, leaving the iterator on
+/// the first character after the verb.
+fn parse_printf_spec<I: Iterator<Item = char>>(
+    chars: &mut std::iter::Peekable<I>,
+    format: &str,
+) -> Result<PrintfSpec, minijinja::Error> {
+    // Go ignores `0` when `-` is set; both flags are kept as given and
+    // `pad_printf` honors that rule.
+    let mut left = false;
+    let mut zero = false;
+    while let Some(&c) = chars.peek() {
+        match c {
+            '-' => left = true,
+            '0' => zero = true,
+            _ => break,
+        }
+        chars.next();
+    }
+    // The flags Go accepts and this does not, named as flags rather than
+    // reported as the verb they precede.
+    if let Some(&c) = chars.peek()
+        && matches!(c, '+' | ' ' | '#' | '*' | '[')
+    {
+        return Err(printf_error(format!(
+            "unsupported flag \"%{c}\" in format {format:?}"
+        )));
+    }
+    let mut width = 0usize;
+    while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
+        width = width
+            .saturating_mul(10)
+            .saturating_add(digit.try_into().unwrap_or(usize::MAX));
+        if width > PRINTF_MAX_WIDTH {
+            return Err(printf_error(format!(
+                "a width above {PRINTF_MAX_WIDTH} is not supported in format {format:?}"
+            )));
+        }
+        chars.next();
+    }
+    match chars.next() {
+        Some(verb) if PRINTF_VERBS.contains(&verb) => Ok(PrintfSpec {
+            left,
+            zero,
+            width,
+            verb,
+        }),
+        Some('.') => Err(printf_error(format!(
+            "a precision is not supported in format {format:?}"
+        ))),
+        Some(verb) => Err(printf_error(format!(
+            "unsupported verb \"%{verb}\" in format {format:?}"
+        ))),
+        None => Err(printf_error(format!(
+            "format {format:?} ends with a lone \"%\""
+        ))),
+    }
+}
+
+/// Renders one argument through its verb, padded to the requested width.
+fn format_printf_arg(
+    spec: &PrintfSpec,
+    arg: &JinjaValue,
+    format: &str,
+) -> Result<String, minijinja::Error> {
+    let text = match spec.verb {
+        's' | 'v' => {
+            if !is_printf_scalar(arg) {
+                return Err(printf_error(format!(
+                    "\"%{}\" in format {format:?} wants a scalar, given {arg}",
+                    spec.verb
+                )));
+            }
+            go_string(arg)
+        }
+        // Go's `%q` of a number is a rune literal (`'A'` for 65) and of a bool
+        // an error marker, so only a string — or a missing variable, which
+        // this module renders empty — formats faithfully.
+        'q' => {
+            if !(arg.is_undefined() || arg.is_none() || arg.as_str().is_some()) {
+                return Err(printf_error(format!(
+                    "\"%q\" in format {format:?} wants a string, given {arg}"
+                )));
+            }
+            format!("{:?}", go_string(arg))
+        }
+        'd' => {
+            let Some(n) = arg.as_i64() else {
+                return Err(printf_error(format!(
+                    "\"%d\" in format {format:?} wants a number, given {arg}"
+                )));
+            };
+            n.to_string()
+        }
+        // `parse_printf_spec` accepts no other verb, and `%` never reaches
+        // here.
+        other => {
+            return Err(printf_error(format!(
+                "unsupported verb \"%{other}\" in format {format:?}"
+            )));
+        }
+    };
+    Ok(pad_printf(&text, spec))
+}
+
+/// Whether `%s` / `%v` can render this value the way Go would: Go writes a
+/// list as `[a b]` and a map as `map[k:v]`, neither of which minijinja's
+/// stringification matches, so only a scalar formats faithfully.
+fn is_printf_scalar(arg: &JinjaValue) -> bool {
+    use minijinja::value::ValueKind;
+    matches!(
+        arg.kind(),
+        ValueKind::Undefined
+            | ValueKind::None
+            | ValueKind::Bool
+            | ValueKind::Number
+            | ValueKind::String
+    )
+}
+
+/// Pads `text` to the spec's width: on the right for `-`, otherwise on the
+/// left, with zeros for `0`.
+fn pad_printf(text: &str, spec: &PrintfSpec) -> String {
+    let Some(missing) = spec.width.checked_sub(text.chars().count()) else {
+        return text.to_string();
+    };
+    if spec.left {
+        return format!("{text}{}", " ".repeat(missing));
+    }
+    if spec.zero {
+        // Go zero-pads a number after its sign (`-07`) but pads a string
+        // whole, sign or not (`000-a`).
+        let signed = spec.verb == 'd' && text.starts_with(['-', '+']);
+        let (sign, digits) = text.split_at(usize::from(signed));
+        return format!("{sign}{}{digits}", "0".repeat(missing));
+    }
+    format!("{}{text}", " ".repeat(missing))
+}
+
+fn printf_error(message: String) -> minijinja::Error {
+    minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, message)
 }
 
 /// Task `splitArgs`: shell-style field splitting honoring single and double
@@ -2070,6 +2314,73 @@ mod tests {
         }
     }
 
+    // Go's `printf` and `print` are how a Taskfile assembles a path out of
+    // several variables (`{{printf "%s/lib/python%s" .DESTDIR .MAJOR}}`), so
+    // both are mapped; the verbs a Taskfile uses are the string ones.
+    #[test]
+    fn go_printf_and_print() {
+        let cases = [
+            (r#"{{ printf "%s/fr.po" .D }}"#, "dir/fr.po"),
+            (r#"{{ printf "%s-%v" .D 3 }}"#, "dir-3"),
+            (r#"{{ printf "%q" .D }}"#, "\"dir\""),
+            (r#"{{ printf "%d%%" 50 }}"#, "50%"),
+            (r#"{{ printf "%-5s|" .D }}"#, "dir  |"),
+            (r#"{{ printf "%5s|" .D }}"#, "  dir|"),
+            (r#"{{ printf "%03d" 7 }}"#, "007"),
+            // The zero padding goes after a number's sign, as it does in Go,
+            // and around a string whole.
+            (r#"{{ printf "%03d" -7 }}"#, "-07"),
+            (r#"{{ printf "%05s" .D }}"#, "00dir"),
+            (r#"{{ printf "%s" .MISSING }}"#, ""),
+            (r#"{{ printf "%q" .MISSING }}"#, "\"\""),
+            // A flag and a width before `%%` are ignored, as in Go.
+            (r#"{{ printf "%5%" }}"#, "%"),
+            // `print` separates two operands only when neither is a string.
+            (r#"{{ print .D "/fr.po" }}"#, "dir/fr.po"),
+            (r#"{{ print 1 2 }}"#, "1 2"),
+            (r#"{{ .D | printf "%s.mo" }}"#, "dir.mo"),
+        ];
+        for (tmpl, want) in cases {
+            let mut c = cache_with(&[("D", "dir")]);
+            let got = c.replace(tmpl);
+            assert!(!c.is_err(), "{tmpl} recorded {:?}", c.err());
+            assert_eq!(got, want, "rendering {tmpl}");
+        }
+    }
+
+    // A format this module cannot render the way Go would is an error, not
+    // output that only looks right.
+    #[test]
+    fn printf_rejects_what_it_cannot_render() {
+        for tmpl in [
+            // Unsupported verb.
+            r#"{{ printf "%f" 1 }}"#,
+            // Precision.
+            r#"{{ printf "%.2s" .D }}"#,
+            // A lone trailing `%`, the likeliest real mistake.
+            r#"{{ printf "100%" }}"#,
+            // A width nothing could pad to, which Go gives up on too.
+            r#"{{ printf "%99999999999999999999d" 1 }}"#,
+            // `%d` of a string, which Go renders as `%!d(string=dir)`.
+            r#"{{ printf "%d" .D }}"#,
+            // `%q` of a number, which Go renders as the rune `'A'`.
+            r#"{{ printf "%q" 65 }}"#,
+            // A list, which Go renders as `[dir fr.po]`, through either
+            // builtin.
+            r#"{{ printf "%v" (splitList "/" .D) }}"#,
+            r#"{{ print (splitList "/" .D) }}"#,
+            // A flag Go accepts and this does not.
+            r#"{{ printf "%+d" 7 }}"#,
+            // Argument count mismatches, either way.
+            r#"{{ printf "%s %s" .D }}"#,
+            r#"{{ printf "%s" .D .D }}"#,
+        ] {
+            let mut c = cache_with(&[("D", "dir")]);
+            c.replace(tmpl);
+            assert!(c.is_err(), "{tmpl} rendered without an error");
+        }
+    }
+
     // A `.` inside a string literal is part of the literal, not field access.
     #[test]
     fn dots_inside_string_literals_are_preserved() {
@@ -2091,6 +2402,26 @@ mod tests {
         assert_eq!(
             to_jinja(r#"{{trimSuffix ".po" .ITEM}}"#).expect("migrates"),
             r#"{{ trimSuffix(".po", ITEM) }}"#
+        );
+    }
+
+    // `printf` and `print` migrate to the same call form, so a converted
+    // Taskfile keeps composing the strings it did as Go.
+    #[test]
+    fn migration_converts_printf() {
+        assert_eq!(
+            to_jinja(r#"{{printf "%s/lib/python%s" .DESTDIR .MAJOR}}"#).expect("migrates"),
+            r#"{{ printf("%s/lib/python%s", DESTDIR, MAJOR) }}"#
+        );
+        assert_eq!(
+            to_jinja(r#"{{.KEY | default (print (joinPath .DIR "k.pem"))}}"#).expect("migrates"),
+            r#"{{ default(print(joinPath(DIR, "k.pem")), KEY) }}"#
+        );
+        // After a pipe too: the subject is the last argument, not a filter's
+        // first one.
+        assert_eq!(
+            to_jinja(r#"{{.ITEM | printf "%s.mo"}}"#).expect("migrates"),
+            r#"{{ printf("%s.mo", ITEM) }}"#
         );
     }
 
@@ -2206,8 +2537,8 @@ mod tests {
     // A name the preflight does not know is rejected before the rewrite can
     // see it, so the call-position set has to be a subset of the mapped funcs.
     #[test]
-    fn sprig_call_position_names_are_all_mapped() {
-        for name in SPRIG_ONLY_IN_CALL_POSITION {
+    fn call_after_pipe_names_are_all_mapped() {
+        for name in CALL_AFTER_PIPE {
             assert!(MAPPED_FUNCS.contains(name), "{name} is not a mapped func");
         }
     }
