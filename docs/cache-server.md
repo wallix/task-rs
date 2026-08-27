@@ -48,6 +48,29 @@ data_volume: /srv/harbor              # blobs end up here
 With a self-signed or private-CA certificate, keep the CA file around: every
 client needs it (the `?ca=` URL parameter or `TASK_CACHE_OCI_CA`).
 
+The certificate Harbor serves (`https.certificate` above) must be a **leaf**: a
+CA certificate presented as the TLS end-entity is rejected (`CaUsedAsEndEntity`)
+even when it is also the configured trust anchor. A bare `openssl req -x509`
+produces exactly that — `CA:TRUE`, and no `subjectAltName`, which is the only
+name a client checks. Pin both, plus the server EKU other verifiers ask for:
+
+```sh
+openssl req -x509 -newkey rsa:4096 -nodes -days 825 \
+    -subj '/CN=harbor.example.com' \
+    -addext 'basicConstraints=critical,CA:FALSE' \
+    -addext 'extendedKeyUsage=serverAuth' \
+    -addext 'subjectAltName=DNS:harbor.example.com' \
+    -keyout harbor.key -out harbor.crt
+sudo install -D -m 644 harbor.crt /etc/harbor/certs/harbor.crt
+sudo install -D -m 600 harbor.key /etc/harbor/certs/harbor.key
+```
+
+Use `IP:<host address>` instead of `DNS:` in the `subjectAltName` if `hostname`
+is an address. A self-signed leaf is its own anchor, so `harbor.crt` is also
+the file the clients pass as `?ca=`.
+
+With the certificate and `harbor.yml` in place, install:
+
 ```sh
 sudo ./install.sh
 ```
@@ -163,6 +186,6 @@ task build        # task: "build" restored from cache
 The pushed entries are visible with `oras` or in the Harbor UI:
 
 ```sh
-oras repo tags --ca-file harbor-ca.crt -u 'robot$task-cache+ci' \
+oras repo tags --ca-file harbor.crt -u 'robot$task-cache+ci' \
     harbor.example.com/task-cache/build
 ```
