@@ -126,16 +126,13 @@ cargo test -p task --test cache
 Run the full `cargo test --workspace` before calling a change done — the parity
 suite is the safety net for the compatibility constraint above.
 
-### Release / container scripts
+### Build / container scripts
 
 Of the scripts below, the first four run inside the pinned devcontainer image
 (`.devcontainer/Dockerfile`, digest- and apk-pinned), each preferring a `vk` on
 `PATH` (dogfooding virtkit's microVM builder) and falling back to Docker;
-`--docker` forces the Docker backend. `update.sh` and `release.sh` run on the
-host — `update.sh` shells out to `docker` to resolve the image digest and apk
-versions; `release.sh` bumps the version files, runs `cargo build` and
-`cargo test` on the host to refresh `Cargo.lock` and check the version
-invariant, then commits, tags and pushes.
+`--docker` forces the Docker backend. `update.sh` runs on the host, shelling
+out to `docker` to resolve the image digest and apk versions.
 
 ```bash
 ./build.sh [--docker]     # reproducible static-musl binary -> dist/task (+ dist/task.sha256)
@@ -143,13 +140,43 @@ invariant, then commits, tags and pushes.
 ./fmt.sh   [--docker]     # cargo fmt (--check to verify)
 ./audit.sh [--docker]     # cargo-audit against the committed Cargo.lock
 ./update.sh               # bump the pinned toolchain + re-pin the base image and apk deps
-./release.sh <X.Y.Z>      # set the version, check the CHANGELOG, commit, tag, push
 ```
 
 `build.sh` output is a stripped static ELF that links no system C libraries
 (musl-static, rustls + ring). Rebuilding from the same commit must reproduce the
 same bytes — keep the pinning (toolchain, base image digest, apk versions,
 `SOURCE_DATE_EPOCH`, path remapping) intact when touching build inputs.
+
+### Cutting a release
+
+By hand, from a clean tree on an up-to-date `main`, with `v<X.Y.Z>` not already
+a tag: a `v*` tag triggers `release.yml` wherever it sits, publishing artifacts
+built from the commit it points at. The tag is the point of no return —
+everything below happens before it is pushed, because undoing it means deleting
+a published tag.
+
+1. Insert a `## v<X.Y.Z> - <YYYY-MM-DD>` heading in `CHANGELOG.md` below
+   `## Unreleased`, moving the unreleased entries under it and leaving
+   `## Unreleased` empty for the next cycle.
+2. Set `version` under `[workspace.package]` in the root `Cargo.toml` to the
+   same version — every crate inherits it.
+3. Run the four checks `quality.yml` runs, since `release.yml` runs them again
+   on the tagged commit and a failure there costs a published tag:
+
+   ```bash
+   cargo fmt --all -- --check
+   cargo clippy --workspace --all-targets -- -D warnings
+   cargo test --workspace          # also refreshes Cargo.lock
+   ./audit.sh --deny warnings      # bare cargo audit passes what CI denies
+   ```
+
+   `cargo test --workspace` is where `version_matches_changelog` ties the
+   workspace version to the newest CHANGELOG heading.
+4. Commit as `task-rs: release <X.Y.Z>`, tag it `v<X.Y.Z>` (annotated), then
+   push the branch **first** — if that push is rejected, do not push the tag —
+   and the tag after it. The tag must be `v` + the workspace version + the
+   newest CHANGELOG heading, all three agreeing: `release.yml` takes the release
+   notes from the matching `## v<X.Y.Z>` section.
 
 ## Code Quality Config
 

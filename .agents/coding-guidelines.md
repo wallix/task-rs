@@ -40,6 +40,6 @@ row below is CI-enforced; the rest are conventions to follow by hand.
 Each language has its own file under [`coding-guidelines/`](coding-guidelines/):
 
 - [Rust (every crate in the workspace)](coding-guidelines/rust.md)
-- [Shell (`*.sh`, build & release scripts)](coding-guidelines/shell.md)
+- [Shell (`*.sh`, build & container scripts)](coding-guidelines/shell.md)
 - [YAML & JSON (`testdata/` fixtures, the JSON schemas, workflows,
   `Taskfile.yml`)](coding-guidelines/yaml.md)

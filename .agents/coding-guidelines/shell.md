@@ -1,7 +1,7 @@
 # Shell Coding Guidelines
 
-Applies to: `*.sh` (the build, lint, format, audit, release, update, and
-installer scripts at the repo root).
+Applies to: `*.sh` (the build, lint, format, audit, update, and installer
+scripts at the repo root).
 
 See [`../coding-guidelines.md`](../coding-guidelines.md) for general conventions
 and formatting requirements that apply to all code.
@@ -22,16 +22,16 @@ and formatting requirements that apply to all code.
   produce identical results.
 - Preserve current flag semantics. New flags get a clear `--long-name` and a
   usage line. `build.sh` owns its whole flag set and rejects unknown args with
-  `exit 2`; `release.sh` takes a single positional version and exits 2 when it
-  is malformed; the cargo wrappers (`lint.sh`, `fmt.sh`, `audit.sh`)
-  deliberately forward extra args to the underlying command (`./fmt.sh --check`)
-  — preserve that.
+  `exit 2`; the cargo wrappers (`lint.sh`, `fmt.sh`, `audit.sh`) deliberately
+  forward extra args to the underlying command (`./fmt.sh --check`) — preserve
+  that.
 - Make destructive or expensive operations safe: verbose output, idempotent
   re-runs (`update.sh` is a no-op when already current), and preconditions
-  checked up front (`release.sh` refuses a dirty tree or an existing tag). No
-  script uses `trap` today; a new one that creates a temp dir should clean it up
-  on every exit path, not just the success path (`install-task.sh` currently
-  only removes its `mktemp -d` on success).
+  checked up front rather than half way through (`build.sh` rejects an unknown
+  argument before it starts a container). No script uses `trap` today; a new one
+  that creates a temp dir should clean it up on every exit path, not just the
+  success path (`install-task.sh` currently only removes its `mktemp -d` on
+  success).
 - Keep builds reproducible: pin inputs (toolchain channel, base image tag
   **and** digest, apk versions) and neutralize timestamps and host paths. Do not
   float a version that was previously pinned. `build.sh` writes
@@ -42,4 +42,4 @@ and formatting requirements that apply to all code.
   (registry tokens, `$TASK_VK_LOCK_TOKEN`).
 - Prefer the dedicated tools the repo already uses (`sed -nE`, `awk`,
   `sha256sum`, `cargo`) over reinventing parsing; keep one script focused on one
-  job (build vs. lint vs. fmt vs. audit vs. release vs. update).
+  job (build vs. lint vs. fmt vs. audit vs. update).

@@ -53,16 +53,6 @@ tasks:
     cmds:
       - ./build.sh {{ CLI_ARGS }}
 
-  release:
-    desc: Cut a release — `task release -- <MAJOR.MINOR.PATCH>` (add the CHANGELOG entry first)
-    summary: |
-      Sets the version across the workspace, checks the CHANGELOG has a matching
-      `## v<version>` section, then commits, tags v<version>, and pushes. The
-      Release GitHub workflow builds and publishes the per-platform artifacts.
-    prompt: Cut and push release v{{ CLI_ARGS }}?
-    cmds:
-      - ./release.sh {{ CLI_ARGS }}
-
   clean:
     desc: Clean build artifacts
     aliases: [clear]

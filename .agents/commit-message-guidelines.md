@@ -67,7 +67,7 @@ Pick one lowercase scope matching the component touched. Common scopes here:
   `taskcore/templater:`.
 - `ci` — GitHub Actions workflows.
 - A script's basename when the change is to that script, e.g. `build.sh:`,
-  `release.sh:`, `install-task.sh:`.
+  `update.sh:`, `install-task.sh:`.
 - `devcontainer` — the build image and its pins.
 - `schema` — `schema.json` / `schema-taskrc.json` when changed on their own.
 - `doc` — documentation (`README.md`, `docs/`). `tests` — test-only changes,
@@ -113,10 +113,10 @@ When in doubt, ship the shorter message.
 A commit that changes user-visible behavior — a feature, a fix, a change in how
 `task` is invoked or behaves, a new Taskfile field — must update `CHANGELOG.md`
 in the same commit, under an `## Unreleased` heading at the top (create it if
-absent). At release time that heading becomes `## v<version>` — `release.sh`
-refuses to cut a release without a matching `## v<version>` section. Purely
-internal changes (refactors, tests, CI, build tooling, docs) do not get an
-entry.
+absent). At release time a `## v<version>` heading goes in below it —
+`taskcore`'s `version_matches_changelog` test refuses a workspace version that
+does not match the newest `## v<version>` heading. Purely internal changes
+(refactors, tests, CI, build tooling, docs) do not get an entry.
 
 Changelog entries are pitched one level higher than the commit message: describe
 what a user gains or what now behaves differently, in their terms. No internal
