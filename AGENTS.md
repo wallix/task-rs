@@ -97,9 +97,9 @@ parser change belong in the same commit. `schema-taskrc.json` describes the
 
 ## Development Environment
 
-The toolchain is pinned in `rust-toolchain.toml` (channel + clippy + rustfmt,
-with the musl target kept available for the release path). A plain host `cargo`
-is all the edit loop needs — no container.
+The toolchain is pinned in `rust-toolchain.toml` (channel + clippy + rustfmt).
+Release builds use the container's native musl target. A plain host `cargo` is
+all the edit loop needs — no container.
 
 ```bash
 cargo build -p task                                  # debug binary

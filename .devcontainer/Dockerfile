@@ -4,13 +4,15 @@
 # targets musl directly, so the `task` binary links no system C libraries and
 # ships as a single static ELF.
 #
+# The multi-arch digest resolves to the host architecture. Linux releases are
+# built natively; no cross toolchain is installed.
+#
 # `task-build` contains the build, lint, and format tools. The default
 # `task-audit` stage adds cargo-audit.
 FROM rust:1.97.1-alpine3.21@sha256:7bae7c67364dad5ebbd4060923b34d734fbed66d7c1cf3af72aa2f062af93eb6 AS task-build
 
-# Build deps (one per line in apk-pins.txt, pinned to exact versions for byte-for-byte
-# reproducibility — Alpine has no snapshot service, so the pins + the image digest above
-# are what freeze the inputs; regenerate with ./update.sh):
+# Build dependencies are version-pinned in apk-pins.txt. Regenerate the file
+# with update.sh on both supported architectures when package versions diverge.
 #   gcc + musl-dev          ring/zstd's vendored C compiles; Alpine's gcc is musl-native,
 #                           so it is also the musl C compiler.
 #   git, ca-certificates, file   dev/build basics.
