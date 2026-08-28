@@ -1,7 +1,7 @@
 # Shell Coding Guidelines
 
-Applies to: `*.sh` (the build, lint, format, audit, update, and installer
-scripts at the repo root).
+Applies to: `*.sh` (the build, package, lint, format, audit, update, and
+installer scripts at the repo root).
 
 See [`../coding-guidelines.md`](../coding-guidelines.md) for general conventions
 and formatting requirements that apply to all code.
@@ -27,11 +27,8 @@ and formatting requirements that apply to all code.
   that.
 - Make destructive or expensive operations safe: verbose output, idempotent
   re-runs (`update.sh` is a no-op when already current), and preconditions
-  checked up front rather than half way through (`build.sh` rejects an unknown
-  argument before it starts a container). No script uses `trap` today; a new one
-  that creates a temp dir should clean it up on every exit path, not just the
-  success path (`install-task.sh` currently only removes its `mktemp -d` on
-  success).
+  checked up front rather than half way through. Clean temporary directories on
+  every exit path with `trap ... EXIT` as `package.sh` does.
 - Keep builds reproducible: pin inputs (toolchain channel, base image tag
   **and** digest, apk versions) and neutralize timestamps and host paths. Do not
   float a version that was previously pinned. `build.sh` writes

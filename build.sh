@@ -9,6 +9,7 @@
 #   --target=<arch>      the musl target to build: x86_64, aarch64, or either full
 #                        triple. Defaults to the host architecture; cross-builds
 #                        are rejected.
+#   --package            write the release archive and checksum with package.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -17,13 +18,15 @@ OUT=dist
 
 FORCE_DOCKER=""
 REQ_TARGET=""
+PACKAGE=""
 for arg in "$@"; do
   case "$arg" in
     --docker) FORCE_DOCKER=1 ;;
     # Reject an explicitly empty target instead of using the host default.
     --target=) echo "build.sh: --target needs a value (x86_64 or aarch64)" >&2; exit 2 ;;
     --target=*) REQ_TARGET="${arg#*=}" ;;
-    *) echo "build.sh: unknown argument: $arg (--docker, --target=<arch>)" >&2; exit 2 ;;
+    --package) PACKAGE=1 ;;
+    *) echo "build.sh: unknown argument: $arg (--docker, --target=<arch>, --package)" >&2; exit 2 ;;
   esac
 done
 
@@ -51,6 +54,13 @@ case "$ARCH" in
   x86_64) PLATFORM=linux/amd64 ;;
   aarch64) PLATFORM=linux/arm64 ;;
 esac
+
+# Check host-side packaging tools before starting the build.
+if [ -n "$PACKAGE" ]; then
+  for t in tar gzip sha256sum; do
+    command -v "$t" >/dev/null || { echo "build.sh: $t is required for --package" >&2; exit 1; }
+  done
+fi
 
 # Path-independence for reproducible builds: remap the mounted /work to stable
 # names in both the Rust debug info and the vendored C (-ffile-prefix-map).
@@ -136,3 +146,8 @@ git diff --quiet HEAD 2>/dev/null || dirty=" (dirty tree)"
 )
 echo "build.sh: wrote $OUT/task" >&2
 file "$OUT/task" >&2 || true
+
+# Package the release with the same script used by CI.
+if [ -n "$PACKAGE" ]; then
+  ./package.sh --platform "linux-$ARCH" --binary "$OUT/task" --out "$OUT"
+fi
