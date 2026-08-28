@@ -1,9 +1,6 @@
 name: CI
 
-# Quality checks on every push to main and every pull request. Tag pushes are
-# excluded (branches: main matches branches, not tags) — release.yml calls the
-# same quality.yml checks as a gate before publishing, so a tag build does not
-# double-run them here.
+# Run quality checks and Linux release builds on branches and pull requests.
 
 on:
   pull_request:
@@ -11,6 +8,17 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   quality:
     uses: ./.github/workflows/quality.yml
+
+  # Exercise the Linux release path without running native platform jobs.
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      artifact-prefix: ci
+      retention-days: 7
+      linux-only: true

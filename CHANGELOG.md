@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Linux release binaries are reproducible** — each release includes a
+  `task-linux-<arch>.build-info.txt` manifest for verifying a local rebuild.
+
 ## v4.2.0 - 2026-08-27
 
 - **`default` is a filter, not a backwards-looking call** — `--migrate` now

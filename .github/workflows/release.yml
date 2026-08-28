@@ -1,76 +1,102 @@
 name: Release
 
+# Build and publish releases for v* tags. Publishing waits for quality checks,
+# all artifacts, and Linux reproducibility checks.
+
 on:
   push:
     tags:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  # Gate: run the same fmt/clippy/test/audit checks as CI against the tagged
-  # commit, before anything is published.
+  # Reject an inconsistent tag before starting the build matrix.
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tag, workspace version and CHANGELOG agree
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          version=$(sed -nE '/^\[workspace\.package\]/,/^\[/ s/^version = "(.*)"$/\1/p' Cargo.toml)
+          if [ "$tag" != "v$version" ]; then
+            echo "tag $tag does not match the workspace version $version" >&2
+            exit 1
+          fi
+          ./release-notes.sh "$tag" > /dev/null
+          echo "$tag matches the workspace version and has release notes"
+
   quality:
+    needs: preflight
     uses: ./.github/workflows/quality.yml
 
-  # Create the GitHub release once, with notes taken from the matching
-  # CHANGELOG.md section (e.g. `## v4.0.0` for tag `v4.0.0`).
-  create-release:
-    needs: [quality]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: taiki-e/create-gh-release-action@v1
-        with:
-          changelog: CHANGELOG.md
-          token: ${{ secrets.GITHUB_TOKEN }}
+  build:
+    needs: preflight
+    uses: ./.github/workflows/build.yml
+    with:
+      artifact-prefix: release
+      retention-days: 3
+      verify-reproducible: true
 
-  # Build, package, checksum, and upload one archive per platform. Native
-  # runners for macOS/Windows; linux aarch64 cross-compiles via `cross`.
-  upload-assets:
-    needs: create-release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            name: linux-x86_64
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            name: linux-aarch64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: macos-x86_64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: macos-aarch64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: windows-x86_64
-          - target: aarch64-pc-windows-msvc
-            os: windows-latest
-            name: windows-aarch64
-    runs-on: ${{ matrix.os }}
+  release:
+    needs: [quality, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
-      # Install cross from a prebuilt binary for the target that needs it.
-      # This avoids `cargo install cross`, which would build from source under
-      # our pinned rust-toolchain.toml (toolchain-override warning) and resolve
-      # cross's own lockfile (yanked-dependency warning). upload-rust-binary-action
-      # reuses the cross already on PATH.
-      - if: contains(matrix.target, 'aarch64-unknown-linux')
-        uses: taiki-e/install-action@v2
+
+      - name: Download release assets
+        uses: actions/download-artifact@v7
         with:
-          tool: cross
-      - uses: taiki-e/upload-rust-binary-action@v1
-        with:
-          bin: task
-          target: ${{ matrix.target }}
-          # task-<os>-<arch>.tar.gz (.zip on Windows), containing the binary
-          # plus these files.
-          archive: task-${{ matrix.name }}
-          include: README.md,LICENSE,crates/task/completion
-          checksum: sha256
-          token: ${{ secrets.GITHUB_TOKEN }}
+          pattern: release-*-${{ github.sha }}
+          path: dist
+          merge-multiple: true
+
+      - name: Verify the archives against their sidecars
+        run: |
+          set -euo pipefail
+          cd dist
+          for sidecar in task-*.sha256; do sha256sum -c "$sidecar"; done
+
+      - name: Release notes from CHANGELOG
+        run: ./release-notes.sh "${GITHUB_REF#refs/tags/}" > ${{ runner.temp }}/release-notes.md
+
+      # Upload to a draft first so partial releases stay unpublished.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          # An explicit list makes missing platform assets fail the job.
+          assets=( \
+            dist/task-linux-x86_64.tar.gz \
+            dist/task-linux-x86_64.sha256 \
+            dist/task-linux-aarch64.tar.gz \
+            dist/task-linux-aarch64.sha256 \
+            dist/task-macos-x86_64.tar.gz \
+            dist/task-macos-x86_64.sha256 \
+            dist/task-macos-aarch64.tar.gz \
+            dist/task-macos-aarch64.sha256 \
+            dist/task-windows-x86_64.zip \
+            dist/task-windows-x86_64.sha256 \
+            dist/task-windows-aarch64.zip \
+            dist/task-windows-aarch64.sha256 \
+            dist/task-linux-x86_64.build-info.txt \
+            dist/task-linux-aarch64.build-info.txt \
+          )
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --draft --title "$tag" --notes-file ${{ runner.temp }}/release-notes.md
+          fi
+          gh release edit "$tag" --draft=false

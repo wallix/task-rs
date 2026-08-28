@@ -39,11 +39,9 @@ and formatting requirements that apply to all code.
   fork. Nothing in the workspace reads `.taskrc` yet, so treat the file as a
   published schema only — if `.taskrc` support ever lands, the parser and this
   schema move together.
-- **Workflows:** the reusable `quality.yml` is the single definition of
-  fmt/clippy/test/audit; `ci.yml` and `release.yml` call it rather than
-  restating the steps, so a release is gated on exactly the checks ordinary CI
-  runs. Add a check there once, not in both callers. Pin actions by major
-  version tag as the existing steps do, and keep `permissions:` least-privilege.
+- **Workflows:** `quality.yml` defines checks and `build.yml` defines artifact
+  builds. `ci.yml` and `release.yml` call both. Pin action versions and runner
+  images, and keep `permissions:` least-privilege.
 - **`Taskfile.yml` is dogfooding:** it is authored in the native Jinja dialect
   (`templater: jinja`) and must keep working with the binary built from the same
   commit. A change to it is a change to a user-facing example — keep the task

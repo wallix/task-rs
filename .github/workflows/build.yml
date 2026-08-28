@@ -1,0 +1,170 @@
+name: Build
+
+# Builds and packages release artifacts. CI runs only the Linux jobs; releases
+# run the full matrix.
+#
+# Linux uses build.sh and the pinned devcontainer. Native binaries use pinned
+# runner versions. package.sh creates every archive on Linux.
+
+on:
+  workflow_call:
+    inputs:
+      artifact-prefix:
+        type: string
+        required: true
+      retention-days:
+        type: number
+        required: true
+      linux-only:
+        type: boolean
+        default: false
+      verify-reproducible:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Linux builds are native to the runner architecture.
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-24.04
+          - arch: aarch64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and package (linux-${{ matrix.arch }})
+        run: ./build.sh --docker --target=${{ matrix.arch }} --package ${{ inputs.verify-reproducible && '--verify' || '' }}
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-prefix }}-archive-linux-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            dist/task-linux-${{ matrix.arch }}.tar.gz
+            dist/task-linux-${{ matrix.arch }}.sha256
+          if-no-files-found: error
+          overwrite: true
+          retention-days: ${{ inputs.retention-days }}
+
+      # Keep the archiver-independent binary digest as a release asset.
+      - name: Name the build manifest for its platform
+        run: cp dist/task.sha256 dist/task-linux-${{ matrix.arch }}.build-info.txt
+
+      - name: Upload build manifest
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-prefix }}-manifest-linux-${{ matrix.arch }}-${{ github.sha }}
+          path: dist/task-linux-${{ matrix.arch }}.build-info.txt
+          if-no-files-found: error
+          overwrite: true
+          retention-days: ${{ inputs.retention-days }}
+
+  # Native builds use the toolchains installed on pinned runner images.
+  native:
+    if: ${{ !inputs.linux-only }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-x86_64
+            target: x86_64-apple-darwin
+            runs-on: macos-15
+          - platform: macos-aarch64
+            target: aarch64-apple-darwin
+            runs-on: macos-15
+          - platform: windows-x86_64
+            target: x86_64-pc-windows-msvc
+            runs-on: windows-2025
+          - platform: windows-aarch64
+            target: aarch64-pc-windows-msvc
+            runs-on: windows-2025
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install pinned toolchain and target
+        run: rustup target add ${{ matrix.target }}
+
+      # Use native Windows paths because rustc does not match Git Bash paths when
+      # applying --remap-path-prefix.
+      - name: Build (${{ matrix.platform }})
+        shell: bash
+        env:
+          SOURCE_DATE_EPOCH: 0
+          CARGO_INCREMENTAL: 0
+        run: |
+          set -euo pipefail
+          if [ "${RUNNER_OS}" = Windows ]; then
+            workspace='${{ github.workspace }}'
+            cargo_home="${CARGO_HOME:-$USERPROFILE\.cargo}"
+          else
+            workspace="$PWD"
+            cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          fi
+          export RUSTFLAGS="--remap-path-prefix=$workspace=/src --remap-path-prefix=$cargo_home=/cargo"
+          echo "RUSTFLAGS=$RUSTFLAGS"
+          cargo build --release -p task --target ${{ matrix.target }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-prefix }}-binary-${{ matrix.platform }}-${{ github.sha }}
+          path: target/${{ matrix.target }}/release/task${{ startsWith(matrix.platform, 'windows') && '.exe' || '' }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: ${{ inputs.retention-days }}
+
+  # Package native binaries with the same Linux archivers used for Linux builds.
+  package:
+    if: ${{ !inputs.linux-only }}
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # Keep artifacts separate because their binary names overlap.
+      - name: Download binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: ${{ inputs.artifact-prefix }}-binary-*-${{ github.sha }}
+          path: ${{ runner.temp }}/binaries
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          for platform in macos-x86_64 macos-aarch64 windows-x86_64 windows-aarch64; do
+            dir="${{ runner.temp }}/binaries/${{ inputs.artifact-prefix }}-binary-$platform-${{ github.sha }}"
+            case "$platform" in
+              windows-*) bin="$dir/task.exe" ;;
+              *)         bin="$dir/task" ;;
+            esac
+            ./package.sh --platform "$platform" --binary "$bin"
+          done
+
+      - name: Upload archives
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-prefix }}-archive-native-${{ github.sha }}
+          path: |
+            dist/task-macos-x86_64.tar.gz
+            dist/task-macos-x86_64.sha256
+            dist/task-macos-aarch64.tar.gz
+            dist/task-macos-aarch64.sha256
+            dist/task-windows-x86_64.zip
+            dist/task-windows-x86_64.sha256
+            dist/task-windows-aarch64.zip
+            dist/task-windows-aarch64.sha256
+          if-no-files-found: error
+          overwrite: true
+          retention-days: ${{ inputs.retention-days }}

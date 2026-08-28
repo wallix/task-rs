@@ -266,9 +266,8 @@ fn http_client(api: &str) -> Result<reqwest::Client> {
         .context("building the HTTP client")
 }
 
-/// This host's release archive and the sidecar published beside it. Kept in step
-/// with the build matrix in `.github/workflows/release.yml` and the names
-/// `install-task.sh` builds.
+/// This host's release archive and checksum names. Keep in sync with
+/// `package.sh` and `install-task.sh`.
 fn asset_names() -> Result<(String, String)> {
     let os = match std::env::consts::OS {
         os @ ("linux" | "macos" | "windows") => os,

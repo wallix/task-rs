@@ -4,7 +4,7 @@ set -e
 #
 # Archives are named `task-<os>-<arch>.<ext>`, each with a
 # `task-<os>-<arch>.sha256` sidecar — the archive name without its extension.
-# Keep in sync with `archive:` in .github/workflows/release.yml.
+# Keep in sync with package.sh.
 
 usage() {
   this=$1
@@ -56,8 +56,7 @@ execute() {
   log_info "installed ${BINDIR}/${binexe}"
   rm -rf "${tmpdir}"
 }
-# Platforms with a published release archive. Keep in sync with the matrix in
-# .github/workflows/release.yml.
+# Keep supported platforms in sync with package.sh.
 check_platform() {
   case "$PLATFORM" in
     linux/x86_64) return 0 ;;
