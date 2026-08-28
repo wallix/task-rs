@@ -21,12 +21,12 @@ if [ -z "$FORCE_DOCKER" ] && command -v vk >/dev/null 2>&1; then
   # host user. No --net — rustfmt neither compiles nor fetches.
   echo "fmt.sh: formatting with vk from PATH ($(command -v vk)); pass --docker to force Docker" >&2
   exec vk run \
-    --file .devcontainer/Dockerfile --context .devcontainer \
+    --file .devcontainer/Dockerfile --context .devcontainer --target task-build \
     --workdir "$PWD" \
     -- cargo fmt --all "${args[@]}"
 fi
 
-docker build -t task-build -f .devcontainer/Dockerfile .devcontainer
+docker build --target task-build -t task-build -f .devcontainer/Dockerfile .devcontainer
 
 docker run --rm \
   --user "$(id -u):$(id -g)" -e HOME=/tmp \

@@ -77,7 +77,7 @@ pin_apk .devcontainer/apk-pins.txt \
 
 echo "updated:"
 grep -E '^channel' rust-toolchain.toml
-grep -E '^FROM'    .devcontainer/Dockerfile
+grep -E '^FROM rust:' .devcontainer/Dockerfile
 grep -E 'cargo install cargo-audit' .devcontainer/Dockerfile
 echo "apk pins (.devcontainer/apk-pins.txt):"
 grep -vE '^[[:space:]]*(#|$)' .devcontainer/apk-pins.txt | sed 's/^/  /'

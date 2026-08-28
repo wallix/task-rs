@@ -11,7 +11,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-IMAGE=task-build
+IMAGE=task-build # Dockerfile stage and local image tag
 TARGET=x86_64-unknown-linux-musl
 OUT=dist
 
@@ -49,15 +49,16 @@ if [ -n "$VK_BIN" ]; then
   # ---- dogfood backend: vk microVM ----
   # The devcontainer RUN steps need egress for apk, and the compile needs egress for
   # cargo (--net); the workspace build wants all CPUs and enough RAM not to OOM rustc.
+  # This --target selects the Dockerfile stage, not a Rust target.
   exports=""
   for e in "${BUILD_ENV[@]}"; do exports+="export ${e%%=*}='${e#*=}'; "; done
   "$VK_BIN" run \
-    --file .devcontainer/Dockerfile --context .devcontainer \
+    --file .devcontainer/Dockerfile --context .devcontainer --target "$IMAGE" \
     --workdir "$PWD" --net --cpus host --mem 8G \
     -- sh -c "${exports}${BUILD_CMD}"
 else
   # ---- default backend: Docker ----
-  docker build -t "$IMAGE" -f .devcontainer/Dockerfile .devcontainer
+  docker build --target "$IMAGE" -t "$IMAGE" -f .devcontainer/Dockerfile .devcontainer
   # Build as the host user so target/ stays writable and no root-owned files leak out.
   docker_env=()
   for e in "${BUILD_ENV[@]}"; do docker_env+=(-e "$e"); done

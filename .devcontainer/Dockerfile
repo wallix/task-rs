@@ -4,8 +4,8 @@
 # targets musl directly, so the `task` binary links no system C libraries and
 # ships as a single static ELF.
 #
-# Named so both build.sh backends can reference it: `docker build -t task-build`
-# tags it, and the `vk` backend resolves the base by this stage name.
+# `task-build` contains the build, lint, and format tools. The default
+# `task-audit` stage adds cargo-audit.
 FROM rust:1.97.1-alpine3.21@sha256:7bae7c67364dad5ebbd4060923b34d734fbed66d7c1cf3af72aa2f062af93eb6 AS task-build
 
 # Build deps (one per line in apk-pins.txt, pinned to exact versions for byte-for-byte
@@ -17,18 +17,16 @@ FROM rust:1.97.1-alpine3.21@sha256:7bae7c67364dad5ebbd4060923b34d734fbed66d7c1cf
 COPY apk-pins.txt /tmp/apk-pins.txt
 RUN apk add --no-cache $(grep -vE '^[[:space:]]*(#|$)' /tmp/apk-pins.txt)
 
-# Lint/format components; x86_64-unknown-linux-musl is Alpine's native target, so
-# no `rustup target add`. Versions follow rust-toolchain.toml.
-RUN rustup component add clippy rustfmt
-
-# cargo-audit baked in so audit.sh needs no on-demand install. Not a rustup component, so
-# install the pinned version as a binary; --locked builds it from its published Cargo.lock
-# so the image stays reproducible. Lands in CARGO_HOME/bin (on PATH) and is chowned below.
-RUN cargo install cargo-audit --locked --version 0.22.2
-
-# Non-root dev user owning the cargo/rustup homes so it can honour
-# rust-toolchain.toml and populate the registry cache without root.
+# Run Rust tools as a non-root user with writable Cargo and rustup homes.
 ARG USERNAME=dev
 RUN adduser -D -s /bin/sh "${USERNAME}" \
  && chown -R "${USERNAME}": "${CARGO_HOME}" "${RUSTUP_HOME}"
 USER ${USERNAME}
+
+# Install the components listed in rust-toolchain.toml in the base stage.
+RUN rustup component add clippy rustfmt
+
+FROM task-build AS task-audit
+
+# cargo-audit is not a rustup component. Build its pinned dependency graph.
+RUN cargo install cargo-audit --locked --version 0.22.2

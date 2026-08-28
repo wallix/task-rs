@@ -20,12 +20,12 @@ if [ -z "$FORCE_DOCKER" ] && command -v vk >/dev/null 2>&1; then
   # workspace compile wants every CPU and enough RAM not to OOM rustc.
   echo "lint.sh: linting with vk from PATH ($(command -v vk)); pass --docker to force Docker" >&2
   exec vk run \
-    --file .devcontainer/Dockerfile --context .devcontainer \
+    --file .devcontainer/Dockerfile --context .devcontainer --target task-build \
     --workdir "$PWD" --net --cpus host --mem 8G \
     -- cargo clippy --workspace --all-targets -- -D warnings "${args[@]}"
 fi
 
-docker build -t task-build -f .devcontainer/Dockerfile .devcontainer
+docker build --target task-build -t task-build -f .devcontainer/Dockerfile .devcontainer
 
 docker run --rm \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -e CARGO_HOME=/work/target/.cargo-home \

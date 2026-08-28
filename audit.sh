@@ -24,15 +24,15 @@ if [ -z "$FORCE_DOCKER" ] && command -v vk >/dev/null 2>&1; then
   # advisory database.
   echo "audit.sh: auditing with vk from PATH ($(command -v vk)); pass --docker to force Docker" >&2
   exec vk run \
-    --file .devcontainer/Dockerfile --context .devcontainer \
+    --file .devcontainer/Dockerfile --context .devcontainer --target task-audit \
     --workdir "$PWD" --net \
     -- cargo audit "${args[@]}"
 fi
 
-docker build -t task-build -f .devcontainer/Dockerfile .devcontainer
+docker build --target task-audit -t task-audit -f .devcontainer/Dockerfile .devcontainer
 
 exec docker run --rm \
   --user "$(id -u):$(id -g)" -e HOME=/tmp \
   -v "$PWD":/work -w /work \
-  task-build \
+  task-audit \
   cargo audit "${args[@]}"
