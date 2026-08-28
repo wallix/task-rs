@@ -10,6 +10,7 @@
 #                        triple. Defaults to the host architecture; cross-builds
 #                        are rejected.
 #   --package            write the release archive and checksum with package.sh
+#   --verify             repeat the build from a clean copy and compare binaries
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -19,6 +20,7 @@ OUT=dist
 FORCE_DOCKER=""
 REQ_TARGET=""
 PACKAGE=""
+VERIFY=""
 for arg in "$@"; do
   case "$arg" in
     --docker) FORCE_DOCKER=1 ;;
@@ -26,7 +28,8 @@ for arg in "$@"; do
     --target=) echo "build.sh: --target needs a value (x86_64 or aarch64)" >&2; exit 2 ;;
     --target=*) REQ_TARGET="${arg#*=}" ;;
     --package) PACKAGE=1 ;;
-    *) echo "build.sh: unknown argument: $arg (--docker, --target=<arch>, --package)" >&2; exit 2 ;;
+    --verify) VERIFY=1 ;;
+    *) echo "build.sh: unknown argument: $arg (--docker, --target=<arch>, --package, --verify)" >&2; exit 2 ;;
   esac
 done
 
@@ -55,10 +58,15 @@ case "$ARCH" in
   aarch64) PLATFORM=linux/arm64 ;;
 esac
 
-# Check host-side packaging tools before starting the build.
+# Check host-side packaging and verification tools before starting the build.
 if [ -n "$PACKAGE" ]; then
   for t in tar gzip sha256sum; do
     command -v "$t" >/dev/null || { echo "build.sh: $t is required for --package" >&2; exit 1; }
+  done
+fi
+if [ -n "$VERIFY" ]; then
+  for t in tar sha256sum; do
+    command -v "$t" >/dev/null || { echo "build.sh: $t is required for --verify" >&2; exit 1; }
   done
 fi
 
@@ -147,7 +155,34 @@ git diff --quiet HEAD 2>/dev/null || dirty=" (dirty tree)"
 echo "build.sh: wrote $OUT/task" >&2
 file "$OUT/task" >&2 || true
 
-# Package the release with the same script used by CI.
+# Rebuild from a copy without Git, build outputs, or Cargo caches. Both builds use
+# /work; path independence comes from the remapping above. TMPDIR must be outside
+# the repository to avoid copying the temporary tree into itself.
+if [ -n "$VERIFY" ]; then
+  built=$(sha256sum < "$OUT/task" | cut -d' ' -f1)
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  case "$tmp" in
+    "$PWD"/*) echo "build.sh: \$TMPDIR must be outside the repo ($tmp)" >&2; exit 2 ;;
+  esac
+  echo "build.sh: rebuilding in $tmp to verify reproducibility" >&2
+  tar -cf - --exclude=./.git --exclude=./.task --exclude=./target --exclude=./dist . \
+    | tar -xf - -C "$tmp"
+  docker_flag=()
+  if [ -n "$FORCE_DOCKER" ]; then docker_flag=(--docker); fi
+  ( cd "$tmp" && ./build.sh "${docker_flag[@]}" "--target=$ARCH" )
+  rebuilt=$(sha256sum < "$tmp/$OUT/task" | cut -d' ' -f1)
+  if [ "$built" != "$rebuilt" ]; then
+    # Preserve the mismatched binary before the temporary directory is removed.
+    cp "$tmp/$OUT/task" "$OUT/task.rebuild"
+    echo "build.sh: NOT reproducible — $built (first) != $rebuilt (rebuild)" >&2
+    echo "build.sh: kept the rebuild at $OUT/task.rebuild to diff against $OUT/task" >&2
+    exit 1
+  fi
+  echo "build.sh: reproducible — both builds are $built" >&2
+fi
+
+# Package only after verification succeeds.
 if [ -n "$PACKAGE" ]; then
   ./package.sh --platform "linux-$ARCH" --binary "$OUT/task" --out "$OUT"
 fi
