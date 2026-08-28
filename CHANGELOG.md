@@ -2,8 +2,11 @@
 
 ## Unreleased
 
+## v4.3.0 - 2026-08-28
+
 - **Linux release binaries are reproducible** — each release includes a
-  `task-linux-<arch>.build-info.txt` manifest for verifying a local rebuild.
+  `task-linux-<arch>.build-info.txt` manifest for verifying a local rebuild. See
+  [reproducible builds](https://github.com/wallix/task-rs/blob/main/docs/reference/reproducible-builds.md).
 
 ## v4.2.0 - 2026-08-27
 
