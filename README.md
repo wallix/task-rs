@@ -17,9 +17,14 @@ For a reproducible, statically linked (musl) release binary in `dist/task`, use 
 
 ```bash
 ./build.sh            # -> dist/task (+ dist/task.sha256)
+./build.sh --package  # + the release archive for this platform
+./build.sh --verify   # rebuild from a pristine copy and assert identical bytes
 ./lint.sh             # cargo clippy -D warnings
 ./fmt.sh              # cargo fmt
 ```
+
+Linux releases use the same script. See
+[reproducible builds](docs/reference/reproducible-builds.md) for verification.
 
 ## Templating: Go and Jinja
 

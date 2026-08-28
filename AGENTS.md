@@ -25,7 +25,7 @@ step.
 
 task-rs — the WALLIX fork of [Task](https://taskfile.dev), reimplemented in Rust
 and shipped as a single self-contained `task` binary (static-musl on Linux;
-`release.yml` also builds macOS and Windows targets). It was a fork of
+`build.yml` also builds macOS and Windows targets). It was a fork of
 [go-task/task](https://github.com/go-task/task) with opinionated changes aimed
 at build-system reliability (deterministic fingerprinting, distributed caching
 and locking, setup tasks); v4.0.0 is a full Rust rewrite of that fork.
@@ -69,8 +69,9 @@ directories instead.
 
 User-facing documentation lives in `docs/` — the guide, the getting-started /
 installation / FAQ / integrations / cache-server / style-guide /
-Taskfile-versions pages, and `reference/` for CLI, schema, templating and
-environment; a user-visible behaviour change updates it in the same commit.
+Taskfile-versions pages, and `reference/` for CLI, schema, templating,
+environment and reproducible builds; a user-visible behaviour change updates it
+in the same commit.
 
 ## Drop-in Compatibility Is a Hard Constraint
 
@@ -128,24 +129,38 @@ suite is the safety net for the compatibility constraint above.
 
 ### Build / container scripts
 
-Of the scripts below, the first four run inside the pinned devcontainer image
-(`.devcontainer/Dockerfile`, digest- and apk-pinned), each preferring a `vk` on
-`PATH` (dogfooding virtkit's microVM builder) and falling back to Docker;
-`--docker` forces the Docker backend. `update.sh` runs on the host, shelling
-out to `docker` to resolve the image digest and apk versions.
+`build.sh`, `lint.sh`, `fmt.sh` and `audit.sh` run inside the pinned
+devcontainer image. They use `vk` when available and fall back to Docker;
+`--docker` forces Docker. The `task-audit` image stage adds cargo-audit to the
+smaller `task-build` stage.
+`package.sh`, `release-notes.sh`, `update.sh` and `install-task.sh` run on the
+host; `update.sh` shells out to `docker` to resolve the image digest and apk
+versions.
 
 ```bash
 ./build.sh [--docker]     # reproducible static-musl binary -> dist/task (+ dist/task.sha256)
+           [--target=x86_64|aarch64]   # assert the host's arch; the build is native
+           [--package]    # + the release archive and sidecar for this platform
+           [--verify]     # rebuild from a pristine copy and assert identical bytes
+./package.sh --platform <name> --binary <path>   # deterministic release archive
+./release-notes.sh v<X.Y.Z>   # that tag's CHANGELOG section, for the release notes
 ./lint.sh  [--docker]     # cargo clippy --workspace --all-targets -- -D warnings
 ./fmt.sh   [--docker]     # cargo fmt (--check to verify)
 ./audit.sh [--docker]     # cargo-audit against the committed Cargo.lock
 ./update.sh               # bump the pinned toolchain + re-pin the base image and apk deps
+./install-task.sh         # the POSIX-sh installer published for end users
 ```
 
 `build.sh` output is a stripped static ELF that links no system C libraries
 (musl-static, rustls + ring). Rebuilding from the same commit must reproduce the
 same bytes — keep the pinning (toolchain, base image digest, apk versions,
 `SOURCE_DATE_EPOCH`, path remapping) intact when touching build inputs.
+
+`build.sh` compiles Linux releases natively for the host architecture.
+`package.sh` packs every platform on Linux so archive bytes use one toolchain.
+macOS and Windows binaries are reproducible only on the same runner image. See
+[`docs/reference/reproducible-builds.md`](docs/reference/reproducible-builds.md),
+and update it when the guarantee changes.
 
 ### Cutting a release
 
@@ -172,11 +187,18 @@ a published tag.
 
    `cargo test --workspace` is where `version_matches_changelog` ties the
    workspace version to the newest CHANGELOG heading.
-4. Commit as `task-rs: release <X.Y.Z>`, tag it `v<X.Y.Z>` (annotated), then
+4. Check the notes the release will carry: `./release-notes.sh v<X.Y.Z>` prints
+   the section `release.yml` will publish, and fails if the heading from step 1
+   is missing.
+5. Commit as `task-rs: release <X.Y.Z>`, tag it `v<X.Y.Z>` (annotated), then
    push the branch **first** — if that push is rejected, do not push the tag —
    and the tag after it. The tag must be `v` + the workspace version + the
    newest CHANGELOG heading, all three agreeing: `release.yml` takes the release
    notes from the matching `## v<X.Y.Z>` section.
+
+The workflow publishes only after all fourteen assets exist and both Linux
+binaries reproduce from a clean copy. Run `./build.sh --verify` before tagging
+when build inputs change.
 
 ## Code Quality Config
 
@@ -209,6 +231,9 @@ a published tag.
 `v*` tag) both call the reusable `quality.yml`, which runs fmt, clippy, `cargo
 test --workspace`, and `cargo audit --deny warnings`. Generated code **must**
 pass those checks.
+
+Both also call `build.yml`. CI runs its Linux jobs; releases run the full matrix
+with reproducibility verification, then publish using `release-notes.sh`.
 
 ## Commit Messages
 

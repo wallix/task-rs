@@ -54,6 +54,22 @@ For a reproducible, statically linked (musl) binary, use the container build:
 ./build.sh                        # -> dist/task (+ dist/task.sha256)
 ```
 
+## Verify a download
+
+Each release archive includes a `task-<os>-<arch>.sha256` checksum. To verify a
+Linux binary against its source, rebuild the tag and compare the published
+binary checksum:
+
+```shell
+git checkout v<X.Y.Z> && ./build.sh
+cd dist
+curl -fsSLO https://github.com/wallix/task-rs/releases/download/v<X.Y.Z>/task-linux-x86_64.build-info.txt
+sha256sum -c task-linux-x86_64.build-info.txt
+```
+
+See [reproducible builds](./reference/reproducible-builds.md) for platform
+coverage and archive verification.
+
 ## Setup completions
 
 You can run `task --completion <shell>` to output a completion script for any
