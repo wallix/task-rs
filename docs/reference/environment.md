@@ -6,62 +6,47 @@ outline: deep
 
 # Environment Reference
 
-Task has multiple ways of being configured. These methods are parsed, in
-sequence, in the following order with the highest priority last:
-
-- [Configuration files](./config.md)
-- _Environment variables_
-- [Command-line flags](./cli.md)
-
-In this document, we will look at the second of the three options, environment
-variables. All Task-specific variables are prefixed with `TASK_` and override
-their configuration file equivalents.
+Task-specific environment variables use the `TASK_` prefix. Equivalent
+[command-line flags](./cli.md) take priority.
 
 ## Variables
 
-All [configuration file options](./config.md) can also be set via environment
-variables. The priority order is: CLI flags > environment variables > config files > defaults.
+Priority: CLI flags > environment variables > defaults.
 
 ### `TASK_VERBOSE`
 
 - **Type**: `boolean` (`true`, `false`, `1`, `0`)
 - **Default**: `false`
 - **Description**: Enable verbose output for all tasks
-- **Config equivalent**: [`verbose`](./config.md#verbose)
 
 ### `TASK_SILENT`
 
 - **Type**: `boolean` (`true`, `false`, `1`, `0`)
 - **Default**: `false`
 - **Description**: Disables echoing of commands
-- **Config equivalent**: [`silent`](./config.md#silent)
 
 ### `TASK_COLOR`
 
 - **Type**: `boolean` (`true`, `false`, `1`, `0`)
 - **Default**: `true`
 - **Description**: Enable colored output
-- **Config equivalent**: [`color`](./config.md#color)
 
 ### `TASK_DISABLE_FUZZY`
 
 - **Type**: `boolean` (`true`, `false`, `1`, `0`)
 - **Default**: `false`
 - **Description**: Disable fuzzy matching for task names
-- **Config equivalent**: [`disable-fuzzy`](./config.md#disable-fuzzy)
 
 ### `TASK_CONCURRENCY`
 
 - **Type**: `integer`
 - **Description**: Limit number of tasks to run concurrently
-- **Config equivalent**: [`concurrency`](./config.md#concurrency)
 
 ### `TASK_FAILFAST`
 
 - **Type**: `boolean` (`true`, `false`, `1`, `0`)
 - **Default**: `false`
 - **Description**: When running tasks in parallel, stop all tasks if one fails
-- **Config equivalent**: [`failfast`](./config.md#failfast)
 
 ### `TASK_DRY`
 

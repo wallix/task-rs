@@ -26,8 +26,8 @@ project, but it can be overwhelming to be asked this question so often. Please
 be patient and avoid asking for ETAs.
 
 The best way to speed things up is to contribute to the project yourself. We
-always appreciate new contributors. If you are interested in contributing, check
-out the [contributing guide](./contributing.md).
+always appreciate new contributors — open an issue or a pull request on
+[the repository](https://github.com/wallix/task-rs).
 
 ## Why won't my task update my shell environment?
 
