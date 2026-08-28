@@ -1,7 +1,7 @@
 # Shell Coding Guidelines
 
-Applies to: `*.sh` (the build, package, lint, format, audit, update, and
-installer scripts at the repo root).
+Applies to: `*.sh` (the build, package, release-notes, lint, format, audit,
+update, and installer scripts at the repo root).
 
 See [`../coding-guidelines.md`](../coding-guidelines.md) for general conventions
 and formatting requirements that apply to all code.
