@@ -1,304 +1,338 @@
-# Task (WALLIX fork)
+# task-rs
 
-A [Task](https://taskfile.dev) runner, reimplemented in **Rust**. Originally a fork of [go-task/task](https://github.com/go-task/task) with opinionated changes focused on build-system reliability — deterministic fingerprinting, distributed caching and locking, and setup tasks — **v4.0.0 is a full Rust rewrite** of that fork. It stays drop-in compatible: the same Taskfile v3 schema, CLI flags, exit codes, and observable behaviour, verified by a black-box suite that ports the entire Go test corpus. Fingerprint checksums are byte-identical, so existing `.task` caches remain valid.
+**A Taskfile v3 runner for builds that need deterministic fingerprints, shared
+caches, and cross-machine locking.**
 
-Source: [github.com/wallix/task-rs](https://github.com/wallix/task-rs)
+This repository is the WALLIX fork of
+[Task](https://taskfile.dev), reimplemented in Rust and distributed as a single
+self-contained binary. It is intended for teams that already use Taskfiles but
+need stronger guarantees around incremental builds and CI reuse.
 
-## Building and installing
+The Rust rewrite preserves the Taskfile v3 schema, CLI flags, exit codes, and
+observable behaviour of the previous Go implementation. Its black-box test
+suite ports the Go test corpus, and its fingerprint checksums are
+byte-compatible with the pre-rewrite WALLIX fork, so existing `.task` state
+remains valid.
 
-Requires the Rust toolchain pinned in `rust-toolchain.toml`.
+This is not upstream Task. The fork deliberately removes a few features and
+changes some semantics; review
+[Compatibility and differences](#compatibility-and-differences) before
+replacing an upstream installation.
 
-```bash
-cargo build --release -p task        # debug: cargo build -p task
-cargo install --path crates/task     # install the `task` binary
-```
+## Quick start
 
-For a reproducible, statically linked (musl) release binary in `dist/task`, use the container build. It runs the compile inside the devcontainer image via virtkit (a `vk` binary on `PATH`) when available, otherwise Docker (`--docker` forces the Docker backend):
-
-```bash
-./build.sh            # -> dist/task (+ dist/task.sha256)
-./build.sh --package  # + the release archive for this platform
-./build.sh --verify   # rebuild from a pristine copy and assert identical bytes
-./lint.sh             # cargo clippy -D warnings
-./fmt.sh              # cargo fmt
-```
-
-Linux releases use the same script. See
-[reproducible builds](docs/reference/reproducible-builds.md) for verification.
-
-## Templating: Go and Jinja
-
-Taskfiles are rendered with [minijinja](https://github.com/mitsuhiko/minijinja). The classic Go `text/template` syntax (`{{.VAR}}`) still works, but a file can opt into **native Jinja** — `{% for %}`, `{% if %}`, filters, function-call syntax — with a top-level marker:
+Create `Taskfile.yml`:
 
 ```yaml
 version: '3'
 templater: jinja
-```
 
-The dialect is auto-detected per file when the marker is absent. Go syntax is **deprecated**: files using it emit a one-time warning (suppress with `TASK_NO_GO_DEPRECATION=1`) and will stop rendering in a future release. Convert a Taskfile in place:
-
-```bash
-task --migrate            # preview the Jinja conversion
-task --migrate --write    # apply it (adds `templater: jinja`)
-```
-
-## Changes from original Task v3
-
-### Removed
-
-- **Remote taskfiles** — `http://` and `git://` includes are no longer supported, along with their related CLI flags.
-- **Timestamp fingerprinting** — only checksum-based fingerprinting remains. The `method` field on tasks is removed.
-- **`none` fingerprint method** — tasks either use checksum fingerprinting or have no `sources`.
-
-### Added
-
-#### Setup tasks
-
-A new `setup` field runs tasks **unconditionally and sequentially** before deps and fingerprint checks. Unlike deps, setup tasks always run regardless of whether the parent is up-to-date, and they do **not** affect the parent's fingerprint. Use `run: once` to avoid re-executing shared setup tasks.
-
-```yaml
 tasks:
-  enforce-version:
-    run: once
+  test:
+    desc: Run the test suite
     cmds:
-      - date +%Y-%m-%d > version.txt
+      - go test ./...
 
   build:
-    setup:
-      - enforce-version
+    desc: Build the application
+    sources:
+      - '**/*.go'
+      - go.mod
+      - go.sum
+    generates:
+      - bin/app
+    cmds:
+      - go build -o bin/app ./cmd/app
+```
+
+Then run:
+
+```console
+$ task --list
+$ task build
+```
+
+The second `task build` is skipped when the inputs, commands, variables, and
+generated output still match the saved fingerprint.
+
+Start with the [getting-started guide](docs/getting-started.md), then use the
+[user guide](docs/guide.md) for Taskfile discovery, variables, includes, and
+command-line usage. The full accepted shape is covered by the
+[schema reference](docs/reference/schema.md).
+
+## Installation
+
+Download the archive for your platform from
+[GitHub Releases](https://github.com/wallix/task-rs/releases), extract `task`,
+or `task.exe` on Windows, and place it on your `PATH`. Archives are published
+for Linux, macOS, and Windows on x86-64 and ARM64, with a SHA-256 sidecar for
+each archive.
+
+An installed binary can update itself:
+
+```bash
+task --update              # latest release
+task --update=4.3.0        # a specific release
+task --update --check      # check without installing
+```
+
+The updater verifies the published checksum and runs the downloaded binary to
+confirm its version before replacing the current executable. It asks for
+confirmation unless `--yes` is supplied.
+
+To build from source, use the toolchain pinned in `rust-toolchain.toml`:
+
+```bash
+cargo install --path crates/task
+```
+
+The [installation guide](docs/installation.md) also covers shell completions,
+download verification, and reproducible builds.
+
+## Why this fork exists
+
+Taskfiles are useful as a readable, repository-local interface to development
+and CI commands. The difficult part is deciding when work can safely be skipped
+and making that decision hold when several machines build the same revision.
+This fork concentrates on that problem.
+
+### Deterministic incremental builds
+
+A task fingerprint covers its sources, generated files, compiled commands, and
+variable data. Source and output staleness are reported separately, and
+`task --status` exposes the decision without executing the task:
+
+```bash
+task --status build
+task --status --json build
+```
+
+Only checksum-based fingerprinting is supported. Timestamp and `none` methods
+were removed because they weaken the relationship between declared inputs and
+the result.
+
+### Build cache
+
+A task can restore its generated files instead of running. Cache URLs are
+templates, so the source checksum can be part of the key:
+
+```yaml
+version: '3'
+templater: jinja
+
+tasks:
+  build:
+    sources:
+      - src/**/*.ts
+      - package.json
+      - yarn.lock
+    generates:
+      - dist/**/*
+    cache:
+      url: 'file:///var/cache/task/build-{{ CHECKSUM }}.zip'
+    cmds:
+      - yarn build
+```
+
+Two storage backends are available:
+
+- `file://` stores a ZIP archive on a local or mounted filesystem.
+- `oci://` stores content-defined, zstd-compressed chunks in an OCI registry.
+  Unchanged chunks are reused across cache entries, and a local content store
+  makes repeated restores incremental.
+
+For CI systems that move state as an artifact rather than expose a shared cache
+service, fingerprint state and generated files can be exported together:
+
+```bash
+task --export-cache state.zip build test
+task --import-cache state.zip
+```
+
+See [Setting up a cache server](docs/cache-server.md) for an OCI registry
+deployment and credential configuration.
+
+### Build-once locking
+
+Tasks with both `sources` and `generates` are protected by a local advisory file
+lock. The lock includes the task name and source hash, so equivalent builds are
+serialized while different inputs remain independent.
+
+Set `cache.lock` to coordinate across machines:
+
+- `redis://` uses a renewable Redis lease.
+- `vk://` and `vks://` use the vk-registry lock API; use `vks://` when
+  credentials cross an untrusted network.
+- `file://` places the lock in an explicitly selected shared directory.
+
+If a distributed lock cannot be acquired because its service is unavailable,
+Task warns and falls back to a local lock. If a held lease is lost, it does not
+publish the resulting fingerprint or cache entry.
+
+### Setup tasks
+
+`setup` is for preparation that must happen before the parent task is checked.
+Setup tasks run sequentially and unconditionally, even when the parent is
+already up to date. They do not become part of the parent's fingerprint; use
+`run: once` for setup shared by several tasks.
+
+```yaml
+version: '3'
+templater: jinja
+
+tasks:
+  version-file:
+    run: once
+    cmds:
+      - git describe --always > version.txt
+
+  build:
+    setup: [version-file]
     sources:
       - version.txt
       - src/**/*.go
     generates:
       - bin/app
     cmds:
-      - go build -ldflags "-X main.buildDate=$(cat version.txt)" -o bin/app .
+      - go build -ldflags "-X main.version=$(cat version.txt)" -o bin/app .
 ```
 
-#### Fingerprint-based generates
+### Large generated trees
 
-For large generated directories where hashing every file is expensive, a `generates` entry can specify a **fingerprint** file — a single representative file used for checksum-based up-to-date detection instead of hashing every file matched by the glob. The full glob is still used for cache operations (save/restore), so all files are archived correctly.
-
-Four YAML forms are supported in `sources` and `generates`:
+Hashing every file in a large output directory can cost more than the staleness
+check is worth. A `generates` entry may name one representative fingerprint
+file while retaining the full glob for cache save and restore:
 
 ```yaml
 generates:
-  # Scalar: simple glob pattern (hashes all matched files)
-  - "build/**/*"
-
-  # Exclude: negated pattern
-  - exclude: "build/tmp/**"
-
-  # Glob + fingerprint: the glob defines the full set of files for caching,
-  # while fingerprint names a single file for up-to-date checks.
-  - glob: "node_modules/**/*"
-    fingerprint: "node_modules/.yarn-state.yml"
-
-  # From: inherit entries from related tasks (see "Inherited sources/generates")
-  - from: deps
+  - glob: node_modules/**/*
+    fingerprint: node_modules/.yarn-state.yml
 ```
 
-**Example: yarn install with fingerprint**
-
-```yaml
-tasks:
-  install:
-    sources:
-      - package.json
-      - yarn.lock
-    generates:
-      - glob: "node_modules/**/*"
-        fingerprint: "node_modules/.yarn-state.yml"
-    cmds:
-      - yarn install --immutable
-```
-
-Here `node_modules/` may contain thousands of files, but only `.yarn-state.yml` is hashed for staleness checks. When caching is enabled, the full `node_modules/**/*` glob (plus the fingerprint dotfile) is archived.
-
-**Example: mixed generates with caching**
-
-```yaml
-tasks:
-  build:
-    sources:
-      - src/**/*.ts
-      - package.json
-    generates:
-      - "dist/**/*"
-      - glob: "node_modules/**/*"
-        fingerprint: "node_modules/.yarn-state.yml"
-      - exclude: "dist/tmp/**"
-    cache:
-      url: 'file:///tmp/cache/build-{{.CHECKSUM}}.zip'
-    cmds:
-      - npm run build
-```
-
-#### Inherited sources/generates (`from: deps` and `from: cmds`)
-
-Wrapper tasks can inherit `sources` and `generates` from their dependencies or cmd task-calls using the `from:` directive. This avoids duplicating glob patterns across tasks and ensures cache keys reflect the full input/output set. Entries are deduplicated automatically.
-
-**`from: deps`** — copies entries from all direct dependencies:
+`sources` and `generates` may also inherit entries from direct dependencies or
+task calls. This keeps wrapper tasks aligned with the work they aggregate:
 
 ```yaml
 tasks:
   all:
+    deps: [frontend, backend]
     sources:
       - from: deps
     generates:
       - from: deps
-    cache:
-      url: 'file:///tmp/cache/all-{{.CHECKSUM}}.zip'
-    deps:
-      - build-a
-      - build-b
-
-  build-a:
-    sources: [src/a/**/*.go]
-    generates: [bin/a]
-    cmds: [go build -o bin/a ./cmd/a]
-
-  build-b:
-    sources: [src/b/**/*.go]
-    generates: [bin/b]
-    cmds: [go build -o bin/b ./cmd/b]
 ```
 
-**`from: cmds`** — copies entries from all cmd task-calls:
+Use `from: cmds` instead when the related tasks are invoked through `cmds`.
+Literal globs and inherited entries can be combined, and duplicates are removed
+automatically.
+
+## Templating
+
+New Taskfiles should use the native Jinja dialect explicitly:
 
 ```yaml
+version: '3'
+templater: jinja
+
+vars:
+  OUTPUT: dist/{{ OS() }}/app
+
 tasks:
   build:
-    sources:
-      - from: cmds
-    generates:
-      - from: cmds
     cmds:
-      - task: compile
-      - task: link
-
-  compile:
-    sources: [src/**/*.c]
-    generates: [build/**/*.o]
-    cmds: [make compile]
-
-  link:
-    sources: [build/**/*.o]
-    generates: [bin/app]
-    cmds: [make link]
+      - '{% if CI %}echo building in CI{% endif %}'
+      - go build -o {{ OUTPUT }} .
 ```
 
-Literal globs and `from:` entries can be mixed freely:
+Jinja mode supports expressions, conditionals, loops, filters, and normal
+function-call syntax through
+[minijinja](https://github.com/mitsuhiko/minijinja).
 
-```yaml
-sources:
-  - config.yml        # own source
-  - from: deps        # plus all dep sources
-```
-
-#### Per-task cache block (`file://` and `oci://` backends)
-
-Cache generated files so that subsequent runs (or other machines) can skip execution entirely. The `url` and `lock` fields are rendered with the active templater (Go or Jinja), with access to all task variables plus `{{.CHECKSUM}}` (SHA256 of sources, commands, and generates).
-
-```yaml
-tasks:
-  build:
-    sources:
-      - src/**/*.go
-    generates:
-      - bin/app
-    cache:
-      enabled: '{{ne .REDIS_URL ""}}'         # optional, template bool
-      url: 'file:///tmp/cache/build-{{.CHECKSUM}}.zip'
-      lock: 'redis://{{.REDIS_URL}}/lock:build-{{.CHECKSUM}}'
-    cmds:
-      - go build -o bin/app .
-```
-
-**OCI registry backend.** With an `oci://` URL the entry is stored as an OCI artifact: files are cut into content-defined chunks (FastCDC), compressed with zstd, and pushed as individual blobs that the registry deduplicates by digest. Saving a slightly changed `node_modules` or VM image only uploads the new chunks; pulls go through a local chunk store so repeated restores are incremental. The chunk store defaults to `$XDG_CACHE_HOME/task/ocicas` (falling back to `~/.cache/task/ocicas`) and is created on demand — no configuration needed; override it with `?cas=<dir>` or `TASK_CACHE_OCI_CAS_DIR`. Entries expire through the registry's retention policy (no TTL).
-
-```yaml
-cache:
-  url: 'oci://registry.example.com/task-cache:{{urlsafe .TASK}}-{{.CHECKSUM}}?ca=/etc/ssl/registry-ca.crt'
-```
-
-The URL shape is `oci://[user:password@]host/repo:tag[?ca=<file>][&cas=<dir>][&plainhttp=1]` (the tag carries the cache key and is limited to `[A-Za-z0-9._-]`). Credentials and trust can also come from the environment — `TASK_CACHE_OCI_USER`, `TASK_CACHE_OCI_PASSWORD`, `TASK_CACHE_OCI_CA` and `TASK_CACHE_OCI_CAS_DIR` — keeping secrets out of the Taskfile.
-
-See [docs/cache-server.md](docs/cache-server.md) for setting up the server side (a Harbor registry for the cache entries plus a Redis for the distributed locks).
-
-#### Filesystem-based locking
-
-Tasks with `sources` and `generates` automatically acquire a POSIX advisory file lock (stored in `.task/`). The lock key is `taskname:sourcehash`, so different source states don't contend on the same lock.
-
-#### Redis-based distributed locking
-
-When `cache.lock` evaluates to a `redis://` URL, locking is distributed across machines using Redis `SET NX EX` with TTL-based heartbeat renewal. If Redis is unreachable, the lock falls back to the local file lock so a Redis outage degrades to local locking rather than failing the build.
-
-#### `urlsafe` template function
-
-`{{urlsafe .TASK}}` percent-encodes a string for use in URLs, replacing special characters like colons from namespaced task names. Useful in cache URLs:
-
-```yaml
-cache:
-  url: 'file:///tmp/cache/{{urlsafe .TASK}}-{{.CHECKSUM}}.zip'
-```
-
-#### `--status` flag
-
-Show fingerprint status of tasks without running them:
+The legacy Go `text/template` dialect remains available for compatibility but
+is deprecated. Files without an explicit `templater` are auto-detected per
+file. Convert them before Go rendering is removed:
 
 ```bash
-task --status build           # human-readable
-task --status --json build    # machine-readable
+task --migrate          # preview on stdout
+task --migrate --write  # rewrite the Taskfile in place
 ```
 
-#### `--export-cache` and `--import-cache`
+See the [templating reference](docs/reference/templating.md) for dialect
+selection, supported functions, and migration limitations.
 
-Portable fingerprint state for CI/CD pipelines:
+## Compatibility and differences
 
-```bash
-# On build machine
-task --export-cache state.zip build test
+The compatibility target is Taskfile v3, including its command-line surface
+and observable runner behaviour. The following differences from upstream Task
+v3 are intentional.
 
-# On CI machine
-task --import-cache state.zip
-```
+### Removed
 
-Exports checksum state and generated files for up-to-date tasks as a ZIP archive.
+- Remote `http://` and `git://` Taskfile includes and their CLI flags.
+- Timestamp fingerprinting and the task-level `method` field.
+- The `none` fingerprint method.
 
-#### `--update` flag
+### Added
 
-Replace the running binary with a published [release](https://github.com/wallix/task-rs/releases):
-
-```bash
-task --update              # install the latest release
-task --update=4.1.0        # install a specific version (an older one downgrades)
-task --update --check      # report what is available; exits 1 if newer, installing nothing
-task --update --yes        # skip the confirmation prompt
-```
-
-It prints what it is about to install and asks first, unless `--yes` is given. The archive is checked against the `.sha256` published beside it and the binary it carries has to report its own version before it replaces the one in place, so a corrupted transfer or a foreign build never gets installed. Needs write access to the install directory; a run already in flight is unaffected.
+- Unconditional, sequential `setup` tasks.
+- File and OCI build-cache backends with local or distributed locking.
+- Representative fingerprint files for large `sources` or `generates` globs.
+- `from: deps` and `from: cmds` inheritance for sources and generated files.
+- `--status`, `--export-cache`, `--import-cache`, and self-update commands.
+- Native Jinja templating and an automated migration path from Go templates.
+- Duplicate YAML task keys are errors instead of last-definition-wins.
 
 ### Changed
 
-- **`--force` no longer cascades** — `--force` only forces the directly called task; dependent tasks still check their status. Use `--force-all` to force everything (previously the default `--force` behavior).
-- **A dependency cycle is reported as one** — naming the path (`a -> b -> a`) rather than running until the process ran out of stack. A task counts as repeating only if it reaches itself with the same compiled body, so calling itself with different `vars:` still works; recursion that progresses only through external state (a counter in a file) is rejected.
-- **Ctrl-C reaches the commands** — the second press is passed on to them and the third stops them before exiting, where Task v3 only reports and exits.
-- **A `SIGTERM` stops the run at once, exiting `1`** — it comes from a supervisor rather than a terminal, so there is no second signal to wait for. Task v3 escalates it like a Ctrl-C, which leaves a `SIGTERM`-then-`SIGKILL` supervisor with no cleanup at all. Ctrl-C keeps its escalation. Note the exit code: v4.0.0 died of the signal and reported `143`.
+- Task-defined `env` and `vars` override the inherited process environment by
+  default. Set `TASK_X_ENV_PRECEDENCE=0` to restore process-environment
+  precedence.
+- `--force` applies only to tasks named on the command line. Use `--force-all`
+  to force their dependencies as well.
+- Dependency cycles fail with the cycle path instead of recursing until the
+  process exhausts its stack. Self-calls with a different compiled body remain
+  valid; recursion driven only by external state is rejected.
+- Ctrl-C is escalated through running commands. `SIGTERM` stops the run
+  immediately and exits with status `1`.
+- Fingerprints include commands and variables as well as file contents, and
+  report source and generated-output staleness independently.
 
-### Improved
+For release-specific compatibility notes, including migration fixes and known
+gaps, read the [changelog](CHANGELOG.md).
 
-- **Richer fingerprints** — checksums now include serialized commands and variable data, not just file contents.
-- **Separate staleness reporting** — `sources` and `generates` staleness is tracked and reported independently.
+## Reproducible releases
 
-## Execution pipeline
+Linux release binaries are built as static musl executables from pinned inputs
+and are reproducible from their tagged source. Each Linux release includes a
+build manifest containing the binary digest. macOS and Windows binaries are
+reproducible only on the same pinned runner image.
 
+The exact guarantees and verification commands are documented in
+[Reproducible builds](docs/reference/reproducible-builds.md).
+
+## Contributing
+
+The workspace contains the runner library (`taskcore`), the CLI (`task`), and
+the OCI content-addressed store (`ocicas`). A normal edit loop uses the pinned
+Rust toolchain:
+
+```bash
+cargo check -p taskcore
+cargo test -p taskcore --lib
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 ```
-setup tasks (unconditional, sequential)
-  -> acquire lock (file or redis)
-  -> run deps (parallel)
-  -> check fingerprint (sources + generates, including from: resolution)
-     -> try restore from cache (file://, redis:// or oci://)
-     -> if miss: execute task, then save to cache
-  -> release lock
+
+Run the complete compatibility suite before submitting a change:
+
+```bash
+cargo test --workspace
 ```
+
+Changes to Taskfile behaviour must preserve upstream compatibility or document
+an intentional divergence. See [AGENTS.md](AGENTS.md) for the architecture,
+development workflow, and review constraints.
+
+## License
+
+[Apache License 2.0](LICENSE)
