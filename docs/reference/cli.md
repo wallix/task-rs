@@ -104,7 +104,8 @@ similar.
 
 #### `-h, --help`
 
-Show help information.
+Show the command usage, positional arguments, every available option with its
+description, and a hint for listing all tasks.
 
 ```bash
 task --help

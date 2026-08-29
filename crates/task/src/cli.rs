@@ -7,6 +7,9 @@ use clap::Parser;
 const ABOUT: &str = "Runs the specified task(s). Falls back to the \"default\" task if no task name \
 was specified, or lists all tasks if an unknown task name was specified.";
 
+/// The footer shown after the option list.
+const AFTER_HELP: &str = "Run 'task --list-all' to see the available tasks.";
+
 /// The parsed command-line arguments.
 ///
 /// Positional arguments carry task names and `VAR=value` overrides; everything
@@ -15,6 +18,8 @@ was specified, or lists all tasks if an unknown task name was specified.";
 #[command(
     name = "task",
     about = ABOUT,
+    after_help = AFTER_HELP,
+    override_usage = "task [flags...] [task...] [-- CLI_ARGS...]",
     disable_help_flag = true,
     disable_version_flag = true
 )]
@@ -196,13 +201,12 @@ pub struct Cli {
     #[arg(long)]
     pub check: bool,
 
-    /// Task names and `VAR=value` overrides. Arguments after `--` are collected
-    /// separately as pass-through CLI args.
-    #[arg(trailing_var_arg = false)]
+    /// Task names to run, plus `VAR=value` overrides.
+    #[arg(value_name = "TASK", trailing_var_arg = false)]
     pub args: Vec<String>,
 
-    /// Pass-through arguments given after `--`, exposed as `CLI_ARGS`.
-    #[arg(last = true)]
+    /// Arguments after `--`, passed to the task as `CLI_ARGS`.
+    #[arg(value_name = "CLI_ARGS", last = true)]
     pub cli_args: Vec<String>,
 }
 

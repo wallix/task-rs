@@ -1,0 +1,103 @@
+Runs the specified task(s). Falls back to the "default" task if no task name was specified, or lists
+all tasks if an unknown task name was specified.
+
+Usage: task [flags...] [task...] [-- CLI_ARGS...]
+
+Arguments:
+  [TASK]...      Task names to run, plus `VAR=value` overrides
+  [CLI_ARGS]...  Arguments after `--`, passed to the task as `CLI_ARGS`
+
+Options:
+      --version
+          Show Task version
+  -h, --help
+          Shows Task usage
+      --init
+          Creates a new Taskfile.yml in the current folder
+      --completion <SHELL>
+          Generates shell completion script
+      --schema
+          Prints the JSON Schema for Taskfiles to stdout
+  -l, --list
+          Lists tasks with description of current Taskfile
+  -a, --list-all
+          Lists tasks with or without a description
+  -j, --json
+          Formats task list as JSON
+      --sort <SORT>
+          Changes the order of the tasks when listed. [default|alphanumeric|none]
+      --nested
+          Nest namespaces when listing tasks as JSON
+  -w, --watch
+          Enables watch of the given task
+  -v, --verbose
+          Enables verbose mode
+  -s, --silent
+          Disables echoing
+      --disable-fuzzy
+          Disables fuzzy matching for task names
+  -y, --yes
+          Assume "yes" as answer to all prompts
+      --interactive
+          Prompt for missing required variables
+  -p, --parallel
+          Executes tasks provided on command line in parallel
+  -n, --dry
+          Compiles and prints tasks in the order that they would be run, without executing them
+      --status
+          Show fingerprint status of the given task(s)
+      --summary
+          Show summary about a task
+  -x, --exit-code
+          Pass-through the exit code of the task command
+  -d, --dir <DIR>
+          Sets the directory in which Task will execute and look for a Taskfile
+  -t, --taskfile <TASKFILE>
+          Choose which Taskfile to run. Defaults to "Taskfile.yml"
+  -o, --output <OUTPUT>
+          Sets output style: [interleaved|group|prefixed]
+      --output-group-begin <OUTPUT_GROUP_BEGIN>
+          Message template to print before a task's grouped output
+      --output-group-end <OUTPUT_GROUP_END>
+          Message template to print after a task's grouped output
+      --output-group-error-only
+          Swallow output from successful tasks
+  -c, --color
+          Colored output. Enabled by default. Set --no-color or NO_COLOR=1 to disable
+      --no-color
+          Disables colored output
+  -C, --concurrency <CONCURRENCY>
+          Limit number of tasks to run concurrently [default: 0]
+  -I, --interval <INTERVAL>
+          Interval to watch for changes (e.g. 500ms, 1s)
+  -F, --failfast
+          When running tasks in parallel, stop all tasks if one fails
+  -g, --global
+          Runs global Taskfile, from $HOME/{T,t}askfile.{yml,yaml}
+  -f, --force
+          Forces execution of the directly called task
+      --force-all
+          Forces execution of the called task and all its dependent tasks
+      --export-cache <PATH>
+          Exports generated files and fingerprint state to a zip file
+      --import-cache <PATH>
+          Imports generated files and fingerprint state from a zip file
+      --migrate
+          Converts the Taskfile(s) from Go template syntax to native Jinja and adds a `templater:
+          jinja` marker. Prints the result by default; use --write to apply in place. Targets the
+          given file paths, or the resolved Taskfile
+      --write
+          With --migrate, rewrites the file(s) in place instead of printing
+      --update[=<VERSION>]
+          Replaces this task binary with a published GitHub release build: the latest release, or
+          `--update=<VERSION>` for a specific one (an older one downgrades). Prints what it is about
+          to install and asks before touching anything, unless --yes is given; the download is
+          checked against the digest published beside it and must report its own version before it
+          replaces the running binary. A symlinked install has its target replaced. Needs write
+          access to the directory task is installed in. Exit: 0 up to date, installed, or declined;
+          1 a newer release is available (--check); 2 the update or check itself failed
+      --check
+          With --update, reports whether a newer release is available and exits, downloading and
+          installing nothing
+
+Run 'task --list-all' to see the available tasks.

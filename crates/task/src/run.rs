@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use taskcore::ast::{self, Var};
 use taskcore::call::Call;
 use taskcore::executor::{Executor, ExecutorError, TaskSummary};
@@ -545,14 +545,8 @@ fn quote_join(args: &[String]) -> String {
         .join(" ")
 }
 
-/// Prints the top-level usage text. Ports the Go `usage` string header plus a
-/// hint to run `--list-all`.
+/// Prints the top-level help: usage, description, the full flag list and the
+/// `--list-all` hint, all rendered by clap.
 fn print_usage() {
-    println!(
-        "Usage: task [flags...] [task...]\n\n\
-Runs the specified task(s). Falls back to the \"default\" task if no task name\n\
-was specified, or lists all tasks if an unknown task name was specified.\n\n\
-Run 'task --list-all' to see the available tasks.\n\
-Run 'task --help' via clap for the full flag list."
-    );
+    print!("{}", Cli::command().render_help());
 }

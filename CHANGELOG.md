@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **`task --help` lists the flags** — it now prints the usage line, every
+  option with its description, and the hint to run `task --list-all`, instead of
+  a short blurb that pointed back at `--help` for the flag list.
+
 ## v4.3.0 - 2026-08-28
 
 - **Linux release binaries are reproducible** — each release includes a
