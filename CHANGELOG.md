@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.3.1 - 2026-08-30
+
 - **`task --help` lists the flags** — it now prints the usage line, every
   option with its description, and the hint to run `task --list-all`, instead of
   a short blurb that pointed back at `--help` for the flag list.
