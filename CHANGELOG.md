@@ -21,6 +21,8 @@
 - **A `vk://` lock is released when its task finishes.** It used to stay held
   until its lease expired, making a peer waiting on the same build wait up to
   30 s longer than needed.
+- **An `oci://` cache miss is quiet.** A tag the registry does not have was
+  reported as a registry error in verbose output on every miss.
 
 ## v4.3.2 - 2026-09-02
 

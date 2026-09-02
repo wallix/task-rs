@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientProtocol};
-use oci_client::errors::OciDistributionError;
+use oci_client::errors::{OciDistributionError, OciErrorCode};
 use oci_client::manifest::{OciDescriptor, OciImageManifest, OciManifest};
 use oci_client::{Client, Reference};
 use tokio::sync::Semaphore;
@@ -198,7 +198,7 @@ impl Store {
             Ok((OciManifest::ImageIndex(_), _)) => Err(Error::format(format!(
                 "{tag} is an image index, not an artifact"
             ))),
-            Err(OciDistributionError::ImageManifestNotFoundError(_)) => Ok(None),
+            Err(e) if is_missing(&e) => Ok(None),
             Err(e) => Err(oci_err(e)),
         }
     }
@@ -633,6 +633,24 @@ fn read_cas(dir: &Path, digest: &str) -> Result<Vec<u8>> {
     Ok(data)
 }
 
+/// Whether a manifest fetch failed because the tag is not there — a cache miss,
+/// not an error. `oci-client` only reports `ImageManifestNotFoundError` from
+/// its image-index resolution; a registry's own 404 arrives as the OCI error
+/// envelope (`MANIFEST_UNKNOWN`, or `NAME_UNKNOWN` for a repository nothing has
+/// been pushed to yet).
+fn is_missing(e: &OciDistributionError) -> bool {
+    match e {
+        OciDistributionError::ImageManifestNotFoundError(_) => true,
+        OciDistributionError::RegistryError { envelope, .. } => envelope.errors.iter().any(|err| {
+            matches!(
+                err.code,
+                OciErrorCode::ManifestUnknown | OciErrorCode::NameUnknown
+            )
+        }),
+        _ => false,
+    }
+}
+
 fn oci_err(e: OciDistributionError) -> Error {
     // `RequestError` is transparent over the `reqwest` error, so its chain
     // carries the same reason a direct request's does.
@@ -683,5 +701,28 @@ mod tests {
         assert_eq!(seen[0].path, "/v2/");
         // base64("ci:s3cret")
         assert_eq!(seen[0].authorization.as_deref(), Some("Basic Y2k6czNjcmV0"));
+    }
+
+    fn registry_error(code: &str) -> OciDistributionError {
+        let envelope: oci_client::errors::OciEnvelope = serde_json::from_str(&format!(
+            r#"{{"errors":[{{"code":"{code}","message":"x"}}]}}"#
+        ))
+        .expect("envelope");
+        OciDistributionError::RegistryError {
+            envelope,
+            url: "https://reg/v2/r/manifests/t".to_string(),
+        }
+    }
+
+    /// A registry's 404 envelope is a miss; anything else it reports is an error.
+    #[test]
+    fn a_missing_manifest_is_a_miss_not_an_error() {
+        assert!(is_missing(&registry_error("MANIFEST_UNKNOWN")));
+        assert!(is_missing(&registry_error("NAME_UNKNOWN")));
+        assert!(!is_missing(&registry_error("UNAUTHORIZED")));
+        assert!(!is_missing(&registry_error("DENIED")));
+        assert!(is_missing(
+            &OciDistributionError::ImageManifestNotFoundError("x".to_string())
+        ));
     }
 }
