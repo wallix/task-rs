@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Match files with trailing `**` globs** — `target/**` now matches the same
+  files as `target/**/*`, restoring Go Task and bash `globstar` compatibility
+  for `sources:`, `generates:`, and `exclude:` patterns. These patterns
+  previously matched nothing.
 - **Exclude build directories without scanning them** — an `exclude:` such as
   `target/**/*` skips matching trees, keeping large excludes fast without
   changing the matched file set.

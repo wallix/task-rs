@@ -10,7 +10,8 @@
 //! - `*` and `?` match within a single path segment and never match a leading
 //!   dot (dotfiles are hidden).
 //! - `[...]` bracket expressions match a single character within a segment.
-//! - `**` as a whole segment matches zero or more directory levels.
+//! - `**` as a whole segment matches zero or more directory levels; a trailing
+//!   `**` also matches every file below, like bash and mvdan.
 //! - literal segments match verbatim.
 
 use std::collections::BTreeSet;
@@ -147,15 +148,15 @@ fn expand(pattern: &str, pruners: &[Pruner]) -> Vec<String> {
     results.into_iter().collect()
 }
 
-/// Applies a negated `<prefix>/**/*` pattern while walking includes by refusing
-/// to enter directories matching `prefix`.
+/// Skips directories covered by a negated `<prefix>/**/*` or `<prefix>/**`
+/// pattern while walking includes.
 ///
 /// Pruning preserves `included - excluded`: the exclude would remove every
 /// skipped path. Because `**/*` cannot reach dot-prefixed descendants,
 /// [`Pruner::new`] rejects pruning when an include can name one below a covered
 /// directory.
 struct Pruner {
-    /// Pattern segments before the trailing `**/*`, including the walk's root
+    /// Pattern segments before the trailing `**`, including the walk's root
     /// marker (`""` for absolute patterns and `"."` for relative ones).
     prefix: Vec<String>,
 }
@@ -163,9 +164,10 @@ struct Pruner {
 impl Pruner {
     fn new(pattern: &str, includes: &[&str]) -> Option<Self> {
         let segments = rooted_segments(pattern);
-        let (&"*", mut prefix) = segments.split_last()? else {
-            return None;
-        };
+        let mut prefix = segments.as_slice();
+        if let Some((&"*", rest)) = prefix.split_last() {
+            prefix = rest;
+        }
         let mut stars = 0usize;
         while let Some((&"**", rest)) = prefix.split_last() {
             prefix = rest;
@@ -315,11 +317,7 @@ impl Walker<'_> {
             // `**` matches zero or more directory levels. Match here (zero
             // levels) then descend into every subdirectory.
             self.walk(base, rest);
-            for child in list_dir(base) {
-                if Path::new(&child).is_dir() && self.enter(&child) {
-                    self.walk_double_star(&child, rest);
-                }
-            }
+            self.descend_double_star(base, rest);
             return;
         }
 
@@ -351,9 +349,20 @@ impl Walker<'_> {
     /// apply the remaining segments here and keep descending.
     fn walk_double_star(&mut self, base: &str, rest: &[&str]) {
         self.walk(base, rest);
+        self.descend_double_star(base, rest);
+    }
+
+    /// Descends into every subdirectory for `**`. When `**` is trailing, it
+    /// also emits each file it passes, making `a/**` equivalent to `a/**/*` as
+    /// in bash and mvdan.
+    fn descend_double_star(&mut self, base: &str, rest: &[&str]) {
         for child in list_dir(base) {
-            if Path::new(&child).is_dir() && self.enter(&child) {
-                self.walk_double_star(&child, rest);
+            if Path::new(&child).is_dir() {
+                if self.enter(&child) {
+                    self.walk_double_star(&child, rest);
+                }
+            } else if rest.is_empty() {
+                self.out.push(child);
             }
         }
     }
@@ -598,6 +607,14 @@ mod tests {
         ];
         let files = globs(&dir, &patterns).unwrap();
         assert_eq!(files, vec![join(&dir, "src/a.rs")]);
+
+        // A trailing `**` exclude must also remove the injected fingerprint.
+        let bare = [
+            g("**/*.rs"),
+            g_fp("build/**", "build/gen/fp.txt"),
+            g_neg("build/gen/**"),
+        ];
+        assert_eq!(globs(&dir, &bare).unwrap(), vec![join(&dir, "src/a.rs")]);
     }
 
     #[test]
@@ -662,6 +679,26 @@ mod tests {
             files,
             vec![join(&dir, "build/app.js"), join(&dir, "build/sub/x.js")]
         );
+    }
+
+    #[test]
+    fn trailing_double_star_matches_files() {
+        let dir = tmp();
+        write_file(&dir, "target/a", "a");
+        write_file(&dir, "target/sub/b", "b");
+        write_file(&dir, "target/.hidden/c", "c");
+        write_file(&dir, "target/sub/.d", "d");
+        write_file(&dir, "other/e", "e");
+        let expected = vec![join(&dir, "target/a"), join(&dir, "target/sub/b")];
+        assert_eq!(glob(&dir, "target/**").unwrap(), expected);
+        assert_eq!(glob(&dir, "target/**/*").unwrap(), expected);
+        assert_eq!(
+            glob(&dir, "target/*").unwrap(),
+            vec![join(&dir, "target/a")]
+        );
+
+        let files = globs(&dir, &[g("**/*"), g_neg("target/**")]).unwrap();
+        assert_eq!(files, vec![join(&dir, "other/e")]);
     }
 
     #[test]
@@ -756,7 +793,9 @@ mod tests {
         // These patterns do not cover a whole directory.
         assert!(Pruner::new("/w/target/**/*.o", &inc).is_none());
         assert!(Pruner::new("/w/target/*", &inc).is_none());
-        assert!(Pruner::new("/w/target/**", &inc).is_none());
+        // Both forms cover the same files.
+        assert!(Pruner::new("/w/target/**", &inc).is_some());
+        assert!(Pruner::new("/w/target/**/**", &inc).is_some());
         // This covers each child directory at depth 2 or greater under `target`.
         assert!(Pruner::new("/w/target/**/*/**/*", &inc).is_some());
         // These would prune the walk root.
