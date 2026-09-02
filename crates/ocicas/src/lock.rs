@@ -29,6 +29,7 @@ use serde::Deserialize;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+use crate::auth::Auth;
 use crate::error::{Error, Result, with_causes};
 
 /// Lease requested on acquire; renewed by the heartbeat below.
@@ -47,20 +48,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// hangs on a registry that goes quiet mid-request.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How the lock client authenticates, matching the schemes the vk-registry
-/// server gates its `/lock/` API with (its `auth::Auth`: none, Basic, or a
-/// static bearer token).
-#[derive(Clone, Default)]
-enum LockAuth {
-    /// No credentials (loopback / trusted network).
-    #[default]
-    None,
-    /// HTTP Basic — from `vk://user:pass@host/...`.
-    Basic { user: String, pass: String },
-    /// Static bearer token — from `$TASK_VK_LOCK_TOKEN`.
-    Bearer { token: String },
-}
-
 /// A lock client against a vk-registry `/lock` API.
 pub struct Locker {
     /// `scheme://host`.
@@ -72,7 +59,8 @@ pub struct Locker {
     /// Interval between lease renewals ([`HEARTBEAT_FREQ`]; a test may shorten
     /// it to observe the heartbeat's decisions without waiting on it).
     heartbeat: Duration,
-    auth: LockAuth,
+    /// Basic from `vk://user:pass@host/...`, or the `$TASK_VK_LOCK_TOKEN` bearer.
+    auth: Auth,
     http: reqwest::Client,
 }
 
@@ -95,7 +83,7 @@ impl Locker {
         let auth = std::env::var("TASK_VK_LOCK_TOKEN")
             .ok()
             .filter(|t| !t.is_empty())
-            .map(|token| LockAuth::Bearer { token })
+            .map(|token| Auth::Bearer { token })
             .unwrap_or_default();
         Ok(Locker {
             base: base.into(),
@@ -138,7 +126,7 @@ impl Locker {
     /// default in place, so a credential-less URL still picks up the env token.
     pub fn with_basic_auth(mut self, user: &str, pass: Option<&str>) -> Self {
         if !user.is_empty() {
-            self.auth = LockAuth::Basic {
+            self.auth = Auth::Basic {
                 user: user.to_string(),
                 pass: pass.unwrap_or_default().to_string(),
             };
@@ -179,22 +167,23 @@ impl Locker {
     /// `POST /lock/acquire?name=<key>`. `wait` is how long the server may block
     /// before returning 409. Returns the owner token on 200, `None` on 409.
     async fn acquire(&self, key: &str, wait: Duration) -> Result<Option<String>> {
-        let resp = authorize(
-            self.http
-                .post(lock_url(&self.base, "acquire"))
-                .query(&[
-                    ("name", key),
-                    ("ttl", &LEASE_TTL.as_secs().to_string()),
-                    ("wait", &wait.as_secs().to_string()),
-                ])
-                // the server holds the request up to `wait`; give the client slack.
-                .timeout(wait.saturating_add(POLL_CAP))
-                .header("X-Vk-Lock-Holder", holder_info(key)),
-            &self.auth,
-        )
-        .send()
-        .await
-        .map_err(req_err)?;
+        let resp = self
+            .auth
+            .apply(
+                self.http
+                    .post(lock_url(&self.base, "acquire"))
+                    .query(&[
+                        ("name", key),
+                        ("ttl", &LEASE_TTL.as_secs().to_string()),
+                        ("wait", &wait.as_secs().to_string()),
+                    ])
+                    // the server holds the request up to `wait`; give the client slack.
+                    .timeout(wait.saturating_add(POLL_CAP))
+                    .header("X-Vk-Lock-Holder", holder_info(key)),
+            )
+            .send()
+            .await
+            .map_err(req_err)?;
         match resp.status() {
             reqwest::StatusCode::OK => {
                 #[derive(Deserialize)]
@@ -270,14 +259,6 @@ fn lock_url(base: &str, action: &str) -> String {
     format!("{}/lock/{action}", base.trim_end_matches('/'))
 }
 
-fn authorize(req: reqwest::RequestBuilder, auth: &LockAuth) -> reqwest::RequestBuilder {
-    match auth {
-        LockAuth::None => req,
-        LockAuth::Basic { user, pass } => req.basic_auth(user, Some(pass)),
-        LockAuth::Bearer { token } => req.bearer_auth(token),
-    }
-}
-
 /// Whether the heartbeat should give the lease up, given what the latest renew
 /// established and how long since the server last confirmed we hold it.
 ///
@@ -313,7 +294,7 @@ struct Heartbeat {
     base: String,
     key: String,
     owner: String,
-    auth: LockAuth,
+    auth: Auth,
 }
 
 impl Heartbeat {
@@ -321,24 +302,25 @@ impl Heartbeat {
     /// of}` when every name was renewed and 409 with the same body when some
     /// were not — for our single name that is exactly "still held" vs "lost".
     async fn renew(&self) -> Renewed {
-        let sent = authorize(
-            self.http
-                .post(lock_url(&self.base, "renew"))
-                .query(&[
-                    ("name", self.key.as_str()),
-                    ("ttl", &LEASE_TTL.as_secs().to_string()),
-                ])
-                // A renew that outlives one heartbeat interval is a lost renew,
-                // not a slow one: the next tick supersedes it. Unbounded, it
-                // would also stall the heartbeat task — and with it the
-                // `handle.await` in `unlock` — for as long as the server keeps
-                // the connection open without answering.
-                .timeout(HEARTBEAT_FREQ)
-                .header("X-Vk-Lock-Owner", &self.owner),
-            &self.auth,
-        )
-        .send()
-        .await;
+        let sent = self
+            .auth
+            .apply(
+                self.http
+                    .post(lock_url(&self.base, "renew"))
+                    .query(&[
+                        ("name", self.key.as_str()),
+                        ("ttl", &LEASE_TTL.as_secs().to_string()),
+                    ])
+                    // A renew that outlives one heartbeat interval is a lost
+                    // renew, not a slow one: the next tick supersedes it.
+                    // Unbounded, it would also stall the heartbeat task — and
+                    // with it the `handle.await` in `unlock` — for as long as
+                    // the server keeps the connection open without answering.
+                    .timeout(HEARTBEAT_FREQ)
+                    .header("X-Vk-Lock-Owner", &self.owner),
+            )
+            .send()
+            .await;
         let Ok(resp) = sent else {
             return Renewed::Unknown;
         };
@@ -379,7 +361,7 @@ pub struct Lease {
     base: String,
     key: String,
     owner: String,
-    auth: LockAuth,
+    auth: Auth,
     stop: Arc<Notify>,
     lost: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -419,17 +401,18 @@ impl Lease {
         if self.is_lost() {
             return Ok(());
         }
-        let resp = authorize(
-            self.http
-                .post(lock_url(&self.base, "release"))
-                .query(&[("name", self.key.as_str())])
-                .timeout(RELEASE_TIMEOUT)
-                .header("X-Vk-Lock-Owner", &self.owner),
-            &self.auth,
-        )
-        .send()
-        .await
-        .map_err(req_err)?;
+        let resp = self
+            .auth
+            .apply(
+                self.http
+                    .post(lock_url(&self.base, "release"))
+                    .query(&[("name", self.key.as_str())])
+                    .timeout(RELEASE_TIMEOUT)
+                    .header("X-Vk-Lock-Owner", &self.owner),
+            )
+            .send()
+            .await
+            .map_err(req_err)?;
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::format(format!(
@@ -688,7 +671,7 @@ mod tests {
             base: server.base(),
             key: "k".to_string(),
             owner: "owner-token".to_string(),
-            auth: LockAuth::None,
+            auth: Auth::None,
         }
         .renew()
         .await
@@ -738,7 +721,7 @@ mod tests {
             base: format!("http://{addr}"),
             key: "k".to_string(),
             owner: "o".to_string(),
-            auth: LockAuth::None,
+            auth: Auth::None,
         }
         .renew()
         .await;
@@ -883,7 +866,7 @@ mod tests {
             base: l.base.clone(),
             key: l.key("build"),
             owner: "owner-token".to_string(),
-            auth: LockAuth::None,
+            auth: Auth::None,
         }
         .renew()
         .await;
@@ -995,6 +978,6 @@ mod tests {
         let l = Locker::new("http://x", "")
             .expect("locker")
             .with_basic_auth("", None);
-        assert!(matches!(l.auth, LockAuth::None | LockAuth::Bearer { .. }));
+        assert!(matches!(l.auth, Auth::None | Auth::Bearer { .. }));
     }
 }

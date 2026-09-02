@@ -22,6 +22,7 @@
     )
 )]
 
+mod auth;
 mod cas;
 mod chunker;
 mod error;

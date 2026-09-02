@@ -14,12 +14,12 @@ use std::time::Duration;
 use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientProtocol};
 use oci_client::errors::OciDistributionError;
 use oci_client::manifest::{OciDescriptor, OciImageManifest, OciManifest};
-use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinSet};
 
+use crate::auth::Auth;
 use crate::cas::{assemble, build, digest_hex, sha256_hex};
 use crate::error::{Error, Result, with_causes};
 use crate::index::{
@@ -78,9 +78,8 @@ struct Counters {
 pub struct Store {
     client: Client,
     http: reqwest::Client,
-    auth: RegistryAuth,
-    /// Basic credentials for the raw transparent-zstd push (`None` = anonymous).
-    basic: Option<(String, String)>,
+    /// Shared by `oci-client` requests and raw transparent-zstd pushes.
+    auth: Auth,
     /// `host/repo` reference base; a per-tag [`Reference`] is built from it.
     base: String,
     registry: String,
@@ -135,13 +134,13 @@ impl Store {
         }
         let http = builder.build().map_err(req_err)?;
 
-        let (auth, basic) = if opts.username.is_empty() {
-            (RegistryAuth::Anonymous, None)
+        let auth = if opts.username.is_empty() {
+            Auth::None
         } else {
-            (
-                RegistryAuth::Basic(opts.username.clone(), opts.password.clone()),
-                Some((opts.username.clone(), opts.password.clone())),
-            )
+            Auth::Basic {
+                user: opts.username.clone(),
+                pass: opts.password.clone(),
+            }
         };
 
         let scheme = if opts.plain_http { "http" } else { "https" };
@@ -151,7 +150,6 @@ impl Store {
             client,
             http,
             auth,
-            basic,
             base: reference.to_string(),
             registry,
             repository,
@@ -177,7 +175,11 @@ impl Store {
     /// not exist — the cheap "is this entry already pushed and matching" check.
     pub async fn resolve_annotations(&self, tag: &str) -> Result<Option<BTreeMap<String, String>>> {
         let image = self.reference(tag)?;
-        match self.client.pull_manifest(&image, &self.auth).await {
+        match self
+            .client
+            .pull_manifest(&image, &self.auth.registry_auth())
+            .await
+        {
             Ok((OciManifest::Image(m), _)) => {
                 if m.artifact_type.as_deref() != Some(ARTIFACT_TYPE) {
                     return Err(Error::format(format!(
@@ -206,7 +208,7 @@ impl Store {
     ) -> Result<PushStats> {
         let image = self.reference(tag)?;
         self.client
-            .store_auth_if_needed(image.resolve_registry(), &self.auth)
+            .store_auth_if_needed(image.resolve_registry(), &self.auth.registry_auth())
             .await;
 
         // Bounded channel so at most FETCH_CONCURRENCY frames are buffered beyond
@@ -241,7 +243,7 @@ impl Store {
             let client = self.client.clone();
             let http = self.http.clone();
             let image = image.clone();
-            let basic = self.basic.clone();
+            let auth = self.auth.clone();
             let scheme = self.scheme;
             let registry = self.registry.clone();
             let repository = self.repository.clone();
@@ -256,7 +258,7 @@ impl Store {
                     scheme,
                     &registry,
                     &repository,
-                    &basic,
+                    &auth,
                     &refc,
                     frame,
                     &counters,
@@ -349,7 +351,7 @@ impl Store {
         let image = self.reference(tag)?;
         let (manifest, _digest) = self
             .client
-            .pull_manifest(&image, &self.auth)
+            .pull_manifest(&image, &self.auth.registry_auth())
             .await
             .map_err(oci_err)?;
         let OciManifest::Image(m) = manifest else {
@@ -475,7 +477,7 @@ async fn upload_chunk(
     scheme: &str,
     registry: &str,
     repository: &str,
-    basic: &Option<(String, String)>,
+    auth: &Auth,
     refc: &ChunkRef,
     frame: Vec<u8>,
     counters: &Counters,
@@ -495,7 +497,7 @@ async fn upload_chunk(
             scheme,
             registry,
             repository,
-            basic,
+            auth,
             &refc.digest,
             frame,
         )
@@ -535,23 +537,19 @@ async fn push_blob_zstd(
     scheme: &str,
     registry: &str,
     repository: &str,
-    basic: &Option<(String, String)>,
+    auth: &Auth,
     digest: &str,
     frame: Vec<u8>,
 ) -> Result<()> {
-    let with_auth = |req: reqwest::RequestBuilder| match basic {
-        Some((u, p)) => req.basic_auth(u, Some(p)),
-        None => req,
-    };
-
     let uploads = format!("{scheme}://{registry}/v2/{repository}/blobs/uploads/");
-    let resp = with_auth(
-        http.post(&uploads)
-            .header(reqwest::header::CONTENT_LENGTH, "0"),
-    )
-    .send()
-    .await
-    .map_err(req_err)?;
+    let resp = auth
+        .apply(
+            http.post(&uploads)
+                .header(reqwest::header::CONTENT_LENGTH, "0"),
+        )
+        .send()
+        .await
+        .map_err(req_err)?;
     if resp.status() != reqwest::StatusCode::ACCEPTED {
         return Err(Error::format(format!(
             "begin blob upload: HTTP {}",
@@ -569,15 +567,16 @@ async fn push_blob_zstd(
         location.to_string()
     };
 
-    let resp = with_auth(
-        http.put(location)
-            .query(&[("digest", digest)])
-            .header(reqwest::header::CONTENT_ENCODING, "zstd")
-            .body(frame),
-    )
-    .send()
-    .await
-    .map_err(req_err)?;
+    let resp = auth
+        .apply(
+            http.put(location)
+                .query(&[("digest", digest)])
+                .header(reqwest::header::CONTENT_ENCODING, "zstd")
+                .body(frame),
+        )
+        .send()
+        .await
+        .map_err(req_err)?;
     if resp.status() != reqwest::StatusCode::CREATED && resp.status() != reqwest::StatusCode::OK {
         return Err(Error::format(format!("blob PUT: HTTP {}", resp.status())));
     }
