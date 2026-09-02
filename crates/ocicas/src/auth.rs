@@ -5,10 +5,9 @@
 
 use oci_client::secrets::RegistryAuth;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) enum Auth {
     /// No credentials (loopback / trusted network).
-    #[default]
     None,
     /// HTTP Basic.
     Basic { user: String, pass: String },

@@ -129,9 +129,9 @@ impl CacheLock {
                 let locker = ocicas::Locker::new(base, prefix)?
                     .with_timeout(timeout)
                     .with_ca(ca.as_deref())?
-                    // `vk://user:pass@host/...` authenticates with Basic; with
-                    // no user the locker keeps its `$TASK_VK_LOCK_TOKEN`
-                    // bearer default.
+                    // `$TASK_VK_LOCK_TOKEN` is the bearer default;
+                    // `vk://user:pass@host/...` overrides it with Basic.
+                    .with_bearer_auth(&super::oci::env("TASK_VK_LOCK_TOKEN"))
                     .with_basic_auth(&u.username, u.password.as_deref());
                 Ok(Some(CacheLock::Vk(locker)))
             }

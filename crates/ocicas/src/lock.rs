@@ -59,7 +59,8 @@ pub struct Locker {
     /// Interval between lease renewals ([`HEARTBEAT_FREQ`]; a test may shorten
     /// it to observe the heartbeat's decisions without waiting on it).
     heartbeat: Duration,
-    /// Basic from `vk://user:pass@host/...`, or the `$TASK_VK_LOCK_TOKEN` bearer.
+    /// Credential sent on every lock request; see [`Locker::with_bearer_auth`]
+    /// and [`Locker::with_basic_auth`].
     auth: Auth,
     http: reqwest::Client,
 }
@@ -67,11 +68,9 @@ pub struct Locker {
 impl Locker {
     /// Build a locker for `scheme://host` (e.g. `http://reg:5000`) keying names
     /// under `prefix` (the URL path, empty for none). Fails only if the HTTP
-    /// client cannot be built (a TLS backend that won't initialize).
-    ///
-    /// Authentication defaults to `$TASK_VK_LOCK_TOKEN` as a bearer token when
-    /// set; [`Locker::with_basic_auth`] overrides it with credentials carried
-    /// in the URL.
+    /// client cannot be built (a TLS backend that won't initialize). The locker
+    /// remains anonymous until [`Locker::with_bearer_auth`] or
+    /// [`Locker::with_basic_auth`].
     ///
     /// # Panics
     ///
@@ -79,19 +78,13 @@ impl Locker {
     /// provider must already be installed (the `task` binary installs ring at
     /// startup); building a client without one panics inside `reqwest`.
     pub fn new(base: impl Into<String>, prefix: impl Into<String>) -> Result<Self> {
-        let http = http_client(Vec::new())?;
-        let auth = std::env::var("TASK_VK_LOCK_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty())
-            .map(|token| Auth::Bearer { token })
-            .unwrap_or_default();
         Ok(Locker {
             base: base.into(),
             prefix: prefix.into(),
             timeout: None,
             heartbeat: HEARTBEAT_FREQ,
-            auth,
-            http,
+            auth: Auth::None,
+            http: http_client(Vec::new())?,
         })
     }
 
@@ -121,9 +114,19 @@ impl Locker {
         Ok(self)
     }
 
-    /// Authenticate with `user`/`pass` (from the `cache.lock` URL) instead of
-    /// the `$TASK_VK_LOCK_TOKEN` bearer default. An empty user leaves the
-    /// default in place, so a credential-less URL still picks up the env token.
+    /// Authenticate with a static bearer `token`. An empty token leaves the
+    /// current credential in place.
+    pub fn with_bearer_auth(mut self, token: &str) -> Self {
+        if !token.is_empty() {
+            self.auth = Auth::Bearer {
+                token: token.to_string(),
+            };
+        }
+        self
+    }
+
+    /// Authenticate with HTTP Basic, replacing any current credential. An empty
+    /// user leaves the current credential unchanged.
     pub fn with_basic_auth(mut self, user: &str, pass: Option<&str>) -> Self {
         if !user.is_empty() {
             self.auth = Auth::Basic {
@@ -956,8 +959,7 @@ mod tests {
         );
     }
 
-    /// URL-carried Basic credentials reach the wire; without them the bearer
-    /// default applies.
+    /// URL-carried Basic credentials reach the wire.
     #[tokio::test]
     async fn basic_auth_is_sent_when_configured() {
         let server = FakeLockServer::start(vec![(200, r#"{"owner":"o"}"#)]);
@@ -972,12 +974,41 @@ mod tests {
         drop(lease);
     }
 
+    /// A caller-supplied token reaches the wire as a bearer.
+    #[tokio::test]
+    async fn bearer_auth_is_sent_when_configured() {
+        let server = FakeLockServer::start(vec![(200, r#"{"owner":"o"}"#)]);
+        let lease = locker(server.base())
+            .with_bearer_auth("vkr_t0ken")
+            .lock("build", || {})
+            .await
+            .expect("acquire");
+        let auth = server.seen()[0].authorization.clone();
+        assert_eq!(auth.as_deref(), Some("Bearer vkr_t0ken"));
+        drop(lease);
+    }
+
+    /// URL credentials override the token; an empty credential of either
+    /// scheme is "not configured" and leaves the other in place.
     #[test]
-    fn empty_basic_user_keeps_the_default_auth() {
+    fn credential_precedence() {
         install_crypto();
         let l = Locker::new("http://x", "")
             .expect("locker")
+            .with_basic_auth("", None)
+            .with_bearer_auth("");
+        assert!(matches!(l.auth, Auth::None));
+
+        let l = Locker::new("http://x", "")
+            .expect("locker")
+            .with_bearer_auth("t")
             .with_basic_auth("", None);
-        assert!(matches!(l.auth, Auth::None | Auth::Bearer { .. }));
+        assert!(matches!(l.auth, Auth::Bearer { .. }));
+
+        let l = Locker::new("http://x", "")
+            .expect("locker")
+            .with_bearer_auth("t")
+            .with_basic_auth("ci", Some("s3cret"));
+        assert!(matches!(l.auth, Auth::Basic { .. }));
     }
 }

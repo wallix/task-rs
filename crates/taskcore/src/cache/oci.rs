@@ -86,7 +86,9 @@ pub(super) fn ca_file(explicit: &str) -> Option<PathBuf> {
     (!ca.is_empty()).then(|| PathBuf::from(ca))
 }
 
-fn env(key: &str) -> String {
+/// Return an empty string for an unset or non-UTF-8 variable; callers treat
+/// empty values as unconfigured.
+pub(super) fn env(key: &str) -> String {
     std::env::var(key).unwrap_or_default()
 }
 
