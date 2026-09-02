@@ -894,5 +894,12 @@ mod tests {
             .with_bearer_auth("t")
             .with_basic_auth("ci", Some("s3cret"));
         assert!(matches!(l.auth, Auth::Basic { .. }));
+
+        // A later, non-empty token replaces an earlier Basic pair.
+        let l = Locker::new("http://x", "")
+            .expect("locker")
+            .with_basic_auth("env", Some("p"))
+            .with_bearer_auth("t");
+        assert!(matches!(l.auth, Auth::Bearer { .. }));
     }
 }

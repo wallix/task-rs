@@ -4,9 +4,9 @@
 //!   names never contend; the same name serializes across processes.
 //! * `vk://` / `vks://` — a distributed build-once lock backed by a vk-registry
 //!   HTTP lock API ([`ocicas::Locker`]). The same registry can serve the
-//!   `oci://` cache, so `$TASK_VK_LOCK_TOKEN` falls back to
-//!   `$TASK_CACHE_OCI_TOKEN`. For `vks://`, `?ca=` falls back to
-//!   `$TASK_CACHE_OCI_CA`.
+//!   `oci://` cache, so locks use `$TASK_VK_LOCK_TOKEN`, then fall back to
+//!   `$TASK_CACHE_OCI_TOKEN` or `$TASK_CACHE_OCI_USER`/`PASSWORD`. For `vks://`,
+//!   `?ca=` falls back to `$TASK_CACHE_OCI_CA`.
 //! * `redis://` — a distributed lock via Redis `SET NX EX` with a heartbeat
 //!   ([`RedisLocker`]).
 
@@ -127,11 +127,16 @@ impl CacheLock {
                 let ca = tls
                     .then(|| super::oci::ca_file(u.query().get("ca").map_or("", String::as_str)))
                     .flatten();
+                // Apply credentials from lowest to highest precedence. Empty
+                // values are no-ops: cache Basic, lock/cache bearer, then URL
+                // Basic.
                 let locker = ocicas::Locker::new(base, prefix)?
                     .with_timeout(timeout)
                     .with_ca(ca.as_deref())?
-                    // Start with the environment bearer token; URL Basic
-                    // credentials override it.
+                    .with_basic_auth(
+                        &super::oci::env("TASK_CACHE_OCI_USER"),
+                        Some(&super::oci::env("TASK_CACHE_OCI_PASSWORD")),
+                    )
                     .with_bearer_auth(&super::oci::lock_token())
                     .with_basic_auth(&u.username, u.password.as_deref());
                 Ok(Some(CacheLock::Vk(locker)))

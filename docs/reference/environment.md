@@ -103,7 +103,8 @@ directly.
 
 HTTP Basic credentials for a `cache.url: oci://...` registry, used when the URL
 carries no `user:pass@` credentials of its own and `TASK_CACHE_OCI_TOKEN` is
-unset.
+unset. A `cache.lock: vk://...` lock also uses the pair when its URL has no
+credentials and neither bearer-token variable is set.
 
 ### `TASK_CACHE_OCI_TOKEN`
 
@@ -112,13 +113,15 @@ key. Used when the URL carries no `user:pass@` credentials and preferred over
 `TASK_CACHE_OCI_USER` / `TASK_CACHE_OCI_PASSWORD`.
 
 A `cache.lock: vk://...` lock reads the same token when `TASK_VK_LOCK_TOKEN` is
-unset, since the lock API is served by the same registry.
+unset. If both tokens are unset, it uses the OCI Basic pair instead. The lock
+and cache APIs can share a registry.
 
 ### `TASK_VK_LOCK_TOKEN`
 
 Bearer token for a `cache.lock: vk://...` distributed lock. URL Basic
-credentials override it, and it defaults to `TASK_CACHE_OCI_TOKEN`. It is sent
-on every acquire, renew and release, in the clear unless the URL is `vks://`.
+credentials override it. When unset, the lock falls back to
+`TASK_CACHE_OCI_TOKEN`, then the OCI Basic pair. It is sent on every acquire,
+renew and release, in the clear unless the URL is `vks://`.
 
 ### `TASK_CACHE_OCI_CA`
 

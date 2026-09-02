@@ -741,12 +741,13 @@ Supported `lock` schemes:
 - `redis://[user:pass@]host[:port]/<prefix>` — Redis `SET NX EX` with a heartbeat.
 - `vk://host[:port]/<prefix>` (`vks://host[:port]/<prefix>[?ca=<file>]` for
   HTTPS) — the vk-registry HTTP lock API, so one vk-registry serves both the
-  `oci://` cache and the lock without Redis. It accepts URL Basic credentials
-  or a bearer token from `$TASK_VK_LOCK_TOKEN`, falling back to
-  `$TASK_CACHE_OCI_TOKEN` so one API key covers both. Credentials travel in the
-  clear over `vk://` on every acquire, renew and release; use `vks://` unless
-  they remain on a trusted network. A `vks://` lock adds `?ca=<file>`, or
-  `$TASK_CACHE_OCI_CA` when unset, to the system trust store.
+  `oci://` cache and the lock without Redis. Credential precedence is URL Basic,
+  `$TASK_VK_LOCK_TOKEN`, `$TASK_CACHE_OCI_TOKEN`, then
+  `$TASK_CACHE_OCI_USER` / `$TASK_CACHE_OCI_PASSWORD`, allowing one token or
+  account to cover both APIs. Credentials travel in the clear over `vk://` on
+  every acquire, renew and release; use `vks://` outside trusted networks. A
+  `vks://` lock adds `?ca=<file>`, or `$TASK_CACHE_OCI_CA` when unset, to the
+  system trust store.
 
 All template fields (`url`, `lock`, `enabled`, `lock_timeout`) support standard
 Task variables plus `{{.TASK}}`, `{{.CHECKSUM}}`, and the `urlsafe` template
