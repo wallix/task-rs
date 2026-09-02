@@ -23,6 +23,8 @@
   30 s longer than needed.
 - **An `oci://` cache miss is quiet.** A tag the registry does not have was
   reported as a registry error in verbose output on every miss.
+- **A `vk://` lock names its holder's machine** on the registry even when the
+  shell did not export `HOSTNAME`, as under a CI job.
 
 ## v4.3.2 - 2026-09-02
 

@@ -442,9 +442,7 @@ impl Drop for Lease {
 
 /// The identity served on the lock: a single line (it travels in an HTTP header).
 fn holder_info(key: &str) -> String {
-    let host = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string());
+    let host = hostname().unwrap_or_else(|| "unknown".to_string());
     let acquired = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -453,6 +451,31 @@ fn holder_info(key: &str) -> String {
         "pid={}; host={host}; key={key}; acquired={acquired}",
         std::process::id()
     )
+}
+
+/// This machine's name. `HOSTNAME` is a shell variable bash sets but does not
+/// export, so a task run from a script or a CI job usually has none — the
+/// kernel's name is read then.
+fn hostname() -> Option<String> {
+    ["HOSTNAME", "COMPUTERNAME"]
+        .into_iter()
+        // Unset, empty or non-UTF-8: try the next source.
+        .find_map(|k| std::env::var(k).ok().filter(|h| !h.is_empty()))
+        .or_else(hostname_from_kernel)
+}
+
+/// The kernel's name, for a process whose environment carries none: `/proc` on
+/// Linux, else `/etc/hostname` where the distribution keeps one (macOS has
+/// neither, and stays `unknown`). Comment lines are skipped, per hostname(5).
+fn hostname_from_kernel() -> Option<String> {
+    ["/proc/sys/kernel/hostname", "/etc/hostname"]
+        .into_iter()
+        // Missing or unreadable: try the next file.
+        .find_map(|p| std::fs::read_to_string(p).ok())?
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
 }
 
 /// Combine the URL path prefix with the lock name (redis-locker compatible).
@@ -493,6 +516,15 @@ mod tests {
     fn key_combines_prefix_and_name() {
         assert_eq!(make_key("task/demo", "build"), "task/demo:build");
         assert_eq!(make_key("", "build"), "build");
+    }
+
+    /// The holder can name its machine even when the shell did not export
+    /// `HOSTNAME`, as under a CI job: the kernel knows it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_kernel_names_the_host_without_an_exported_hostname() {
+        let h = hostname_from_kernel();
+        assert!(h.as_deref().is_some_and(|h| !h.is_empty()), "{h:?}");
     }
 
     #[test]
