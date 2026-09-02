@@ -99,11 +99,26 @@ Task passes the signal to the commands it started, and the switch suppresses
 that too, so a command only ever sees what the terminal delivered to it
 directly.
 
+### `TASK_CACHE_OCI_USER`, `TASK_CACHE_OCI_PASSWORD`
+
+HTTP Basic credentials for a `cache.url: oci://...` registry, used when the URL
+carries no `user:pass@` credentials of its own and `TASK_CACHE_OCI_TOKEN` is
+unset.
+
+### `TASK_CACHE_OCI_TOKEN`
+
+Bearer token for a `cache.url: oci://...` registry, such as a vk-registry API
+key. Used when the URL carries no `user:pass@` credentials and preferred over
+`TASK_CACHE_OCI_USER` / `TASK_CACHE_OCI_PASSWORD`.
+
+A `cache.lock: vk://...` lock reads the same token when `TASK_VK_LOCK_TOKEN` is
+unset, since the lock API is served by the same registry.
+
 ### `TASK_VK_LOCK_TOKEN`
 
-Bearer token for a `cache.lock: vk://...` distributed lock, used when the URL
-carries no `user:pass@` credentials of its own. Sent on every acquire, renew and
-release, in the clear unless the URL is `vks://`.
+Bearer token for a `cache.lock: vk://...` distributed lock. URL Basic
+credentials override it, and it defaults to `TASK_CACHE_OCI_TOKEN`. It is sent
+on every acquire, renew and release, in the clear unless the URL is `vks://`.
 
 ### `TASK_CACHE_OCI_CA`
 

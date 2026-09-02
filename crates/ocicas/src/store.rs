@@ -48,8 +48,11 @@ const TRANSPARENT_ZSTD_HEADER: &str = "x-virtkit-transparent-zstd";
 /// Configures [`Store::open`].
 #[derive(Debug, Default, Clone)]
 pub struct RemoteOptions {
+    /// HTTP Basic credentials; an empty `username` disables them.
     pub username: String,
     pub password: String,
+    /// Static bearer token (a vk-registry API key), preferred over Basic.
+    pub token: String,
     /// Extra trust anchor (a self-signed corp registry).
     pub ca_file: Option<PathBuf>,
     /// Local chunk CAS directory (`None` = fetch into memory).
@@ -134,7 +137,11 @@ impl Store {
         }
         let http = builder.build().map_err(req_err)?;
 
-        let auth = if opts.username.is_empty() {
+        let auth = if !opts.token.is_empty() {
+            Auth::Bearer {
+                token: opts.token.clone(),
+            }
+        } else if opts.username.is_empty() {
             Auth::None
         } else {
             Auth::Basic {

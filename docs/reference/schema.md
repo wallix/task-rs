@@ -728,9 +728,11 @@ Supported `url` (storage) schemes:
 
 - `file://<dir>` — local archives.
 - `oci://[user:password@]host/repo:tag[?ca=<file>][&cas=<dir>][&plainhttp=1]` —
-  a chunk-deduplicated artifact on any OCI registry. Credentials also come from
-  `$TASK_CACHE_OCI_USER` / `$TASK_CACHE_OCI_PASSWORD` (and `$TASK_CACHE_OCI_CA`,
-  `$TASK_CACHE_OCI_CAS_DIR`). Against a vk-registry server this additionally
+  a chunk-deduplicated artifact on any OCI registry. Environment credentials
+  are `$TASK_CACHE_OCI_TOKEN` (a bearer token, such as a vk-registry API key) or
+  `$TASK_CACHE_OCI_USER` / `$TASK_CACHE_OCI_PASSWORD` (Basic), with the token
+  taking precedence. `$TASK_CACHE_OCI_CA` and `$TASK_CACHE_OCI_CAS_DIR` provide
+  the other environment settings. Against a vk-registry server, Task also
   negotiates its transparent-zstd upload mode automatically.
 
 Supported `lock` schemes:
@@ -739,12 +741,12 @@ Supported `lock` schemes:
 - `redis://[user:pass@]host[:port]/<prefix>` — Redis `SET NX EX` with a heartbeat.
 - `vk://host[:port]/<prefix>` (`vks://host[:port]/<prefix>[?ca=<file>]` for
   HTTPS) — the vk-registry HTTP lock API, so one vk-registry serves both the
-  `oci://` cache and the lock with no separate Redis. Authenticates with
-  `vk://user:pass@host/...` (Basic) or `$TASK_VK_LOCK_TOKEN` (bearer). Either
-  travels in the clear over `vk://`, on every acquire, renew and release — use
-  `vks://` unless the credentials are confined to a trusted network. A `vks://`
-  lock trusts `?ca=<file>`, else `$TASK_CACHE_OCI_CA`, on top of the system
-  store.
+  `oci://` cache and the lock without Redis. It accepts URL Basic credentials
+  or a bearer token from `$TASK_VK_LOCK_TOKEN`, falling back to
+  `$TASK_CACHE_OCI_TOKEN` so one API key covers both. Credentials travel in the
+  clear over `vk://` on every acquire, renew and release; use `vks://` unless
+  they remain on a trusted network. A `vks://` lock adds `?ca=<file>`, or
+  `$TASK_CACHE_OCI_CA` when unset, to the system trust store.
 
 All template fields (`url`, `lock`, `enabled`, `lock_timeout`) support standard
 Task variables plus `{{.TASK}}`, `{{.CHECKSUM}}`, and the `urlsafe` template

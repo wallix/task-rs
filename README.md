@@ -161,8 +161,9 @@ serialized while different inputs remain independent.
 Set `cache.lock` to coordinate across machines:
 
 - `redis://` uses a renewable Redis lease.
-- `vk://` and `vks://` use the vk-registry lock API; use `vks://` when
-  credentials cross an untrusted network.
+- `vk://` and `vks://` use the vk-registry lock API and can share an API key
+  with the `oci://` cache; use `vks://` when credentials cross an untrusted
+  network.
 - `file://` places the lock in an explicitly selected shared directory.
 
 If a distributed lock cannot be acquired because its service is unavailable,

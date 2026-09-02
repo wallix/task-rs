@@ -9,7 +9,8 @@
 //! registry), `cas` overrides the local chunk store (default:
 //! `<user cache dir>/task/ocicas`), `plainhttp` is for local dev registries.
 //! Credentials and trust can also come from the environment, keeping secrets
-//! out of the Taskfile: `TASK_CACHE_OCI_USER`, `TASK_CACHE_OCI_PASSWORD`,
+//! out of the Taskfile: `TASK_CACHE_OCI_TOKEN` (a bearer token — a vk-registry
+//! API key) or `TASK_CACHE_OCI_USER` / `TASK_CACHE_OCI_PASSWORD` (Basic), plus
 //! `TASK_CACHE_OCI_CA` and `TASK_CACHE_OCI_CAS_DIR`.
 
 use std::path::PathBuf;
@@ -41,14 +42,18 @@ pub fn parse_oci_cache_url(u: &CacheUri) -> Result<(String, String, RemoteOption
     }
     let repo = format!("{}{}", u.host, repo_path);
 
+    // Prefer URL Basic credentials. Otherwise, prefer the environment bearer
+    // token over the environment Basic pair.
     let mut opts = RemoteOptions::default();
-    if !u.username.is_empty() || u.password.is_some() {
+    if !u.username.is_empty() {
         opts.username = u.username.clone();
         opts.password = u.password.clone().unwrap_or_default();
-    }
-    if opts.username.is_empty() {
-        opts.username = env("TASK_CACHE_OCI_USER");
-        opts.password = env("TASK_CACHE_OCI_PASSWORD");
+    } else {
+        opts.token = token();
+        if opts.token.is_empty() {
+            opts.username = env("TASK_CACHE_OCI_USER");
+            opts.password = env("TASK_CACHE_OCI_PASSWORD");
+        }
     }
 
     let q = u.query();
@@ -84,6 +89,18 @@ pub(super) fn ca_file(explicit: &str) -> Option<PathBuf> {
         explicit.to_string()
     };
     (!ca.is_empty()).then(|| PathBuf::from(ca))
+}
+
+/// The registry's bearer token, `$TASK_CACHE_OCI_TOKEN`.
+pub(super) fn token() -> String {
+    env("TASK_CACHE_OCI_TOKEN")
+}
+
+/// Bearer token for a `vk://` lock. `$TASK_VK_LOCK_TOKEN` overrides the cache's
+/// [`token`] because a vk-registry can serve both APIs.
+pub(super) fn lock_token() -> String {
+    let own = env("TASK_VK_LOCK_TOKEN");
+    if own.is_empty() { token() } else { own }
 }
 
 /// Return an empty string for an unset or non-UTF-8 variable; callers treat
@@ -175,6 +192,59 @@ mod tests {
     fn plain_http() {
         let (_, _, opts) = parse("oci://host/repo:tag?plainhttp=1").unwrap();
         assert!(opts.plain_http);
+    }
+
+    /// URL Basic credentials override the environment, where bearer overrides
+    /// Basic. A lock token overrides the cache token.
+    #[test]
+    fn credential_precedence() {
+        // SAFETY: no other test writes these variables or asserts on a value
+        // read from them; the reads elsewhere (`parse` of a credential-less
+        // URL) go through `std::env::var`, which shares std's env lock with
+        // `set_var`.
+        unsafe {
+            std::env::set_var("TASK_CACHE_OCI_TOKEN", "vkr_env");
+            std::env::set_var("TASK_CACHE_OCI_USER", "env-user");
+            std::env::set_var("TASK_CACHE_OCI_PASSWORD", "env-pass");
+            std::env::remove_var("TASK_VK_LOCK_TOKEN");
+        }
+        let (_, _, opts) = parse("oci://ci:secret@host/repo:tag").unwrap();
+        assert_eq!(
+            (opts.username.as_str(), opts.password.as_str()),
+            ("ci", "secret")
+        );
+        assert_eq!(opts.token, "");
+
+        let (_, _, opts) = parse("oci://host/repo:tag").unwrap();
+        assert_eq!(opts.token, "vkr_env");
+        assert_eq!(opts.username, "");
+        assert_eq!(lock_token(), "vkr_env");
+        // A password without a user is no URL credential.
+        let (_, _, opts) = parse("oci://:secret@host/repo:tag").unwrap();
+        assert_eq!(opts.token, "vkr_env");
+        assert_eq!(opts.username, "");
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::set_var("TASK_VK_LOCK_TOKEN", "vkr_lock");
+        }
+        assert_eq!(lock_token(), "vkr_lock");
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("TASK_CACHE_OCI_TOKEN");
+            std::env::remove_var("TASK_VK_LOCK_TOKEN");
+        }
+        let (_, _, opts) = parse("oci://host/repo:tag").unwrap();
+        assert_eq!(
+            (opts.username.as_str(), opts.password.as_str()),
+            ("env-user", "env-pass")
+        );
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("TASK_CACHE_OCI_USER");
+            std::env::remove_var("TASK_CACHE_OCI_PASSWORD");
+        }
     }
 
     #[test]

@@ -3,9 +3,10 @@
 //! * `file://` — a local exclusive lockfile with retry/backoff. Distinct lock
 //!   names never contend; the same name serializes across processes.
 //! * `vk://` / `vks://` — a distributed build-once lock backed by a vk-registry
-//!   HTTP lock API ([`ocicas::Locker`]). `vks://` takes its trust anchor from
-//!   `?ca=` or `$TASK_CACHE_OCI_CA`, the same registry certificate the
-//!   `oci://` cache uses.
+//!   HTTP lock API ([`ocicas::Locker`]). The same registry can serve the
+//!   `oci://` cache, so `$TASK_VK_LOCK_TOKEN` falls back to
+//!   `$TASK_CACHE_OCI_TOKEN`. For `vks://`, `?ca=` falls back to
+//!   `$TASK_CACHE_OCI_CA`.
 //! * `redis://` — a distributed lock via Redis `SET NX EX` with a heartbeat
 //!   ([`RedisLocker`]).
 
@@ -129,9 +130,9 @@ impl CacheLock {
                 let locker = ocicas::Locker::new(base, prefix)?
                     .with_timeout(timeout)
                     .with_ca(ca.as_deref())?
-                    // `$TASK_VK_LOCK_TOKEN` is the bearer default;
-                    // `vk://user:pass@host/...` overrides it with Basic.
-                    .with_bearer_auth(&super::oci::env("TASK_VK_LOCK_TOKEN"))
+                    // Start with the environment bearer token; URL Basic
+                    // credentials override it.
+                    .with_bearer_auth(&super::oci::lock_token())
                     .with_basic_auth(&u.username, u.password.as_deref());
                 Ok(Some(CacheLock::Vk(locker)))
             }
