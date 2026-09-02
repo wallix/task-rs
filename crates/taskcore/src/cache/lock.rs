@@ -5,7 +5,7 @@
 //! * `vk://` / `vks://` — a distributed build-once lock backed by a vk-registry
 //!   HTTP lock API ([`ocicas::Locker`]). The same registry can serve the
 //!   `oci://` cache, so locks use `$TASK_VK_LOCK_TOKEN`, then fall back to
-//!   `$TASK_CACHE_OCI_TOKEN` or `$TASK_CACHE_OCI_USER`/`PASSWORD`. For `vks://`,
+//!   `$TASK_VK_API_KEY` or `$TASK_CACHE_OCI_USER`/`PASSWORD`. For `vks://`,
 //!   `?ca=` falls back to `$TASK_CACHE_OCI_CA`.
 //! * `redis://` — a distributed lock via Redis `SET NX EX` with a heartbeat
 //!   ([`RedisLocker`]).

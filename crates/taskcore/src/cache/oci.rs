@@ -9,7 +9,7 @@
 //! registry), `cas` overrides the local chunk store (default:
 //! `<user cache dir>/task/ocicas`), `plainhttp` is for local dev registries.
 //! Credentials and trust can also come from the environment, keeping secrets
-//! out of the Taskfile: `TASK_CACHE_OCI_TOKEN` (a bearer token — a vk-registry
+//! out of the Taskfile: `TASK_VK_API_KEY` (a bearer token — a vk-registry
 //! API key) or `TASK_CACHE_OCI_USER` / `TASK_CACHE_OCI_PASSWORD` (Basic), plus
 //! `TASK_CACHE_OCI_CA` and `TASK_CACHE_OCI_CAS_DIR`.
 
@@ -91,9 +91,9 @@ pub(super) fn ca_file(explicit: &str) -> Option<PathBuf> {
     (!ca.is_empty()).then(|| PathBuf::from(ca))
 }
 
-/// The registry's bearer token, `$TASK_CACHE_OCI_TOKEN`.
+/// The registry's bearer token, `$TASK_VK_API_KEY`.
 pub(super) fn token() -> String {
-    env("TASK_CACHE_OCI_TOKEN")
+    env("TASK_VK_API_KEY")
 }
 
 /// Bearer token for a `vk://` lock. `$TASK_VK_LOCK_TOKEN` overrides the cache's
@@ -203,7 +203,7 @@ mod tests {
         // URL) go through `std::env::var`, which shares std's env lock with
         // `set_var`.
         unsafe {
-            std::env::set_var("TASK_CACHE_OCI_TOKEN", "vkr_env");
+            std::env::set_var("TASK_VK_API_KEY", "vkr_env");
             std::env::set_var("TASK_CACHE_OCI_USER", "env-user");
             std::env::set_var("TASK_CACHE_OCI_PASSWORD", "env-pass");
             std::env::remove_var("TASK_VK_LOCK_TOKEN");
@@ -232,7 +232,7 @@ mod tests {
 
         // SAFETY: see above.
         unsafe {
-            std::env::remove_var("TASK_CACHE_OCI_TOKEN");
+            std::env::remove_var("TASK_VK_API_KEY");
             std::env::remove_var("TASK_VK_LOCK_TOKEN");
         }
         let (_, _, opts) = parse("oci://host/repo:tag").unwrap();

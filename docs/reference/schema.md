@@ -729,7 +729,7 @@ Supported `url` (storage) schemes:
 - `file://<dir>` — local archives.
 - `oci://[user:password@]host/repo:tag[?ca=<file>][&cas=<dir>][&plainhttp=1]` —
   a chunk-deduplicated artifact on any OCI registry. Environment credentials
-  are `$TASK_CACHE_OCI_TOKEN` (a bearer token, such as a vk-registry API key) or
+  are `$TASK_VK_API_KEY` (a bearer token, such as a vk-registry API key) or
   `$TASK_CACHE_OCI_USER` / `$TASK_CACHE_OCI_PASSWORD` (Basic), with the token
   taking precedence. `$TASK_CACHE_OCI_CA` and `$TASK_CACHE_OCI_CAS_DIR` provide
   the other environment settings. Against a vk-registry server, Task also
@@ -742,7 +742,7 @@ Supported `lock` schemes:
 - `vk://host[:port]/<prefix>` (`vks://host[:port]/<prefix>[?ca=<file>]` for
   HTTPS) — the vk-registry HTTP lock API, so one vk-registry serves both the
   `oci://` cache and the lock without Redis. Credential precedence is URL Basic,
-  `$TASK_VK_LOCK_TOKEN`, `$TASK_CACHE_OCI_TOKEN`, then
+  `$TASK_VK_LOCK_TOKEN`, `$TASK_VK_API_KEY`, then
   `$TASK_CACHE_OCI_USER` / `$TASK_CACHE_OCI_PASSWORD`, allowing one token or
   account to cover both APIs. Credentials travel in the clear over `vk://` on
   every acquire, renew and release; use `vks://` outside trusted networks. A

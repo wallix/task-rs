@@ -102,11 +102,11 @@ directly.
 ### `TASK_CACHE_OCI_USER`, `TASK_CACHE_OCI_PASSWORD`
 
 HTTP Basic credentials for a `cache.url: oci://...` registry, used when the URL
-carries no `user:pass@` credentials of its own and `TASK_CACHE_OCI_TOKEN` is
+carries no `user:pass@` credentials of its own and `TASK_VK_API_KEY` is
 unset. A `cache.lock: vk://...` lock also uses the pair when its URL has no
 credentials and neither bearer-token variable is set.
 
-### `TASK_CACHE_OCI_TOKEN`
+### `TASK_VK_API_KEY`
 
 Bearer token for a `cache.url: oci://...` registry, such as a vk-registry API
 key. Used when the URL carries no `user:pass@` credentials and preferred over
@@ -120,7 +120,7 @@ and cache APIs can share a registry.
 
 Bearer token for a `cache.lock: vk://...` distributed lock. URL Basic
 credentials override it. When unset, the lock falls back to
-`TASK_CACHE_OCI_TOKEN`, then the OCI Basic pair. It is sent on every acquire,
+`TASK_VK_API_KEY`, then the OCI Basic pair. It is sent on every acquire,
 renew and release, in the clear unless the URL is `vks://`.
 
 ### `TASK_CACHE_OCI_CA`

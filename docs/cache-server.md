@@ -12,9 +12,9 @@ single small host:
 - **A Redis instance** serves the `cache.lock: redis://...` distributed locks
   (and, optionally, `redis://` cache entries for small blobs). If the registry
   is a vk-registry, `cache.lock: vks://...` uses its `/lock` API instead,
-  eliminating Redis. One API key in `TASK_CACHE_OCI_TOKEN` authenticates both
-  the cache and the lock — see
-  [`cache`](reference/schema.md#cache) in the schema reference.
+  eliminating Redis. One API key in `TASK_VK_API_KEY` authenticates both the
+  cache and the lock — see [`cache`](reference/schema.md#cache) in the schema
+  reference.
 
 Sizing: Harbor wants 4 GB of RAM and 2 vCPUs minimum, plus disk for the cache
 volume (chunks are zstd-compressed and deduplicated, so plan for the size of
@@ -170,7 +170,7 @@ Notes:
   in the environment (masked CI variables, with the CA as a *file* variable).
   The robot username contains a `$`, so single-quote it in shell:
   `export TASK_CACHE_OCI_USER='robot$task-cache+ci'`. Registries that issue
-  bearer tokens, including vk-registry API keys, use `TASK_CACHE_OCI_TOKEN`
+  bearer tokens, including vk-registry API keys, use `TASK_VK_API_KEY`
   instead.
 - The Redis URL (with its password) should likewise come from a masked CI
   variable, e.g. `CI_CACHE_REDIS_URL=:<password>@<host>:6379`.

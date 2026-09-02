@@ -2,11 +2,11 @@
 
 ## Unreleased
 
-- **Registry API keys.** `TASK_CACHE_OCI_TOKEN` authenticates `oci://` caches
-  with a vk-registry bearer token. `vk://` locks without URL credentials use
-  `TASK_VK_LOCK_TOKEN`, then fall back to that cache token or the
-  `TASK_CACHE_OCI_USER` / `TASK_CACHE_OCI_PASSWORD` pair. One token or account
-  authenticates both APIs on the same vk-registry.
+- **One vk-registry API key authenticates an explicit `oci://` cache and
+  `vk://` lock.** `TASK_VK_API_KEY` is sent as a bearer token to `oci://`
+  caches. `vk://` locks without URL credentials use `TASK_VK_LOCK_TOKEN`, then
+  fall back to that key or the `TASK_CACHE_OCI_USER` / `TASK_CACHE_OCI_PASSWORD`
+  pair.
 - **Authenticate transparent-zstd capability probes.** The `oci://` cache now
   sends registry credentials when negotiating transparent-zstd uploads, so
   credential-gated vk-registry servers use that mode instead of
