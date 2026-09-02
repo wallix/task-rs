@@ -45,6 +45,11 @@ impl FakeServer {
         FakeServer { addr, seen }
     }
 
+    /// `host:port`.
+    pub(crate) fn authority(&self) -> String {
+        self.addr.to_string()
+    }
+
     /// `http://host:port`.
     pub(crate) fn base(&self) -> String {
         format!("http://{}", self.addr)

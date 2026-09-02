@@ -144,7 +144,7 @@ impl Store {
         };
 
         let scheme = if opts.plain_http { "http" } else { "https" };
-        let transparent = detect_transparent(&http, scheme, &registry).await?;
+        let transparent = detect_transparent(&http, scheme, &registry, &auth).await?;
 
         Ok(Store {
             client,
@@ -519,9 +519,17 @@ async fn upload_chunk(
 /// registry accepts. A connect/timeout failure means the registry is unreachable
 /// and every later operation would fail too, so it surfaces as [`Error::Network`]
 /// — letting `Store::open` fail fast and the caller warn instead of stalling.
-async fn detect_transparent(http: &reqwest::Client, scheme: &str, registry: &str) -> Result<bool> {
+///
+/// Authenticate the probe because a credential-gated vk-registry omits the
+/// capability header from its 401 response.
+async fn detect_transparent(
+    http: &reqwest::Client,
+    scheme: &str,
+    registry: &str,
+    auth: &Auth,
+) -> Result<bool> {
     let url = format!("{scheme}://{registry}/v2/");
-    match http.get(&url).send().await {
+    match auth.apply(http.get(&url)).send().await {
         Ok(resp) => Ok(resp.headers().contains_key(TRANSPARENT_ZSTD_HEADER)),
         Err(e) if e.is_connect() || e.is_timeout() => Err(req_err(e)),
         Err(_) => Ok(false),
@@ -640,4 +648,33 @@ fn req_err(e: reqwest::Error) -> Error {
 
 fn join_err(e: JoinError) -> Error {
     Error::format(format!("task join: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{FakeServer, install_crypto};
+
+    /// A credential-gated registry omits the capability header from an
+    /// anonymous probe's 401 response, so the probe sends credentials.
+    #[tokio::test]
+    async fn the_capability_probe_carries_the_credential() {
+        install_crypto();
+        let server = FakeServer::start(vec![(200, "{}")]);
+        let auth = Auth::Basic {
+            user: "ci".to_string(),
+            pass: "s3cret".to_string(),
+        };
+        let transparent =
+            detect_transparent(&reqwest::Client::new(), "http", &server.authority(), &auth)
+                .await
+                .expect("probe");
+        // A 200 without the capability header reports no support.
+        assert!(!transparent);
+        let seen = server.seen();
+        assert_eq!(seen[0].method, "GET");
+        assert_eq!(seen[0].path, "/v2/");
+        // base64("ci:s3cret")
+        assert_eq!(seen[0].authorization.as_deref(), Some("Basic Y2k6czNjcmV0"));
+    }
 }

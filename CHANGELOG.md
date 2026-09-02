@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Authenticate transparent-zstd capability probes.** The `oci://` cache now
+  sends registry credentials when negotiating transparent-zstd uploads, so
+  credential-gated vk-registry servers use that mode instead of
+  compressed-digest uploads.
+
 ## v4.3.2 - 2026-09-02
 
 - **Match files with trailing `**` globs** — `target/**` now matches the same
