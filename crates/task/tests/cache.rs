@@ -685,3 +685,89 @@ tasks:
         "build dep should NOT run on cache hit: {second}"
     );
 }
+
+/// A fake vk-registry lock API: answers every `POST /lock/<action>` with a
+/// canned success body and records the request paths in arrival order. Each
+/// path is recorded before its response goes out, so a request the binary saw
+/// answered is visible once the binary has exited.
+fn fake_vk_lock_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let Ok(reader) = stream.try_clone() else {
+                continue;
+            };
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                continue;
+            }
+            let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+            // Skip the headers; these requests carry no body.
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = if path.starts_with("/lock/acquire") {
+                r#"{"owner":"o"}"#
+            } else if path.starts_with("/lock/renew") {
+                r#"{"renewed":1,"of":1}"#
+            } else {
+                "{}"
+            };
+            recorder.lock().unwrap().push(path);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    (format!("vk://{addr}/locks"), seen)
+}
+
+// A `vk://` lock is released when its task finishes rather than left to expire:
+// the release must reach the server before the binary exits.
+#[test]
+fn vk_lock_is_released_when_the_task_finishes() {
+    let (lock_url, seen) = fake_vk_lock_server();
+    let taskfile = format!(
+        r#"version: '3'
+vars:
+  CACHE_DIR:
+    sh: echo "$CACHE_DIR"
+tasks:
+  build:
+    sources:
+      - input.txt
+    generates:
+      - output.txt
+    cache:
+      url: 'file://{{{{.CACHE_DIR}}}}/build-{{{{.CHECKSUM}}}}.zip'
+      lock: '{lock_url}'
+    cmds:
+      - cp input.txt output.txt
+"#
+    );
+    let dir = stage_inline(&taskfile, "hello\n");
+    let cache = cache_dir();
+    let (out, code) = run_env(&dir, &["build"], &[("CACHE_DIR", cache.to_str().unwrap())]);
+    assert_eq!(code, 0, "run failed: {out}");
+    assert!(dir.join("output.txt").exists());
+    let paths = seen.lock().unwrap().clone();
+    assert!(
+        paths.iter().any(|p| p.starts_with("/lock/acquire")),
+        "the lock was never acquired remotely: {paths:?}\n{out}"
+    );
+    assert!(
+        paths.iter().any(|p| p.starts_with("/lock/release")),
+        "the lock was not released before exit: {paths:?}\n{out}"
+    );
+}

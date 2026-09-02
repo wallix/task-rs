@@ -762,9 +762,9 @@ impl Executor {
         }
     }
 
-    /// The core task execution body run once per dedup hash: fingerprint/cache
-    /// short-circuit, deps, then commands. Ports the closure passed to Go
-    /// `startExecution`.
+    /// The core task execution body run once per dedup hash: setup, then the
+    /// build-once lock around [`Self::execute_locked`], released before
+    /// returning. Ports the closure passed to Go `startExecution`.
     async fn execute(
         self: &Rc<Self>,
         t: &Task,
@@ -777,18 +777,44 @@ impl Executor {
 
         self.run_setup(t, &ancestors).await?;
 
-        let mut checker = ChecksumChecker::new(&self.temp_dir.fingerprint, t.clone());
-        let source_hash = t.source_hash.clone();
-
         let cache_url = self.cache_url(t);
-        let cache_active = cache_url.is_some();
 
         // Acquire the build-once lock covering deps, fingerprint, execution and
         // the up-to-date write, for tasks with fingerprint state.
         let lock = self
-            .acquire_task_lock(t, &source_hash, cache_url.as_ref())
+            .acquire_task_lock(t, &t.source_hash, cache_url.as_ref())
             .await?;
 
+        let result = self
+            .execute_locked(t, call, ancestors, cache_url.as_ref(), lock.as_ref())
+            .await;
+        // Release explicitly: a dropped vk lease only stops its heartbeat and
+        // keeps peers waiting until it expires server-side.
+        if let Some(guard) = lock
+            && let Err(e) = guard.unlock().await
+        {
+            self.logger().borrow_mut().verbose_errf(
+                Color::Yellow,
+                &format!("task: failed to release the lock for {:?}: {e}\n", t.name()),
+            );
+        }
+        result
+    }
+
+    /// The part of [`Self::execute`] that runs under the build-once lock: the
+    /// fingerprint/cache short-circuit, deps, commands, then the up-to-date
+    /// write and cache upload.
+    async fn execute_locked(
+        self: &Rc<Self>,
+        t: &Task,
+        call: &Call,
+        ancestors: Ancestors,
+        cache_url: Option<&CacheUrl>,
+        lock: Option<&cache::Guard>,
+    ) -> Result<(), ExecutorError> {
+        let mut checker = ChecksumChecker::new(&self.temp_dir.fingerprint, t.clone());
+        let source_hash = t.source_hash.as_str();
+        let cache_active = cache_url.is_some();
         let skip_fingerprinting = self.force_all || (!call.indirect && self.force);
         if !skip_fingerprinting {
             let precond_met = {
@@ -809,7 +835,7 @@ impl Executor {
             if cache_active
                 && !self.dry
                 && !source_hash.is_empty()
-                && let Some(url) = &cache_url
+                && let Some(url) = cache_url
             {
                 {
                     let (ok, meta) = {
@@ -901,7 +927,7 @@ impl Executor {
         // cannot be trusted as the build-once result. Read here, before the
         // early return and before anything that can fail, so the warning also
         // reaches an operator whose task errored out.
-        let lock_lost = lock.as_ref().is_some_and(cache::Guard::is_lost);
+        let lock_lost = lock.is_some_and(cache::Guard::is_lost);
         if lock_lost {
             self.logger().borrow_mut().errf(
                 Color::Yellow,
@@ -935,7 +961,7 @@ impl Executor {
                 checker.set_up_to_date()?;
                 if cache_active
                     && !source_hash.is_empty()
-                    && let Some(url) = &cache_url
+                    && let Some(url) = cache_url
                 {
                     let (mut scratch, sink) = self.scratch_logger();
                     cache::cache_save(

@@ -11,6 +11,9 @@
   sends registry credentials when negotiating transparent-zstd uploads, so
   credential-gated vk-registry servers use that mode instead of
   compressed-digest uploads.
+- **A `vk://` lock is released when its task finishes.** It used to stay held
+  until its lease expired, making a peer waiting on the same build wait up to
+  30 s longer than needed.
 
 ## v4.3.2 - 2026-09-02
 
