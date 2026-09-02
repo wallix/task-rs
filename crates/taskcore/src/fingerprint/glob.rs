@@ -25,22 +25,20 @@ use crate::filepathext;
 pub fn globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<String>> {
     let mut included: BTreeSet<String> = BTreeSet::new();
     let mut excluded: BTreeSet<String> = BTreeSet::new();
+    let mut patterns = Vec::new();
 
     for g in globs {
         if !g.fingerprint.is_empty() {
-            let fp = filepathext::smart_join(dir, &g.fingerprint)
-                .to_string_lossy()
-                .into_owned();
+            let fp = join_pattern(dir, &g.fingerprint);
             if Path::new(&fp).exists() {
                 mark(&mut included, &mut excluded, fp, g.negate);
             }
             continue;
         }
-        for m in glob(dir, &g.glob).unwrap_or_default() {
-            mark(&mut included, &mut excluded, m, g.negate);
-        }
+        patterns.push((join_pattern(dir, &g.glob), g.negate));
     }
 
+    expand_patterns(&patterns, &mut included, &mut excluded);
     Ok(collect(&included, &excluded))
 }
 
@@ -52,33 +50,89 @@ pub fn globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<String>> {
 pub fn cache_globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<String>> {
     let mut included: BTreeSet<String> = BTreeSet::new();
     let mut excluded: BTreeSet<String> = BTreeSet::new();
+    let mut patterns = Vec::new();
 
     for g in globs {
-        for m in glob(dir, &g.glob).unwrap_or_default() {
-            mark(&mut included, &mut excluded, m, g.negate);
-        }
+        patterns.push((join_pattern(dir, &g.glob), g.negate));
         if !g.fingerprint.is_empty() && !g.negate {
-            let fp = filepathext::smart_join(dir, &g.fingerprint)
-                .to_string_lossy()
-                .into_owned();
+            let fp = join_pattern(dir, &g.fingerprint);
             if Path::new(&fp).exists() {
                 mark(&mut included, &mut excluded, fp, false);
             }
         }
     }
 
+    expand_patterns(&patterns, &mut included, &mut excluded);
     Ok(collect(&included, &excluded))
+}
+
+/// Expands joined `(pattern, negate)` entries into the working sets.
+///
+/// The result is the order-independent `included - excluded`. A negated
+/// whole-tree pattern (`<prefix>/**/*`) becomes a [`Pruner`] that keeps positive
+/// walks out of covered directories. Other excludes expand normally.
+fn expand_patterns(
+    patterns: &[(String, bool)],
+    included: &mut BTreeSet<String>,
+    excluded: &mut BTreeSet<String>,
+) {
+    let includes: Vec<&str> = patterns
+        .iter()
+        .filter(|(_, negate)| !negate)
+        .map(|(p, _)| p.as_str())
+        .collect();
+
+    let mut pruners = Vec::new();
+    for (pattern, _) in patterns.iter().filter(|(_, negate)| *negate) {
+        match Pruner::new(pattern, &includes) {
+            Some(pruner) => {
+                // Pruning only affects walks. Subtract covered fingerprint paths
+                // inserted directly into `included` to preserve expanded-exclude
+                // behavior.
+                let segments = rooted_segments(pattern);
+                let covered: Vec<String> = included
+                    .iter()
+                    .filter(|p| match_segments(&segments, &rooted_segments(p)))
+                    .cloned()
+                    .collect();
+                for path in covered {
+                    mark(included, excluded, path, true);
+                }
+                pruners.push(pruner);
+            }
+            None => {
+                for m in expand(pattern, &[]) {
+                    mark(included, excluded, m, true);
+                }
+            }
+        }
+    }
+
+    for pattern in includes {
+        for m in expand(pattern, &pruners) {
+            mark(included, excluded, m, false);
+        }
+    }
+}
+
+/// Joins `pattern` onto `dir` the way every expansion in this module does.
+fn join_pattern(dir: &str, pattern: &str) -> String {
+    filepathext::smart_join(dir, pattern)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Expands a single glob pattern rooted at `dir`, returning matching regular
 /// files (directories are skipped). Symlinks are included as regular entries.
 pub fn glob(dir: &str, pattern: &str) -> std::io::Result<Vec<String>> {
-    let joined = filepathext::smart_join(dir, pattern)
-        .to_string_lossy()
-        .into_owned();
+    Ok(expand(&join_pattern(dir, pattern), &[]))
+}
 
+/// Expands an already-joined pattern, skipping directories and never entering
+/// a directory one of the `pruners` covers.
+fn expand(pattern: &str, pruners: &[Pruner]) -> Vec<String> {
     let mut results: BTreeSet<String> = BTreeSet::new();
-    for f in expand_fields(&joined) {
+    for f in expand_fields(pattern, pruners) {
         let meta = match std::fs::symlink_metadata(&f) {
             Ok(meta) => meta,
             Err(_) => continue,
@@ -90,7 +144,109 @@ pub fn glob(dir: &str, pattern: &str) -> std::io::Result<Vec<String>> {
         }
         results.insert(f);
     }
-    Ok(results.into_iter().collect())
+    results.into_iter().collect()
+}
+
+/// Applies a negated `<prefix>/**/*` pattern while walking includes by refusing
+/// to enter directories matching `prefix`.
+///
+/// Pruning preserves `included - excluded`: the exclude would remove every
+/// skipped path. Because `**/*` cannot reach dot-prefixed descendants,
+/// [`Pruner::new`] rejects pruning when an include can name one below a covered
+/// directory.
+struct Pruner {
+    /// Pattern segments before the trailing `**/*`, including the walk's root
+    /// marker (`""` for absolute patterns and `"."` for relative ones).
+    prefix: Vec<String>,
+}
+
+impl Pruner {
+    fn new(pattern: &str, includes: &[&str]) -> Option<Self> {
+        let segments = rooted_segments(pattern);
+        let (&"*", mut prefix) = segments.split_last()? else {
+            return None;
+        };
+        let mut stars = 0usize;
+        while let Some((&"**", rest)) = prefix.split_last() {
+            prefix = rest;
+            stars = stars.saturating_add(1);
+        }
+        if stars == 0 {
+            return None;
+        }
+        // Count non-`**` prefix segments, including the root marker, to find the
+        // shallowest covered directory. Never prune the walk root.
+        let min_depth = prefix.iter().filter(|s| **s != "**").count();
+        if min_depth < 2 {
+            return None;
+        }
+
+        // A literal dot segment in an include is safe only at a fixed depth
+        // within the prefix of every covered directory.
+        for include in includes {
+            let mut after_double_star = false;
+            for (depth, seg) in rooted_segments(include).into_iter().enumerate() {
+                if seg == "**" {
+                    after_double_star = true;
+                } else if depth > 0
+                    && seg.starts_with('.')
+                    && (after_double_star || depth >= min_depth)
+                {
+                    return None;
+                }
+            }
+        }
+
+        Some(Self {
+            prefix: prefix.iter().map(|s| (*s).to_string()).collect(),
+        })
+    }
+
+    /// Reports whether `dir` (a path built by [`walk`]) matches the prefix.
+    fn covers(&self, dir: &str) -> bool {
+        let path: Vec<&str> = dir.split('/').collect();
+        match_segments(&self.prefix, &path)
+    }
+}
+
+/// Splits a pattern into segments with its walk root: `""` for absolute
+/// patterns and `"."` for relative patterns.
+fn rooted_segments(pattern: &str) -> Vec<&str> {
+    let mut segments: Vec<&str> = pattern.split('/').collect();
+    if segments.first() != Some(&"") {
+        segments.insert(0, ".");
+    }
+    segments
+}
+
+/// Matches pattern segments against a whole path, with the same rules as the
+/// walk: `**` spans zero or more non-dot segments, wildcards match within one
+/// segment, literals match verbatim.
+fn match_segments<S: AsRef<str>>(pat: &[S], path: &[&str]) -> bool {
+    match pat.split_first() {
+        None => path.is_empty(),
+        Some((seg, rest)) if seg.as_ref() == "**" => {
+            if match_segments(rest, path) {
+                return true;
+            }
+            match path.split_first() {
+                Some((name, tail)) if !name.starts_with('.') => match_segments(pat, tail),
+                _ => false,
+            }
+        }
+        Some((seg, rest)) => match path.split_first() {
+            Some((name, tail)) => {
+                let seg = seg.as_ref();
+                let hit = if has_meta(seg) {
+                    matches_segment(seg, name)
+                } else {
+                    seg == *name
+                };
+                hit && match_segments(rest, tail)
+            }
+            None => false,
+        },
+    }
 }
 
 /// Adds or removes `path` from the working sets depending on `negate`.
@@ -120,7 +276,7 @@ fn collect(included: &BTreeSet<String>, excluded: &BTreeSet<String>) -> Vec<Stri
 /// Expands an absolute glob path into the set of matching filesystem paths,
 /// reproducing bash's `globstar`/no-`dotglob` pathname expansion. A pattern
 /// with no metacharacters yields itself.
-fn expand_fields(pattern: &str) -> Vec<String> {
+fn expand_fields(pattern: &str, pruners: &[Pruner]) -> Vec<String> {
     let segments: Vec<&str> = pattern.split('/').collect();
     // An absolute path begins with an empty first segment; expansion starts
     // from the filesystem root. A relative path starts from ".".
@@ -129,65 +285,76 @@ fn expand_fields(pattern: &str) -> Vec<String> {
         _ => (".".to_string(), segments.as_slice()),
     };
 
-    let mut out = Vec::new();
-    walk(&root, rest, &mut out);
-    out
-}
-
-/// Recursively matches the remaining glob segments against the tree rooted at
-/// `base`, appending matched paths to `out`.
-fn walk(base: &str, segments: &[&str], out: &mut Vec<String>) {
-    let Some((segment, rest)) = segments.split_first() else {
-        // No more segments: `base` itself is a match.
-        out.push(base.to_string());
-        return;
+    let mut walker = Walker {
+        pruners,
+        out: Vec::new(),
     };
-
-    if *segment == "**" {
-        // `**` matches zero or more directory levels. Match here (zero levels)
-        // then descend into every subdirectory.
-        walk(base, rest, out);
-        for child in list_dir(base) {
-            if Path::new(&child).is_dir() {
-                walk_double_star(&child, rest, out);
-            }
-        }
-        return;
-    }
-
-    if !has_meta(segment) {
-        // Literal segment: descend if it exists.
-        let next = join_seg(base, segment);
-        if rest.is_empty() {
-            if Path::new(&next).exists() {
-                out.push(next);
-            }
-        } else if Path::new(&next).is_dir() {
-            walk(&next, rest, out);
-        }
-        return;
-    }
-
-    // Wildcard segment: test each visible child.
-    for child in list_dir(base) {
-        let name = file_name(&child);
-        if matches_segment(segment, &name) {
-            if rest.is_empty() {
-                out.push(child);
-            } else if Path::new(&child).is_dir() {
-                walk(&child, rest, out);
-            }
-        }
-    }
+    walker.walk(&root, rest);
+    walker.out
 }
 
-/// Continues a `**` match: `base` is a directory already matched by `**`; apply
-/// the remaining segments here and keep descending.
-fn walk_double_star(base: &str, rest: &[&str], out: &mut Vec<String>) {
-    walk(base, rest, out);
-    for child in list_dir(base) {
-        if Path::new(&child).is_dir() {
-            walk_double_star(&child, rest, out);
+struct Walker<'a> {
+    pruners: &'a [Pruner],
+    out: Vec<String>,
+}
+
+impl Walker<'_> {
+    fn enter(&self, dir: &str) -> bool {
+        !self.pruners.iter().any(|p| p.covers(dir))
+    }
+
+    /// Recursively matches the remaining glob segments against the tree rooted
+    /// at `base`, appending matched paths to `self.out`.
+    fn walk(&mut self, base: &str, segments: &[&str]) {
+        let Some((segment, rest)) = segments.split_first() else {
+            self.out.push(base.to_string());
+            return;
+        };
+
+        if *segment == "**" {
+            // `**` matches zero or more directory levels. Match here (zero
+            // levels) then descend into every subdirectory.
+            self.walk(base, rest);
+            for child in list_dir(base) {
+                if Path::new(&child).is_dir() && self.enter(&child) {
+                    self.walk_double_star(&child, rest);
+                }
+            }
+            return;
+        }
+
+        if !has_meta(segment) {
+            let next = join_seg(base, segment);
+            if rest.is_empty() {
+                if Path::new(&next).exists() {
+                    self.out.push(next);
+                }
+            } else if Path::new(&next).is_dir() && self.enter(&next) {
+                self.walk(&next, rest);
+            }
+            return;
+        }
+
+        for child in list_dir(base) {
+            let name = file_name(&child);
+            if matches_segment(segment, &name) {
+                if rest.is_empty() {
+                    self.out.push(child);
+                } else if Path::new(&child).is_dir() && self.enter(&child) {
+                    self.walk(&child, rest);
+                }
+            }
+        }
+    }
+
+    /// Continues a `**` match: `base` is a directory already matched by `**`;
+    /// apply the remaining segments here and keep descending.
+    fn walk_double_star(&mut self, base: &str, rest: &[&str]) {
+        self.walk(base, rest);
+        for child in list_dir(base) {
+            if Path::new(&child).is_dir() && self.enter(&child) {
+                self.walk_double_star(&child, rest);
+            }
         }
     }
 }
@@ -419,6 +586,34 @@ mod tests {
     }
 
     #[test]
+    fn exclude_prunes_injected_fingerprint_file() {
+        let dir = tmp();
+        write_file(&dir, "build/gen/fp.txt", "f");
+        write_file(&dir, "src/a.rs", "a");
+        // Pruning must still exclude fingerprint files inserted without walking.
+        let patterns = [
+            g("**/*.rs"),
+            g_fp("build/**/*", "build/gen/fp.txt"),
+            g_neg("build/gen/**/*"),
+        ];
+        let files = globs(&dir, &patterns).unwrap();
+        assert_eq!(files, vec![join(&dir, "src/a.rs")]);
+    }
+
+    #[test]
+    fn cache_globs_exclude_drops_injected_fingerprint_file() {
+        let dir = tmp();
+        write_file(&dir, "build/gen/fp.txt", "f");
+        write_file(&dir, "build/out.js", "o");
+        let patterns = [
+            g_fp("build/**/*", "build/gen/fp.txt"),
+            g_neg("build/gen/**/*"),
+        ];
+        let files = cache_globs(&dir, &patterns).unwrap();
+        assert_eq!(files, vec![join(&dir, "build/out.js")]);
+    }
+
+    #[test]
     fn globs_mixed_entries() {
         let dir = tmp();
         for (rel, content) in [
@@ -494,6 +689,107 @@ mod tests {
                 join(&dir, "b1.txt"),
             ]
         );
+    }
+
+    #[test]
+    fn exclude_covering_directory_prunes_walk() {
+        let dir = tmp();
+        write_file(&dir, "src/a.rs", "a");
+        write_file(&dir, "src/target/debug/b.rs", "b");
+        write_file(&dir, "target/release/c.rs", "c");
+        write_file(&dir, "target-x/d.rs", "d");
+        write_file(&dir, "vendor/e.rs", "e");
+        let patterns = [
+            g("**/*.rs"),
+            g_neg("target*/**/*"),
+            g_neg("**/target/**/**/*"),
+        ];
+        let joined: Vec<String> = patterns
+            .iter()
+            .filter(|g| g.negate)
+            .map(|g| join(&dir, &g.glob))
+            .collect();
+        let includes = [join(&dir, "**/*.rs")];
+        let include_refs: Vec<&str> = includes.iter().map(String::as_str).collect();
+        for p in &joined {
+            assert!(Pruner::new(p, &include_refs).is_some(), "{p} should prune");
+        }
+
+        let files = globs(&dir, &patterns).unwrap();
+        assert_eq!(
+            files,
+            vec![join(&dir, "src/a.rs"), join(&dir, "vendor/e.rs")]
+        );
+        // Includes and excludes remain order-independent.
+        let reversed: Vec<Glob> = patterns.iter().rev().cloned().collect();
+        assert_eq!(globs(&dir, &reversed).unwrap(), files);
+    }
+
+    #[test]
+    fn exclude_prune_keeps_literal_dot_paths() {
+        let dir = tmp();
+        write_file(&dir, "target/a.o", "a");
+        write_file(&dir, "target/.keep/b.o", "b");
+        let files = globs(
+            &dir,
+            &[
+                g("target/**/*"),
+                g("target/.keep/*.o"),
+                g_neg("target/**/*"),
+            ],
+        )
+        .unwrap();
+        // `**/*` cannot reach the literal dot path, so pruning is unsafe.
+        assert_eq!(files, vec![join(&dir, "target/.keep/b.o")]);
+        let includes = [join(&dir, "target/.keep/*.o")];
+        let include_refs: Vec<&str> = includes.iter().map(String::as_str).collect();
+        assert!(Pruner::new(&join(&dir, "target/**/*"), &include_refs).is_none());
+    }
+
+    #[test]
+    fn pruner_classification() {
+        let inc = ["/w/**/*.rs"];
+        assert!(Pruner::new("/w/target/**/*", &inc).is_some());
+        assert!(Pruner::new("/w/target/**/**/*", &inc).is_some());
+        assert!(Pruner::new("/w/*/target/**/*", &inc).is_some());
+        assert!(Pruner::new("/w/**/target/**/*", &inc).is_some());
+        // These patterns do not cover a whole directory.
+        assert!(Pruner::new("/w/target/**/*.o", &inc).is_none());
+        assert!(Pruner::new("/w/target/*", &inc).is_none());
+        assert!(Pruner::new("/w/target/**", &inc).is_none());
+        // This covers each child directory at depth 2 or greater under `target`.
+        assert!(Pruner::new("/w/target/**/*/**/*", &inc).is_some());
+        // These would prune the walk root.
+        assert!(Pruner::new("/**/*", &inc).is_none());
+        assert!(Pruner::new("**/*", &["**/*.rs"]).is_none());
+        // A fixed dot segment above covered directories is safe. One below a
+        // covered directory or after `**` is not.
+        assert!(
+            Pruner::new(
+                "/home/u/.local/w/target/**/*",
+                &["/home/u/.local/w/**/*.rs"]
+            )
+            .is_some()
+        );
+        assert!(Pruner::new("/w/target/**/*", &["/w/target/.cache/*"]).is_none());
+        assert!(Pruner::new("/w/target/**/*", &["/w/**/.cache/*"]).is_none());
+        // `**` cannot span `.git`, matching the walk.
+        assert!(Pruner::new("/w/**/target/**/*", &["/w/.git/**/*"]).is_some());
+        assert!(Pruner::new("/w/**/target/**/*", &["/w/**/.git/**/*"]).is_none());
+    }
+
+    #[test]
+    fn pruner_covers() {
+        let p = Pruner::new("/w/**/target*/**/*", &[]).unwrap();
+        assert!(p.covers("/w/target"));
+        assert!(p.covers("/w/a/b/target-x"));
+        assert!(!p.covers("/w/a/.hidden/target"));
+        assert!(!p.covers("/w/a/target/sub"));
+        assert!(!p.covers("/w/a/starget"));
+        assert!(!p.covers("/w"));
+        let rel = Pruner::new("target/**/*", &[]).unwrap();
+        assert!(rel.covers("./target"));
+        assert!(!rel.covers("./src/target"));
     }
 
     #[test]

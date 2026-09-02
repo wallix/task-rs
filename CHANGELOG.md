@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Exclude build directories without scanning them** — an `exclude:` such as
+  `target/**/*` skips matching trees, keeping large excludes fast without
+  changing the matched file set.
+
 ## v4.3.1 - 2026-08-30
 
 - **`task --help` lists the flags** — it now prints the usage line, every
