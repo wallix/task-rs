@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **vk-registry caches need only an address and an API key.** A cache model
+  can name a vk-registry repository — `vk: registry.example/task-cache` — and
+  Task derives the cache entries and the build-once lock from it; an optional
+  `namespace` keeps entries built by different toolchains apart, and a `vk`
+  that renders empty turns the cache off. The key comes from `api_key`
+  or `TASK_VK_API_KEY`; `api_key` also works on an explicit `oci://` cache or
+  `vk://` lock, where it outranks any other credential.
 - **One vk-registry API key authenticates an explicit `oci://` cache and
   `vk://` lock.** `TASK_VK_API_KEY` is sent as a bearer token to `oci://`
   caches. `vk://` locks without URL credentials use `TASK_VK_LOCK_TOKEN`, then

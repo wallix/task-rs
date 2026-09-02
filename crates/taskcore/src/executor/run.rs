@@ -1352,8 +1352,16 @@ impl Executor {
         if !cache_enabled(t) {
             return None;
         }
-        let url = t.cache.as_ref().map(|c| c.url.as_str()).unwrap_or("");
-        CacheUrl::parse(url).unwrap_or_default()
+        let c = t.cache.as_ref()?;
+        let mut url = CacheUrl::parse(&c.url).unwrap_or_default();
+        // A `cache.api_key` outranks every other credential, the URL's
+        // included — the same order as the lock's.
+        if let Some(CacheUrl::Oci { opts, .. }) = &mut url
+            && !c.api_key.is_empty()
+        {
+            opts.token = c.api_key.clone();
+        }
+        url
     }
 
     /// Acquires the build-once lock for a task with both sources and generates,
@@ -1427,7 +1435,7 @@ impl Executor {
         // An unusable lock URL — an unreadable `?ca=` file, an unknown scheme
         // — must not read as "no lock configured": the run degrades to the
         // local file lock, so say why.
-        match CacheLock::from_url(&c.lock, timeout) {
+        match CacheLock::from_url(&c.lock, timeout, &c.api_key) {
             Ok(locker) => locker,
             Err(e) => {
                 // A lock URL carries credentials (`vk://user:pass@host/...`).

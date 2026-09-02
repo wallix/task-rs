@@ -10,11 +10,14 @@ single small host:
   `oci://` backend, which has no TTL) and scheduled garbage collection. Any
   OCI registry works the same from the client's point of view.
 - **A Redis instance** serves the `cache.lock: redis://...` distributed locks
-  (and, optionally, `redis://` cache entries for small blobs). If the registry
-  is a vk-registry, `cache.lock: vks://...` uses its `/lock` API instead,
-  eliminating Redis. One API key in `TASK_VK_API_KEY` authenticates both the
-  cache and the lock — see [`cache`](reference/schema.md#cache) in the schema
-  reference.
+  (and, optionally, `redis://` cache entries for small blobs).
+
+With a [vk-registry](https://github.com/wallix/virtkit) neither half needs
+configuring separately: a `cache.vk: <host>/<repo>` model derives the cache
+entries and takes the lock over the registry's own `/lock` API, and one API key
+in `TASK_VK_API_KEY` authenticates both — see
+[`cache`](reference/schema.md#cache) in the schema reference. The rest of this
+page covers the generic OCI registry + Redis deployment.
 
 Sizing: Harbor wants 4 GB of RAM and 2 vCPUs minimum, plus disk for the cache
 volume (chunks are zstd-compressed and deduplicated, so plan for the size of

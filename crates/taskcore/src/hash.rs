@@ -280,6 +280,9 @@ fn encode_cache(enc: &mut Encoder, cache: Option<&ast::Cache>) {
             enc.str(&c.if_);
             enc.str(&c.url);
             enc.str(&c.lock);
+            enc.str(&c.vk);
+            enc.str(&c.namespace);
+            // `api_key` is a credential, not an identity: left out.
             enc.str(&c.ttl);
             enc.str(&c.lock_timeout);
         }

@@ -19,6 +19,7 @@ pub mod lock;
 pub mod oci;
 pub mod redis_lock;
 pub mod url;
+pub mod vk;
 
 use std::collections::HashSet;
 use std::path::Path;

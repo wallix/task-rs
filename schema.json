@@ -224,11 +224,23 @@
                   ]
                 },
                 "url": {
-                  "description": "Template string for the cache URL (file:// or redis://).",
+                  "description": "Template string for the cache URL (file:// or oci://). Not with vk.",
                   "type": "string"
                 },
                 "lock": {
-                  "description": "Template string for a distributed lock URL (redis://).",
+                  "description": "Template string for a distributed lock URL (redis://, vk://, vks://). Not with vk.",
+                  "type": "string"
+                },
+                "vk": {
+                  "description": "Template string for a vk-registry repository (host[:port]/repo) serving both the cache and the lock; url and lock are derived from it. Rendering empty disables the cache.",
+                  "type": "string"
+                },
+                "api_key": {
+                  "description": "Template string for a bearer token (a vk-registry API key) sent to the oci:// cache and the vk:// lock; outranks every other credential. Default under vk: $TASK_VK_API_KEY.",
+                  "type": "string"
+                },
+                "namespace": {
+                  "description": "Template string prefixing the cache tags and lock keys under vk, keeping entries built by different toolchains apart. No effect without vk.",
                   "type": "string"
                 },
                 "ttl": {
@@ -852,11 +864,23 @@
                   ]
                 },
                 "url": {
-                  "description": "Template string for the cache URL (file:// or redis://).",
+                  "description": "Template string for the cache URL (file:// or oci://). Not with vk.",
                   "type": "string"
                 },
                 "lock": {
-                  "description": "Template string for a distributed lock URL (redis://).",
+                  "description": "Template string for a distributed lock URL (redis://, vk://, vks://). Not with vk.",
+                  "type": "string"
+                },
+                "vk": {
+                  "description": "Template string for a vk-registry repository (host[:port]/repo) serving both the cache and the lock; url and lock are derived from it. Rendering empty disables the cache.",
+                  "type": "string"
+                },
+                "api_key": {
+                  "description": "Template string for a bearer token (a vk-registry API key) sent to the oci:// cache and the vk:// lock; outranks every other credential. Default under vk: $TASK_VK_API_KEY.",
+                  "type": "string"
+                },
+                "namespace": {
+                  "description": "Template string prefixing the cache tags and lock keys under vk, keeping entries built by different toolchains apart. No effect without vk.",
                   "type": "string"
                 },
                 "ttl": {

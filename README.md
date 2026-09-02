@@ -141,6 +141,23 @@ Two storage backends are available:
   Unchanged chunks are reused across cache entries, and a local content store
   makes repeated restores incremental.
 
+A [vk-registry](https://github.com/wallix/virtkit) needs only its address: a
+`vk:` cache model derives the entry and the build-once lock from the one
+repository, authenticated by an API key in `TASK_VK_API_KEY`:
+
+```yaml
+caches:
+  default:
+    vk: '{{.CI_VK_REGISTRY}}'   # registry.example/task-cache; empty = cache off
+
+tasks:
+  build:
+    cache: default
+    sources: [src/**]
+    generates: [dist/**]
+    cmds: [yarn build]
+```
+
 For CI systems that move state as an artifact rather than expose a shared cache
 service, fingerprint state and generated files can be exported together:
 

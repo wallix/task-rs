@@ -771,3 +771,52 @@ tasks:
         "the lock was not released before exit: {paths:?}\n{out}"
     );
 }
+
+// A `vk:` cache model whose registry variable is unset renders empty and so
+// disables the cache: the task runs, nothing is dialled, and no cache warning
+// is printed.
+#[test]
+fn cache_vk_unset_registry_disables_the_cache() {
+    let dir = stage("cache_vk");
+    let (out, code) = run_env(&dir, &["--verbose", "build"], &[("VK_REGISTRY", "")]);
+    assert_eq!(code, 0, "run failed: {out}");
+    assert!(dir.join("output.txt").exists());
+    for line in [
+        "cache registry",
+        "restored from cache",
+        "saved to cache",
+        "remote lock",
+    ] {
+        assert!(!out.contains(line), "no cache activity expected: {out}");
+    }
+}
+
+// A `vk:` cache model derives the `oci://` entry and the `vks://` lock from the
+// one repository. Against a registry that refuses connections the task still
+// runs: the cache degrades with a warning and the lock falls back to a local
+// one, and the derived lock URL shows in the verbose log (the derived tag is
+// covered by the `cache::vk` and `variables` unit tests: the restore dies at
+// the registry ping, before any manifest request could be logged).
+#[test]
+fn cache_vk_derives_cache_and_lock_from_the_registry() {
+    let dir = stage("cache_vk");
+    let env = [
+        ("VK_REGISTRY", "127.0.0.1:1/task-cache"),
+        ("VK_NAMESPACE", "gcc 13"),
+    ];
+    let (out, code) = run_env(&dir, &["--verbose", "build"], &env);
+    assert_eq!(code, 0, "run failed: {out}");
+    assert!(dir.join("output.txt").exists());
+    assert!(
+        out.contains("cache registry 127.0.0.1:1 unreachable, continuing without cache"),
+        "{out}"
+    );
+    assert!(
+        out.contains("https://127.0.0.1:1/lock/acquire?name=task-cache%2Fgcc-13%3Abuild%3A"),
+        "lock key should be <repo>/<namespace>:<task>:<checksum>: {out}"
+    );
+    assert!(
+        out.contains("https://127.0.0.1:1/v2/"),
+        "the cache should have pinged the derived registry: {out}"
+    );
+}

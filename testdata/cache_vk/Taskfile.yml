@@ -1,0 +1,16 @@
+version: '3'
+
+caches:
+  default:
+    vk: '{{.VK_REGISTRY}}'
+    namespace: '{{.VK_NAMESPACE}}'
+
+tasks:
+  build:
+    sources:
+      - input.txt
+    generates:
+      - output.txt
+    cache: default
+    cmds:
+      - cp input.txt output.txt

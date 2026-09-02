@@ -15,6 +15,11 @@ use super::error::TaskfileDecodeError;
 /// or provides a mapping of overrides. In a mapping, `enabled` is treated as
 /// an explicit bool when it is a YAML boolean, otherwise as a template
 /// condition stored in `if_`.
+///
+/// A block either names a vk-registry repository in `vk` — the cache and lock
+/// URLs are then derived from it (`cache::vk`) — or spells out `url` and
+/// `lock` itself; the two are mutually exclusive (enforced when the task is
+/// compiled, on the rendered values).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cache {
     /// Model name to inherit from (empty means no inheritance).
@@ -27,15 +32,25 @@ pub struct Cache {
     pub url: String,
     /// Template string producing the lock URL.
     pub lock: String,
+    /// Template string producing a vk-registry repository (`host[:port]/repo`)
+    /// that serves both the cache and the lock. Rendering empty disables the
+    /// cache.
+    pub vk: String,
+    /// Template string producing the API key for `vk` (a bearer token); empty
+    /// means `$TASK_VK_API_KEY`.
+    pub api_key: String,
+    /// Template string prefixing the tags and lock keys under `vk`, to keep
+    /// entries built by different toolchains apart.
+    pub namespace: String,
     /// Cached asset TTL (e.g. `48h`, `7d`).
     pub ttl: String,
     /// Maximum wait for lock contention (e.g. `5m`, `1h`).
     pub lock_timeout: String,
-    /// The template dialect this block's `url`/`lock`/`if`/`lock_timeout`
-    /// strings are authored in, stamped from the owning Taskfile's dialect when
-    /// the file is read. A task-level block inherits its own file's dialect from
-    /// the task; a `caches:` model keeps the dialect of the file that defined
-    /// it, which is not the same file when a task inherits it across an include.
+    /// The template dialect this block's template strings are authored in,
+    /// stamped from the owning Taskfile's dialect when the file is read. A
+    /// task-level block inherits its own file's dialect from the task; a
+    /// `caches:` model keeps the dialect of the file that defined it, which is
+    /// not the same file when a task inherits it across an include.
     pub dialect: Dialect,
 }
 
@@ -60,6 +75,9 @@ impl<'de> Deserialize<'de> for Cache {
                         },
                         "url" => c.url = value_as_string(&v),
                         "lock" => c.lock = value_as_string(&v),
+                        "vk" => c.vk = value_as_string(&v),
+                        "api_key" => c.api_key = value_as_string(&v),
+                        "namespace" => c.namespace = value_as_string(&v),
                         "ttl" => c.ttl = value_as_string(&v),
                         "lock_timeout" => c.lock_timeout = value_as_string(&v),
                         _ => {}
@@ -157,6 +175,19 @@ mod tests {
         let c: Cache = serde_yaml_ng::from_str("inherit: doc\nurl: file:///override").unwrap();
         assert_eq!(c.inherit, "doc");
         assert_eq!(c.url, "file:///override");
+    }
+
+    #[test]
+    fn mapping_with_vk() {
+        let c: Cache = serde_yaml_ng::from_str(
+            "vk: '{{ REGISTRY }}/task-cache'\napi_key: '{{ KEY }}'\nnamespace: gcc-13",
+        )
+        .unwrap();
+        assert_eq!(c.vk, "{{ REGISTRY }}/task-cache");
+        assert_eq!(c.api_key, "{{ KEY }}");
+        assert_eq!(c.namespace, "gcc-13");
+        assert!(c.url.is_empty());
+        assert!(c.lock.is_empty());
     }
 
     #[test]

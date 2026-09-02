@@ -4,9 +4,10 @@
 //!   names never contend; the same name serializes across processes.
 //! * `vk://` / `vks://` — a distributed build-once lock backed by a vk-registry
 //!   HTTP lock API ([`ocicas::Locker`]). The same registry can serve the
-//!   `oci://` cache, so locks use `$TASK_VK_LOCK_TOKEN`, then fall back to
-//!   `$TASK_VK_API_KEY` or `$TASK_CACHE_OCI_USER`/`PASSWORD`. For `vks://`,
-//!   `?ca=` falls back to `$TASK_CACHE_OCI_CA`.
+//!   `oci://` cache, so the credential is the block's `api_key`, else URL
+//!   Basic, else `$TASK_VK_LOCK_TOKEN`, then the cache's `$TASK_VK_API_KEY` or
+//!   `$TASK_CACHE_OCI_USER`/`PASSWORD`. For `vks://`, `?ca=` falls back to
+//!   `$TASK_CACHE_OCI_CA`.
 //! * `redis://` — a distributed lock via Redis `SET NX EX` with a heartbeat
 //!   ([`RedisLocker`]).
 
@@ -100,9 +101,14 @@ impl Drop for Guard {
 
 impl CacheLock {
     /// Build a lock backend from the resolved `cache.lock` URL string, with an
-    /// optional contention timeout (`None` = default 1h). Returns `Ok(None)`
-    /// when the string is empty (no lock configured).
-    pub fn from_url(raw: &str, timeout: Option<Duration>) -> Result<Option<CacheLock>, CacheError> {
+    /// optional contention timeout (`None` = default 1h) and the block's
+    /// `api_key` (empty = none). Returns `Ok(None)` when the string is empty
+    /// (no lock configured).
+    pub fn from_url(
+        raw: &str,
+        timeout: Option<Duration>,
+        api_key: &str,
+    ) -> Result<Option<CacheLock>, CacheError> {
         let raw = raw.trim();
         if raw.is_empty() {
             return Ok(None);
@@ -128,8 +134,9 @@ impl CacheLock {
                     .then(|| super::oci::ca_file(u.query().get("ca").map_or("", String::as_str)))
                     .flatten();
                 // Apply credentials from lowest to highest precedence. Empty
-                // values are no-ops: cache Basic, lock/cache bearer, then URL
-                // Basic.
+                // values are no-ops: cache Basic, lock/cache bearer, URL Basic,
+                // then the block's own `api_key`, which wins on the cache side
+                // too.
                 let locker = ocicas::Locker::new(base, prefix)?
                     .with_timeout(timeout)
                     .with_ca(ca.as_deref())?
@@ -138,7 +145,8 @@ impl CacheLock {
                         Some(&super::oci::env("TASK_CACHE_OCI_PASSWORD")),
                     )
                     .with_bearer_auth(&super::oci::lock_token())
-                    .with_basic_auth(&u.username, u.password.as_deref());
+                    .with_basic_auth(&u.username, u.password.as_deref())
+                    .with_bearer_auth(api_key);
                 Ok(Some(CacheLock::Vk(locker)))
             }
             "redis" => Ok(Some(CacheLock::Redis(RedisLocker::new(
@@ -460,7 +468,7 @@ mod tests {
     #[test]
     fn redis_scheme_builds_locker() {
         assert!(matches!(
-            CacheLock::from_url("redis://localhost:6379/locks", None),
+            CacheLock::from_url("redis://localhost:6379/locks", None, ""),
             Ok(Some(CacheLock::Redis(_)))
         ));
     }
@@ -471,10 +479,10 @@ mod tests {
         // crypto provider installed by the binary — not available under `cargo
         // test` — so vk dispatch is exercised via URL parsing in the url module.
         assert!(matches!(
-            CacheLock::from_url("file:///tmp/locks", None),
+            CacheLock::from_url("file:///tmp/locks", None, ""),
             Ok(Some(CacheLock::File { .. }))
         ));
-        assert!(matches!(CacheLock::from_url("", None), Ok(None)));
+        assert!(matches!(CacheLock::from_url("", None, ""), Ok(None)));
         assert_eq!(
             CacheUri::parse("vks://reg:5000/task").map(|u| u.scheme),
             Some("vks".to_string())

@@ -108,8 +108,9 @@ credentials and neither bearer-token variable is set.
 
 ### `TASK_VK_API_KEY`
 
-Bearer token for a `cache.url: oci://...` registry, such as a vk-registry API
-key. Used when the URL carries no `user:pass@` credentials and preferred over
+The vk-registry API key (a bearer token) for a `cache.vk:` model whose block
+sets no `api_key` of its own. Also read by a `cache.url: oci://...` registry
+when the URL carries no `user:pass@` credentials, taking precedence over
 `TASK_CACHE_OCI_USER` / `TASK_CACHE_OCI_PASSWORD`.
 
 A `cache.lock: vk://...` lock reads the same token when `TASK_VK_LOCK_TOKEN` is
@@ -118,8 +119,8 @@ and cache APIs can share a registry.
 
 ### `TASK_VK_LOCK_TOKEN`
 
-Bearer token for a `cache.lock: vk://...` distributed lock. URL Basic
-credentials override it. When unset, the lock falls back to
+Bearer token for a `cache.lock: vk://...` distributed lock. A block's `api_key`
+and URL Basic credentials override it. When unset, the lock falls back to
 `TASK_VK_API_KEY`, then the OCI Basic pair. It is sent on every acquire,
 renew and release, in the clear unless the URL is `vks://`.
 

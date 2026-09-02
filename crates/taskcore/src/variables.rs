@@ -77,6 +77,18 @@ pub enum CompileError {
         /// The dependency path, outermost task first, ending with the repeat.
         path: Vec<String>,
     },
+    /// A cache block names a `vk` registry and also spells out `url` or `lock`.
+    CacheVkWithUrl {
+        /// The task being compiled.
+        task: String,
+    },
+    /// A cache block's `vk` rendered to something other than `host[:port]/repo`.
+    CacheVkInvalid {
+        /// The task being compiled.
+        task: String,
+        /// The rendered value.
+        vk: String,
+    },
     /// A cached task references a generates path outside the project root.
     CacheGeneratesOutsideRoot {
         /// The task being compiled.
@@ -108,6 +120,14 @@ impl std::fmt::Display for CompileError {
             Self::Cycle { path } => {
                 write!(f, "task: Cyclic dependency detected: {}", path.join(" -> "))
             }
+            Self::CacheVkWithUrl { task } => write!(
+                f,
+                "task: {task}: cache: `vk` derives the cache and lock URLs; drop `url` and `lock`"
+            ),
+            Self::CacheVkInvalid { task, vk } => write!(
+                f,
+                "task: {task}: cache: `vk` must be a bare host[:port]/repo, got {vk:?}"
+            ),
             Self::CacheGeneratesOutsideRoot { task, glob, root } => write!(
                 f,
                 "task: {task}: generates path {glob:?} is outside project root {root:?}; caching requires all outputs to be within the project directory"
@@ -422,6 +442,15 @@ pub async fn compiled_task(
             if !resolved.lock.is_empty() {
                 merged.lock = resolved.lock.clone();
             }
+            if !resolved.vk.is_empty() {
+                merged.vk = resolved.vk.clone();
+            }
+            if !resolved.api_key.is_empty() {
+                merged.api_key = resolved.api_key.clone();
+            }
+            if !resolved.namespace.is_empty() {
+                merged.namespace = resolved.namespace.clone();
+            }
             if !resolved.if_.is_empty() {
                 merged.if_ = resolved.if_.clone();
             }
@@ -437,6 +466,7 @@ pub async fn compiled_task(
             resolved = merged;
         }
         resolved.inherit = String::new();
+        let vk_configured = !resolved.vk.is_empty();
         // Each field renders in the dialect of the block it was written in: the
         // task's own file for a task-level value, the defining file for one
         // inherited from `caches:`. The two differ while a tree is partway
@@ -461,11 +491,44 @@ pub async fn compiled_task(
         resolved.if_ = cache.replace(&resolved.if_);
         cache.set_dialect(dialect_of(&orig_cache.lock_timeout));
         resolved.lock_timeout = cache.replace(&resolved.lock_timeout);
+        cache.set_dialect(dialect_of(&orig_cache.vk));
+        resolved.vk = cache.replace(&resolved.vk).trim().to_string();
+        cache.set_dialect(dialect_of(&orig_cache.api_key));
+        resolved.api_key = cache.replace(&resolved.api_key).trim().to_string();
+        cache.set_dialect(dialect_of(&orig_cache.namespace));
+        resolved.namespace = cache.replace(&resolved.namespace).trim().to_string();
         // Leave the templater on the task's dialect for anything rendered after
         // this block, and record it on the compiled block, whose strings are all
         // resolved by now.
         cache.set_dialect(orig_task.dialect);
         resolved.dialect = orig_task.dialect;
+
+        // A `vk` model derives its URLs. Rendering empty — the registry comes
+        // from a CI variable that is unset locally — is "no registry", and
+        // there is nothing to cache to or lock on.
+        if vk_configured {
+            if !resolved.url.is_empty() || !resolved.lock.is_empty() {
+                return Err(CompileError::CacheVkWithUrl {
+                    task: orig_task.name().to_string(),
+                });
+            }
+            if resolved.vk.is_empty() {
+                resolved.enabled = Some(false);
+            } else if !crate::cache::vk::is_valid(&resolved.vk) {
+                return Err(CompileError::CacheVkInvalid {
+                    task: orig_task.name().to_string(),
+                    vk: resolved.vk.clone(),
+                });
+            } else {
+                resolved.url = crate::cache::vk::cache_url(
+                    &resolved.vk,
+                    &resolved.namespace,
+                    orig_task.name(),
+                    &new.source_hash,
+                );
+                resolved.lock = crate::cache::vk::lock_url(&resolved.vk, &resolved.namespace);
+            }
+        }
         new.cache = Some(resolved);
     }
 
@@ -1072,6 +1135,148 @@ mod tests {
         assert_eq!(cache.lock_timeout, "5m");
         // The merged block is normalised onto the task's dialect.
         assert_eq!(cache.dialect, Dialect::Go);
+    }
+
+    fn vk_model(vk: &str) -> Caches {
+        Caches(HashMap::from([(
+            "default".to_string(),
+            crate::ast::Cache {
+                vk: vk.to_string(),
+                namespace: "{{ NS }}".to_string(),
+                api_key: "{{ KEY }}".to_string(),
+                dialect: Dialect::Jinja,
+                ..Default::default()
+            },
+        )]))
+    }
+
+    fn vk_task(cache: crate::ast::Cache) -> Task {
+        Task {
+            task: "build".to_string(),
+            dialect: Dialect::Jinja,
+            sources: vec![crate::ast::Glob {
+                glob: "Cargo.toml".to_string(),
+                ..Default::default()
+            }],
+            cache: Some(cache),
+            ..Default::default()
+        }
+    }
+
+    fn vk_vars() -> Vars {
+        Vars::from_elements([
+            VarElement {
+                key: "NS".to_string(),
+                value: string_var("gcc 13"),
+            },
+            VarElement {
+                key: "KEY".to_string(),
+                value: string_var("vkr_k"),
+            },
+        ])
+    }
+
+    /// A `vk` model spells out the registry once; the cache and lock URLs
+    /// follow from it, the task name and the checksum.
+    #[tokio::test]
+    async fn vk_model_derives_the_cache_and_lock_urls() {
+        let caches = vk_model("reg.example/task-cache");
+        let orig = vk_task(crate::ast::Cache {
+            inherit: "default".to_string(),
+            ..Default::default()
+        });
+        let env = Vars::new();
+        let c = compiler();
+        let mut logger = silent_logger();
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let ctx = ctx_with_caches(&env, &tmp, &caches);
+        let out = compiled_task(&orig, vk_vars(), true, &ctx, &c, &mut logger, None)
+            .await
+            .unwrap();
+        let hash = out.source_hash.clone();
+        assert!(!hash.is_empty());
+        let cache = out.cache.unwrap();
+        assert_eq!(cache.vk, "reg.example/task-cache");
+        assert_eq!(cache.api_key, "vkr_k");
+        assert_eq!(
+            cache.url,
+            format!("oci://reg.example/task-cache:gcc-13-build-{hash}")
+        );
+        assert_eq!(cache.lock, "vks://reg.example/task-cache/gcc-13");
+        assert!(cache.enabled.is_none());
+    }
+
+    /// A registry that renders empty — its CI variable is unset locally — is
+    /// no registry: the block is disabled rather than pointed at nothing.
+    #[tokio::test]
+    async fn vk_rendering_empty_disables_the_cache() {
+        let caches = vk_model("{{ REGISTRY }}");
+        let orig = vk_task(crate::ast::Cache {
+            inherit: "default".to_string(),
+            enabled: Some(true),
+            ..Default::default()
+        });
+        let env = Vars::new();
+        let c = compiler();
+        let mut logger = silent_logger();
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let ctx = ctx_with_caches(&env, &tmp, &caches);
+        let out = compiled_task(&orig, vk_vars(), true, &ctx, &c, &mut logger, None)
+            .await
+            .unwrap();
+        let cache = out.cache.unwrap();
+        assert_eq!(cache.enabled, Some(false));
+        assert!(cache.url.is_empty());
+        assert!(cache.lock.is_empty());
+    }
+
+    /// `vk` owns the URLs; a task that also spells one out is refused rather
+    /// than silently overridden either way.
+    #[tokio::test]
+    async fn vk_with_an_explicit_url_is_an_error() {
+        let caches = vk_model("reg.example/task-cache");
+        let orig = vk_task(crate::ast::Cache {
+            inherit: "default".to_string(),
+            url: "file:///tmp/x.zip".to_string(),
+            ..Default::default()
+        });
+        let env = Vars::new();
+        let c = compiler();
+        let mut logger = silent_logger();
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let ctx = ctx_with_caches(&env, &tmp, &caches);
+        let Err(err) = compiled_task(&orig, vk_vars(), true, &ctx, &c, &mut logger, None).await
+        else {
+            panic!("vk with url must fail");
+        };
+        assert!(
+            matches!(err, CompileError::CacheVkWithUrl { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A `vk` carrying a scheme (or anything else beyond `host[:port]/repo`)
+    /// would be copied verbatim into both derived URLs, so it is refused.
+    #[tokio::test]
+    async fn vk_with_a_scheme_is_an_error() {
+        let caches = vk_model("https://reg.example/task-cache");
+        let orig = vk_task(crate::ast::Cache {
+            inherit: "default".to_string(),
+            ..Default::default()
+        });
+        let env = Vars::new();
+        let c = compiler();
+        let mut logger = silent_logger();
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let ctx = ctx_with_caches(&env, &tmp, &caches);
+        let Err(err) = compiled_task(&orig, vk_vars(), true, &ctx, &c, &mut logger, None).await
+        else {
+            panic!("vk with a scheme must fail");
+        };
+        assert!(
+            matches!(err, CompileError::CacheVkInvalid { .. }),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
