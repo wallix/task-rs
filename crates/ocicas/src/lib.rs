@@ -29,6 +29,8 @@ mod error;
 mod index;
 mod lock;
 mod store;
+#[cfg(test)]
+mod testutil;
 mod tls;
 
 pub use cas::{assemble, build, digest_hex};

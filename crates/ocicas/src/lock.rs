@@ -484,8 +484,9 @@ fn http_client(extra_roots: Vec<reqwest::Certificate>) -> Result<reqwest::Client
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::{TcpListener, TcpStream};
+    use crate::testutil::{FakeServer, install_crypto};
+    use std::io::Write;
+    use std::net::TcpListener;
     use std::sync::Mutex;
 
     #[test]
@@ -506,123 +507,6 @@ mod tests {
             lock_url("http://reg:5000/", "release"),
             "http://reg:5000/lock/release"
         );
-    }
-
-    /// One request as the fake server saw it.
-    #[derive(Clone, Debug)]
-    struct Seen {
-        method: String,
-        /// Path only, without the query string.
-        path: String,
-        /// Raw query string.
-        query: String,
-        holder: Option<String>,
-        owner: Option<String>,
-        authorization: Option<String>,
-    }
-
-    /// A fake vk-registry lock endpoint: routes exactly like the real server
-    /// (`vk-registry/src/lock.rs` `route`) — POST-only, a literal match on
-    /// `/lock/<action>`, names as `?name=` — and 404s anything else, so a client
-    /// that talks the wrong protocol fails here exactly as it would in
-    /// production. Records every request for assertions.
-    struct FakeLockServer {
-        addr: std::net::SocketAddr,
-        seen: Arc<Mutex<Vec<Seen>>>,
-    }
-
-    impl FakeLockServer {
-        /// Serves `responses.len()` requests, one per entry, as
-        /// `(status, body)`; then stops.
-        fn start(responses: Vec<(u16, &'static str)>) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            let addr = listener.local_addr().expect("addr");
-            let seen = Arc::new(Mutex::new(Vec::new()));
-            let recorder = seen.clone();
-            std::thread::spawn(move || {
-                for (status, body) in responses {
-                    let Ok((stream, _)) = listener.accept() else {
-                        return;
-                    };
-                    serve_one(stream, status, body, &recorder);
-                }
-            });
-            FakeLockServer { addr, seen }
-        }
-
-        fn base(&self) -> String {
-            format!("http://{}", self.addr)
-        }
-
-        fn seen(&self) -> Vec<Seen> {
-            self.seen.lock().expect("lock").clone()
-        }
-    }
-
-    /// Read one HTTP/1.1 request (headers only — these requests carry no body),
-    /// record it, then write back a fixed response.
-    ///
-    /// The request is recorded *before* the response goes out, so a client that
-    /// has received its reply is guaranteed to be visible in `seen()`. Recording
-    /// afterwards races the client (which may return, and the test assert, first).
-    fn serve_one(stream: TcpStream, status: u16, body: &str, recorder: &Mutex<Vec<Seen>>) {
-        let Some(seen) = read_request(&stream) else {
-            return;
-        };
-        recorder.lock().expect("lock").push(seen);
-
-        let mut stream = stream;
-        let resp = format!(
-            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = stream.write_all(resp.as_bytes());
-        let _ = stream.flush();
-    }
-
-    fn read_request(stream: &TcpStream) -> Option<Seen> {
-        let mut reader = BufReader::new(stream.try_clone().ok()?);
-        let mut line = String::new();
-        reader.read_line(&mut line).ok()?;
-        let mut parts = line.split_whitespace();
-        let method = parts.next()?.to_string();
-        let target = parts.next()?.to_string();
-        let (path, query) = match target.split_once('?') {
-            Some((p, q)) => (p.to_string(), q.to_string()),
-            None => (target, String::new()),
-        };
-
-        let (mut holder, mut owner, mut authorization) = (None, None, None);
-        loop {
-            let mut h = String::new();
-            if reader.read_line(&mut h).ok()? == 0 || h.trim().is_empty() {
-                break;
-            }
-            let Some((name, value)) = h.split_once(':') else {
-                continue;
-            };
-            let value = value.trim().to_string();
-            match name.to_ascii_lowercase().as_str() {
-                "x-vk-lock-holder" => holder = Some(value),
-                "x-vk-lock-owner" => owner = Some(value),
-                "authorization" => authorization = Some(value),
-                _ => {}
-            }
-        }
-        Some(Seen {
-            method,
-            path,
-            query,
-            holder,
-            owner,
-            authorization,
-        })
-    }
-
-    /// reqwest is built with `rustls-no-provider`; the `task` binary installs
-    /// the ring provider at startup, so a test that builds a client must too.
-    fn install_crypto() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
     // `crates/ocicas/src/tls.rs` owns the message contract; this is the wiring
@@ -668,7 +552,7 @@ mod tests {
     /// One renew against a stub, for the classification table below.
     async fn renew_once(status: u16, body: &'static str) -> Renewed {
         install_crypto();
-        let server = FakeLockServer::start(vec![(status, body)]);
+        let server = FakeServer::start(vec![(status, body)]);
         Heartbeat {
             http: reqwest::Client::new(),
             base: server.base(),
@@ -752,7 +636,7 @@ mod tests {
     /// A freshly acquired lease is held, and reports so.
     #[tokio::test]
     async fn a_fresh_lease_is_not_lost() {
-        let server = FakeLockServer::start(vec![(200, r#"{"owner":"owner-token"}"#)]);
+        let server = FakeServer::start(vec![(200, r#"{"owner":"owner-token"}"#)]);
         let lease = locker(server.base())
             .lock("build", || {})
             .await
@@ -767,7 +651,7 @@ mod tests {
     /// server 404s).
     #[tokio::test]
     async fn acquire_and_release_use_the_server_endpoints() {
-        let server = FakeLockServer::start(vec![
+        let server = FakeServer::start(vec![
             (
                 200,
                 r#"{"owner":"owner-token","names":["task/demo:build"],"ttl":30}"#,
@@ -817,7 +701,7 @@ mod tests {
     /// `on_contention` and keeps polling rather than failing.
     #[tokio::test]
     async fn contention_retries_until_granted() {
-        let server = FakeLockServer::start(vec![
+        let server = FakeServer::start(vec![
             (
                 409,
                 r#"{"error":"locks held","blockers":[{"name":"task/demo:build","holder":"peer"}]}"#,
@@ -847,7 +731,7 @@ mod tests {
     /// every request — is a hard error, not silently treated as contention.
     #[tokio::test]
     async fn unknown_action_404_is_an_error() {
-        let server = FakeLockServer::start(vec![(404, r#"{"error":"unknown lock action"}"#)]);
+        let server = FakeServer::start(vec![(404, r#"{"error":"unknown lock action"}"#)]);
         // `Lease` is not `Debug` (it holds a client and a task handle), so
         // unwrap the error by hand rather than through `expect_err`.
         let Err(err) = locker(server.base()).lock("build", || {}).await else {
@@ -862,7 +746,7 @@ mod tests {
     /// far too long to wait for the spawned task to tick.
     #[tokio::test]
     async fn renew_uses_the_server_endpoint() {
-        let server = FakeLockServer::start(vec![(200, r#"{"renewed":1,"of":1}"#)]);
+        let server = FakeServer::start(vec![(200, r#"{"renewed":1,"of":1}"#)]);
         let l = locker(server.base());
         Heartbeat {
             http: l.http.clone(),
@@ -892,7 +776,7 @@ mod tests {
     /// successful unlock.
     #[tokio::test]
     async fn release_reports_a_refused_status() {
-        let server = FakeLockServer::start(vec![
+        let server = FakeServer::start(vec![
             (200, r#"{"owner":"owner-token"}"#),
             (401, r#"{"error":"unauthorized"}"#),
         ]);
@@ -911,7 +795,7 @@ mod tests {
     /// stops, so no further renews go out.
     #[tokio::test]
     async fn the_heartbeat_latches_a_disowned_lease() {
-        let server = FakeLockServer::start(vec![
+        let server = FakeServer::start(vec![
             (200, r#"{"owner":"owner-token"}"#),
             (409, r#"{"renewed":0,"of":1}"#),
             // Deliberately never served: the fake stops accepting once its
@@ -945,7 +829,7 @@ mod tests {
     /// and `unlock` must still report success (there is nothing left to fail).
     #[tokio::test]
     async fn a_lost_lease_is_not_released() {
-        let server = FakeLockServer::start(vec![(200, r#"{"owner":"owner-token"}"#)]);
+        let server = FakeServer::start(vec![(200, r#"{"owner":"owner-token"}"#)]);
         let lease = locker(server.base())
             .lock("build", || {})
             .await
@@ -962,7 +846,7 @@ mod tests {
     /// URL-carried Basic credentials reach the wire.
     #[tokio::test]
     async fn basic_auth_is_sent_when_configured() {
-        let server = FakeLockServer::start(vec![(200, r#"{"owner":"o"}"#)]);
+        let server = FakeServer::start(vec![(200, r#"{"owner":"o"}"#)]);
         let lease = locker(server.base())
             .with_basic_auth("ci", Some("s3cret"))
             .lock("build", || {})
@@ -977,7 +861,7 @@ mod tests {
     /// A caller-supplied token reaches the wire as a bearer.
     #[tokio::test]
     async fn bearer_auth_is_sent_when_configured() {
-        let server = FakeLockServer::start(vec![(200, r#"{"owner":"o"}"#)]);
+        let server = FakeServer::start(vec![(200, r#"{"owner":"o"}"#)]);
         let lease = locker(server.base())
             .with_bearer_auth("vkr_t0ken")
             .lock("build", || {})
