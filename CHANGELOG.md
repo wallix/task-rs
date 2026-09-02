@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.3.2 - 2026-09-02
+
 - **Match files with trailing `**` globs** — `target/**` now matches the same
   files as `target/**/*`, restoring Go Task and bash `globstar` compatibility
   for `sources:`, `generates:`, and `exclude:` patterns. These patterns
