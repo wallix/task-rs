@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.4.0 - 2026-09-03
+
 - **vk-registry caches need only an address and an API key.** A cache model
   can name a vk-registry repository — `vk: registry.example/task-cache` — and
   Task derives the cache entries and the build-once lock from it; an optional
