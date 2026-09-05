@@ -29,13 +29,13 @@ tasks:
     desc: Run the test suite
     aliases: [t]
     cmds:
-      - cargo test --workspace
+      - cargo test --workspace --locked
 
   lint:
     desc: Run clippy on all targets
     aliases: [l]
     cmds:
-      - cargo clippy --workspace --all-targets -- -D warnings
+      - cargo clippy --workspace --all-targets --locked -- -D warnings
 
   fmt:
     desc: Format all sources
