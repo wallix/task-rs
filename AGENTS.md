@@ -98,9 +98,11 @@ parser change belong in the same commit. `schema-taskrc.json` describes the
 
 ## Development Environment
 
-The toolchain is pinned in `rust-toolchain.toml` (channel + clippy + rustfmt).
-Release builds use the container's native musl target. A plain host `cargo` is
-all the edit loop needs — no container.
+`rust-toolchain.toml` pins the host channel, clippy and rustfmt.
+`.devcontainer/nix/flake.nix` pins the same channel inline for the build image,
+where Nix installs it instead of rustup. `./update.sh` keeps both pins in sync;
+they must not drift. Releases use the container's native musl target. A plain
+host `cargo` is enough for the edit loop.
 
 ```bash
 cargo build -p task                                  # debug binary
@@ -112,6 +114,15 @@ cargo fmt --all                                      # check: --all -- --check
 The repo also runs on the tool it builds — see [`Taskfile.yml`](Taskfile.yml)
 (`task build|test|lint|fmt`), which is itself authored in the native Jinja
 dialect.
+
+The build image's whole package set is one Nix closure, pinned by
+`.devcontainer/nix/flake.lock`. On a host that has Nix, the same toolchain is
+available interactively without Docker:
+
+```bash
+nix develop ./.devcontainer/nix      # the build image's toolchain, as a shell
+nix build ./.devcontainer/nix#buildEnv
+```
 
 ### Fast edit/check/test loop
 
@@ -130,12 +141,13 @@ suite is the safety net for the compatibility constraint above.
 ### Build / container scripts
 
 `build.sh`, `lint.sh`, `fmt.sh` and `audit.sh` run inside the pinned
-devcontainer image. They use `vk` when available and fall back to Docker;
-`--docker` forces Docker. The `task-audit` image stage adds cargo-audit to the
-smaller `task-build` stage.
+devcontainer image (one stage, `task-build`). They use `vk` when available and
+fall back to Docker; `--docker` forces Docker.
 `package.sh`, `release-notes.sh`, `update.sh` and `install-task.sh` run on the
-host; `update.sh` shells out to `docker` to resolve the image digest and apk
-versions.
+host; `update.sh` additionally needs `rustup`, `curl` and `docker` with the
+`buildx` plugin — it resolves the base-image version and digest over the
+network and refreshes the flake lock inside a container, so the host needs no
+Nix.
 
 ```bash
 ./build.sh [--docker]     # reproducible static-musl binary -> dist/task (+ dist/task.sha256)
@@ -147,13 +159,13 @@ versions.
 ./lint.sh  [--docker]     # cargo clippy --workspace --all-targets -- -D warnings
 ./fmt.sh   [--docker]     # cargo fmt (--check to verify)
 ./audit.sh [--docker]     # cargo-audit against the committed Cargo.lock
-./update.sh               # bump the pinned toolchain + re-pin the base image and apk deps
+./update.sh               # bump the pinned toolchain + re-pin the base image and flake lock
 ./install-task.sh         # the POSIX-sh installer published for end users
 ```
 
 `build.sh` output is a stripped static ELF that links no system C libraries
 (musl-static, rustls + ring). Rebuilding from the same commit must reproduce the
-same bytes — keep the pinning (toolchain, base image digest, apk versions,
+same bytes — keep the pinning (toolchain, base image digest, flake lock,
 `SOURCE_DATE_EPOCH`, path remapping) intact when touching build inputs.
 
 `build.sh` compiles Linux releases natively for the host architecture.

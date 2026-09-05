@@ -3,9 +3,8 @@
 # Cargo.lock (reading the ignore list in .cargo/audit.toml if present). Extra arguments are
 # forwarded to cargo-audit (e.g. --deny warnings).
 #
-# Backend: prefers a `vk` on PATH (the microVM builder, like build.sh/lint.sh), else Docker
-# — both run in the devcontainer where cargo-audit is baked in. Pass --docker to force the
-# Docker backend.
+# Like build.sh/lint.sh, prefer vk on PATH (microVM), otherwise Docker; --docker
+# forces Docker. Both use cargo-audit from the devcontainer's Nix closure.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -24,15 +23,15 @@ if [ -z "$FORCE_DOCKER" ] && command -v vk >/dev/null 2>&1; then
   # advisory database.
   echo "audit.sh: auditing with vk from PATH ($(command -v vk)); pass --docker to force Docker" >&2
   exec vk run \
-    --file .devcontainer/Dockerfile --context .devcontainer --target task-audit \
+    --file .devcontainer/Dockerfile --context .devcontainer --target task-build \
     --workdir "$PWD" --net \
     -- cargo audit "${args[@]}"
 fi
 
-docker build --target task-audit -t task-audit -f .devcontainer/Dockerfile .devcontainer
+docker build --target task-build -t task-build -f .devcontainer/Dockerfile .devcontainer
 
 exec docker run --rm \
   --user "$(id -u):$(id -g)" -e HOME=/tmp \
   -v "$PWD":/work -w /work \
-  task-audit \
+  task-build \
   cargo audit "${args[@]}"

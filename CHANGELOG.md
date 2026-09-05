@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **A Linux release stays rebuildable for good.** The pinned build environment
+  is now one locked package set whose sources stay fetchable indefinitely,
+  replacing hand-pinned Alpine packages that eventually disappear. Rebuilding a
+  release still needs only Docker and `./build.sh`; the `build-info.txt` shipped
+  with each Linux release now records a `flake lock:` digest in place of
+  `apk pins:`.
+
 ## v4.4.0 - 2026-09-03
 
 - **vk-registry caches need only an address and an API key.** A cache model

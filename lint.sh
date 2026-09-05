@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# lint.sh — run clippy on all targets inside the devcontainer (pinned toolchain from
-# rust-toolchain.toml). Prefers a `vk` on PATH (the microVM builder, like build.sh); pass
-# --docker to force the Docker backend. Extra arguments are forwarded to clippy (e.g. --fix).
+# Run clippy on all targets in the devcontainer's locked Nix toolchain. ./update.sh
+# keeps it aligned with rust-toolchain.toml. Like build.sh, prefer vk on PATH
+# (microVM); --docker forces Docker. Forward extra arguments to clippy (e.g. --fix).
 set -euo pipefail
 cd "$(dirname "$0")"
 

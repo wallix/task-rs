@@ -13,9 +13,10 @@ and formatting requirements that apply to all code.
   exception: `#!/bin/sh` with `set -e` and no `cd`, so it runs from wherever it
   is invoked.
 - **POSIX-compatible when the script must run outside a Bash host** —
-  `install-task.sh` is fetched and run on arbitrary machines, and anything
-  invoked via `sh` inside the Alpine devcontainer image has no `bash`. Avoid
-  bashisms in those and verify with `sh -n`.
+  `install-task.sh` is fetched and run on arbitrary machines. Avoid bashisms
+  there and verify with `sh -n`. The devcontainer image carries `bash`, so the
+  scripts CI runs inside it need not be POSIX; invoke them as `bash <script>`
+  rather than relying on what `sh` happens to be.
 - Keep the two container backends symmetric: scripts that build or check inside
   the devcontainer prefer a `vk` on `PATH` and fall back to Docker, with
   `--docker` forcing Docker. Both paths must pass identical flags so they
@@ -30,9 +31,10 @@ and formatting requirements that apply to all code.
   checked up front rather than half way through. Clean temporary directories on
   every exit path with `trap ... EXIT` as `package.sh` does.
 - Keep builds reproducible: pin inputs (toolchain channel, base image tag
-  **and** digest, apk versions) and neutralize timestamps and host paths. Do not
-  float a version that was previously pinned. `build.sh` writes
-  `dist/task.sha256` — a rebuild from the same commit must match it.
+  **and** digest, the Nix flake lock that fixes every package in the image) and
+  neutralize timestamps and host paths. Do not float a version that was
+  previously pinned. `build.sh` writes `dist/task.sha256` — a rebuild from the
+  same commit must match it.
 - Do not introduce `curl` to new external domains without rationale. Verify
   downloads against a pinned checksum.
 - Never embed credentials in scripts or Docker layers, and do not echo secrets

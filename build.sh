@@ -79,19 +79,19 @@ BUILD_ENV=(
   CARGO_TARGET_DIR=/work/target
   SOURCE_DATE_EPOCH=0
   "RUSTFLAGS=$RUSTFLAGS_VAL"
-  # Alpine's gcc is the musl C compiler; point cc-rs (ring, zstd) at it and make
-  # its output path-independent too.
-  "CC_${TARGET//-/_}=gcc"
+  # .cargo/config.toml selects the musl C compiler for ring and zstd;
+  # remap its output paths here.
   "CFLAGS_${TARGET//-/_}=-ffile-prefix-map=/work=/src -ffile-prefix-map=/work/target/.cargo-home=/cargo"
 )
 BUILD_CMD="cargo build --release -p task --target $TARGET"
 
-# Read and validate the pinned inputs recorded in the build manifest.
+# Read and validate the manifest's pinned inputs. The flake lock digest identifies
+# every package version in the image's toolchain closure.
 toolchain=$(sed -nE 's/^channel = "(.*)"$/\1/p' rust-toolchain.toml)
-base_image=$(sed -nE 's/^FROM (rust:[^ ]+).*$/\1/p' .devcontainer/Dockerfile)
-apk_pins=$(sha256sum .devcontainer/apk-pins.txt | cut -d' ' -f1)
+base_image=$(sed -nE 's/^FROM (nixos\/nix:[^ ]+).*$/\1/p' .devcontainer/Dockerfile)
+flake_lock=$(sha256sum .devcontainer/nix/flake.lock | cut -d' ' -f1)
 : "${toolchain:?no channel found in rust-toolchain.toml}"
-: "${base_image:?no FROM rust: line found in .devcontainer/Dockerfile}"
+: "${base_image:?no FROM nixos/nix: line found in .devcontainer/Dockerfile}"
 
 VK_BIN=""
 if [ -z "$FORCE_DOCKER" ] && command -v vk >/dev/null 2>&1; then
@@ -101,8 +101,8 @@ fi
 
 if [ -n "$VK_BIN" ]; then
   # ---- dogfood backend: vk microVM ----
-  # The devcontainer RUN steps need egress for apk, and the compile needs egress for
-  # cargo (--net); the workspace build wants all CPUs and enough RAM not to OOM rustc.
+  # Image creation needs network access for `nix build`; compilation needs it for
+  # cargo (--net), plus all CPUs and enough RAM to avoid rustc running out of memory.
   # This --target selects the Dockerfile stage, not a Rust target.
   exports=""
   for e in "${BUILD_ENV[@]}"; do exports+="export ${e%%=*}='${e#*=}'; "; done
@@ -145,7 +145,7 @@ git diff --quiet HEAD 2>/dev/null || dirty=" (dirty tree)"
     echo "# target:     ${TARGET}"
     echo "# toolchain:  ${toolchain}"
     echo "# base image: ${base_image}"
-    echo "# apk pins:   sha256:${apk_pins}"
+    echo "# flake lock: sha256:${flake_lock}"
     # Preserve the expected manifest because build.sh overwrites task.sha256.
     echo "# verify: git checkout ${commit} && cp dist/task.sha256 /tmp/task.expected &&"
     echo "#         ./build.sh && ( cd dist && sha256sum -c /tmp/task.expected )"

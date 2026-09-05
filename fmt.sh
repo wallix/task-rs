@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# fmt.sh — reformat all sources with rustfmt (the pinned version from rust-toolchain.toml),
-# inside the devcontainer so the rustfmt version matches CI exactly. Prefers a `vk` on PATH
-# (the microVM builder, like build.sh); pass --docker to force the Docker backend. Extra
-# arguments are forwarded to cargo fmt (e.g. --check).
+# Run rustfmt on all sources in the devcontainer's locked Nix toolchain. ./update.sh
+# keeps its version aligned with rust-toolchain.toml and CI. Like build.sh, prefer
+# vk on PATH (microVM); --docker forces Docker. Forward extra arguments to cargo fmt
+# (e.g. --check).
 set -euo pipefail
 cd "$(dirname "$0")"
 
