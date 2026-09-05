@@ -1,6 +1,9 @@
 name: CI
 
 # Run quality checks and Linux release builds on branches and pull requests.
+#
+# The build job is deliberately gated on the quality checks — a push that cannot pass them
+# never spends a build.
 
 on:
   pull_request:
@@ -17,6 +20,7 @@ jobs:
 
   # Exercise the Linux release path without running native platform jobs.
   build:
+    needs: [quality]
     uses: ./.github/workflows/build.yml
     with:
       artifact-prefix: ci
