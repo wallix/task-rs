@@ -241,8 +241,9 @@ when build inputs change.
 
 `.github/workflows/`: `ci.yml` (push to `main` + PRs) and `release.yml` (on a
 `v*` tag) both call the reusable `quality.yml`, which runs fmt, clippy, `cargo
-test --workspace`, and `cargo audit --deny warnings`. Generated code **must**
-pass those checks.
+test --workspace`, and `cargo audit --deny warnings` — one matrix entry each,
+all four inside the pinned `task-build` image, so CI uses exactly the toolchain
+the release build uses. Generated code **must** pass those checks.
 
 Both also call `build.yml`. CI runs its Linux jobs; releases run the full matrix
 with reproducibility verification, then publish using `release-notes.sh`.

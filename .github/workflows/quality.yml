@@ -1,8 +1,15 @@
 name: Quality
 
 # Reusable fmt/clippy/test/audit checks, called by ci.yml (push/PR) and release.yml
-# (tag gate) so a release build is gated on the exact same checks as ordinary CI,
-# rather than relying on a separate ci.yml run happening to have passed for that tag.
+# (release gate) so a release build is gated on the exact same checks as ordinary CI,
+# rather than relying on a separate ci.yml run happening to have passed for that commit.
+#
+# All checks use build.sh's pinned task-build devcontainer image, with rustc,
+# clippy, rustfmt and cargo-audit pinned by the Nix flake lock, not the runner.
+#
+# One matrix entry per check runs them in parallel; add an entry for a new check.
+# Each entry builds the image: a cold build realizes the whole Nix closure;
+# a warm build restores it from the layer cache.
 
 on:
   workflow_call:
@@ -11,54 +18,82 @@ permissions:
   contents: read
 
 jobs:
-  lint:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: fmt
+            cmd: cargo fmt --all -- --check
+            timeout: 20
+          - name: clippy
+            cmd: cargo clippy --workspace --all-targets -- -D warnings
+            timeout: 45
+          - name: test
+            cmd: cargo test --workspace
+            timeout: 45
+          # cargo-audit comes from the image's closure, so its version moves with the
+          # flake lock. --deny warnings fails the job on any advisory. It picks up
+          # .cargo/audit.toml (the RUSTSEC ignore list) from the working directory if the
+          # repo grows one, the same file a local ./audit.sh run would read.
+          - name: audit
+            cmd: cargo audit --deny warnings
+            timeout: 20
+    name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: ${{ matrix.timeout }}
     steps:
       - uses: actions/checkout@v7
 
-      # Installs the toolchain pinned in rust-toolchain.toml (channel + clippy,
-      # rustfmt components) via the rustup that ships on the runner.
-      - name: Install pinned toolchain
-        run: rustup show
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Format
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-  test:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install pinned toolchain
-        run: rustup show
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Test
-        run: cargo test --workspace
-
-  audit:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+      # Layer cache for the image build. Keyed on the whole devcontainer directory, so any
+      # change to the Dockerfile or the flake lock builds fresh; restore-keys let a PR
+      # start from main's cache. The move dance is what keeps the cache from growing
+      # without bound — buildx writes a new export rather than updating in place.
+      - name: Cache toolchain image layers
+        uses: actions/cache@v4
         with:
-          tool: cargo-audit
+          path: /tmp/buildx-cache
+          key: buildx-${{ hashFiles('.devcontainer/**') }}
+          restore-keys: buildx-
 
-      # Reads the committed Cargo.lock directly (no workspace compile needed).
-      # .cargo/audit.toml, if present, holds the RUSTSEC ignore list — see audit.sh,
-      # which runs this same check locally via the devcontainer.
-      - name: cargo audit
-        run: cargo audit --deny warnings
+      - name: Build toolchain image
+        run: |
+          set -euo pipefail
+          # The default builder cannot export a cache; docker-container can.
+          docker buildx create --name task-ci --driver docker-container --use >/dev/null
+          docker buildx build --load \
+            --target task-build -t task-build \
+            --cache-from type=local,src=/tmp/buildx-cache \
+            --cache-to type=local,dest=/tmp/buildx-cache-new,mode=max \
+            -f .devcontainer/Dockerfile .devcontainer
+          rm -rf /tmp/buildx-cache
+          mv /tmp/buildx-cache-new /tmp/buildx-cache
+
+      # Cache registry downloads and build artifacts in the cargo home and target
+      # directory used below. Per-check keys keep fast checks from overwriting
+      # compilation caches with an empty target/.
+      - name: Cache cargo home and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/.cargo-home/registry
+            target/.cargo-home/git
+            target/debug
+          key: cargo-${{ matrix.name }}-${{ hashFiles('Cargo.lock', '.devcontainer/nix/flake.lock') }}
+          restore-keys: cargo-${{ matrix.name }}-
+
+      # --user is the runner's uid, overriding the image's unprivileged default, so the
+      # checkout and everything written under target/ stays readable by later steps and by
+      # the cache action. --init gives the container a PID 1 that reaps orphans, as any
+      # normal system does; without it cargo is PID 1 and the processes the test suite's
+      # executor spawns pile up as zombies for the whole run.
+      - name: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          docker run --rm --init \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -e CARGO_HOME=/work/target/.cargo-home \
+            -v "$PWD":/work -w /work \
+            task-build \
+            ${{ matrix.cmd }}
