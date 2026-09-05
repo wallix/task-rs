@@ -60,14 +60,14 @@
           # for these two triples is also their rustc target name.
           muslTarget = muslPkgs.stdenv.hostPlatform.config;
 
-          # Exact toolchain: channel 1.97.1 — the same channel, minimal profile and
+          # Exact toolchain: channel 1.98.1 — the same channel, minimal profile and
           # clippy/rustfmt components ../../rust-toolchain.toml pins, kept in sync by
           # ./update.sh, plus the musl target the release build needs (that file
           # deliberately pins no target). Reading it directly (rust-overlay's
           # fromRustupToolchainFile) would require the flake at the repo ROOT — a flake
           # cannot read `..` outside its own dir in pure eval — so with the flake under
           # .devcontainer/nix/ the channel is inline.
-          rustToolchain = pkgs.rust-bin.stable."1.97.1".minimal.override {
+          rustToolchain = pkgs.rust-bin.stable."1.98.1".minimal.override {
             extensions = [ "clippy" "rustfmt" ];
             targets = [ muslTarget ];
           };

@@ -1106,14 +1106,20 @@ fn parse_digest(text: &str, name: &str) -> Result<[u8; 32]> {
 }
 
 /// 64 hex digits as the 32 bytes they encode. The length and alphabet are
-/// checked first, so the pairing below cannot run short.
+/// checked first; 64 is even, so `as_chunks` yields 32 pairs with no remainder.
+/// Check the pair count so a short `zip` returns `None` instead of a digest
+/// padded with zeros.
 fn parse_sha256(s: &str) -> Option<[u8; 32]> {
     let hex = s.as_bytes();
     if hex.len() != 64 || !hex.iter().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 32];
-    for (byte, pair) in out.iter_mut().zip(hex.chunks_exact(2)) {
+    let (pairs, _) = hex.as_chunks::<2>();
+    if pairs.len() != out.len() {
+        return None;
+    }
+    for (byte, pair) in out.iter_mut().zip(pairs) {
         *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
     }
     Some(out)

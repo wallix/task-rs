@@ -32,8 +32,10 @@ pub enum CompilerError {
     DynamicVar {
         /// The failing command.
         command: String,
-        /// The underlying execution error.
-        source: execext::Error,
+        /// The underlying execution error. Boxed to keep `CompilerError`
+        /// under clippy's 128-byte `result_large_err` threshold: the shell
+        /// error inside it is 120 bytes on its own.
+        source: Box<execext::Error>,
     },
 }
 
@@ -320,7 +322,7 @@ impl Compiler {
             .await
             .map_err(|source| CompilerError::DynamicVar {
                 command: command.clone(),
-                source,
+                source: Box::new(source),
             })?;
 
         // Trim a single trailing newline (CRLF or LF) so command output is
