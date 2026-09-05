@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.5.0 - 2026-09-05
+
 - **A Linux release stays rebuildable for good.** The pinned build environment
   is now one locked package set whose sources stay fetchable indefinitely,
   replacing hand-pinned Alpine packages that eventually disappear. Rebuilding a
