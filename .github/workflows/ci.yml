@@ -1,9 +1,13 @@
 name: CI
 
-# Run quality checks and Linux release builds on branches and pull requests.
+# Run quality checks and Linux release builds on `main` and pull requests. A push to
+# `release` does not match, so a candidate is gated once, by release.yml, which calls the
+# same reusable quality.yml. (Publishing fast-forwards `main`, and that push does run this
+# workflow again on the identical commit.)
 #
 # The build job is deliberately gated on the quality checks — a push that cannot pass them
-# never spends a build.
+# never spends a build — and uploads the Linux archives as GitHub Actions artifacts, so a
+# build can be grabbed from any commit without waiting for a release.
 
 on:
   pull_request:

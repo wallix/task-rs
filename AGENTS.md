@@ -66,8 +66,8 @@ Shared test fixtures live in the top-level `testdata/` (one directory per case),
 driven by the black-box binary tests in `crates/task/tests/`. `taskcore`'s own
 integration tests (`crates/taskcore/tests/`) build their Taskfiles in temporary
 directories instead. The one test outside cargo is
-[`tests/release-e2e.sh`](tests/release-e2e.sh), which drives the packaged binary
-out of `dist/` rather than the workspace.
+[`tests/release-e2e.sh`](tests/release-e2e.sh), the release gate: it drives the
+packaged binary rather than the workspace.
 
 User-facing documentation lives in `docs/` — the guide, the getting-started /
 installation / FAQ / integrations / cache-server / style-guide /
@@ -179,41 +179,50 @@ and update it when the guarantee changes.
 
 ### Cutting a release
 
-By hand, from a clean tree on an up-to-date `main`, with `v<X.Y.Z>` not already
-a tag: a `v*` tag triggers `release.yml` wherever it sits, publishing artifacts
-built from the commit it points at. The tag is the point of no return —
-everything below happens before it is pushed, because undoing it means deleting
-a published tag.
+`release` is the integration branch, and the tag is a *result* of a green
+pipeline rather than its trigger. Push the candidate there and `release.yml`
+gates it, then fast-forwards `main` to it, pushes `v<X.Y.Z>` and publishes the
+GitHub release. A failed candidate is corrected and force-pushed to `release`
+(`git push --force-with-lease origin HEAD:release`); no tag existed for it, so
+no tag is ever moved. `release` is the disposable branch that absorbs those
+rewrites, which is what keeps tags and `main` append-only.
+
+Because `publish` fast-forwards `main` from whatever `release` holds, `release`
+is a write path into `main` and must be protected at least as strictly as it —
+otherwise the review `main` expects is bypassed. `main` in turn has to let the
+workflow's `GITHUB_TOKEN` fast-forward it: a "require a pull request" rule there
+rejects that push outright.
 
 1. Insert a `## v<X.Y.Z> - <YYYY-MM-DD>` heading in `CHANGELOG.md` below
    `## Unreleased`, moving the unreleased entries under it and leaving
    `## Unreleased` empty for the next cycle.
 2. Set `version` under `[workspace.package]` in the root `Cargo.toml` to the
    same version — every crate inherits it.
-3. Run the four checks `quality.yml` runs, since `release.yml` runs them again
-   on the tagged commit and a failure there costs a published tag:
+3. Refresh `Cargo.lock` (`cargo check --workspace`) and commit it with the bump:
+   CI builds `--locked`, so a lock still naming the old version fails the gate.
+4. Commit as `task-rs: release <X.Y.Z>` on top of an up-to-date `main`, then
+   `git push origin HEAD:release`.
 
-   ```bash
-   cargo fmt --all -- --check
-   cargo clippy --workspace --all-targets --locked -- -D warnings
-   cargo test --workspace --locked   # commit any Cargo.lock change first
-   ./audit.sh --deny warnings      # bare cargo audit passes what CI denies
-   ```
+The tag is lightweight, so it carries no tagger metadata of its own and
+`git describe` names the commit directly. The tag, the workspace version and the
+newest CHANGELOG heading must agree: `prepare` derives the tag from
+`Cargo.toml`, and `release-notes.sh` takes the body from the matching
+`## v<X.Y.Z>` section.
+`cargo test --workspace --locked` is where `version_matches_changelog` ties the
+workspace version to that heading.
 
-   `cargo test --workspace` is where `version_matches_changelog` ties the
-   workspace version to the newest CHANGELOG heading.
-4. Check the notes the release will carry: `./release-notes.sh v<X.Y.Z>` prints
-   the section `release.yml` will publish, and fails if the heading from step 1
-   is missing.
-5. Commit as `task-rs: release <X.Y.Z>`, tag it `v<X.Y.Z>` (annotated), then
-   push the branch **first** — if that push is rejected, do not push the tag —
-   and the tag after it. The tag must be `v` + the workspace version + the
-   newest CHANGELOG heading, all three agreeing: `release.yml` takes the release
-   notes from the matching `## v<X.Y.Z>` section.
+The pipeline is `prepare` (version, unreleased tag, dated CHANGELOG section,
+candidate contains `main`) → `quality` (fmt, clippy, `cargo test --workspace
+--locked`, audit) and `build` (all six platforms, both Linux binaries rebuilt
+from a clean copy and required to reproduce byte-for-byte) → `e2e`
+([`tests/release-e2e.sh`](tests/release-e2e.sh), which unpacks the very archives
+that will be published and drives the shipped binary) → `publish`. Nothing is
+written to `main` or to a tag until all of them are green, so running the checks
+locally first is a convenience, not a safeguard.
 
-The workflow publishes only after all fourteen assets exist and both Linux
-binaries reproduce from a clean copy. Run `./build.sh --verify` before tagging
-when build inputs change.
+`publish` can repeat each step: fast-forward `main`, push the tag, create the
+release. After a partial failure, re-run the failed job from the Actions UI;
+do not tag by hand.
 
 ## Code Quality Config
 
@@ -242,16 +251,18 @@ when build inputs change.
 
 ## CI
 
-`.github/workflows/`: `ci.yml` (push to `main` + PRs) and `release.yml` (on a
-`v*` tag) both call the reusable `quality.yml`, which runs fmt, clippy, `cargo
+`.github/workflows/`: `ci.yml` (push to `main` + PRs) and `release.yml` (push to
+`release`) both call the reusable `quality.yml`, which runs fmt, clippy, `cargo
 test --workspace --locked`, and `cargo audit --deny warnings` — one matrix entry
 each, all four inside the pinned `task-build` image, so CI uses exactly the
 toolchain the release build uses. Generated code **must** pass those checks.
 Commit dependency changes with their `Cargo.lock` updates. `build.sh` and
 `lint.sh` also pass `--locked`, so local runs reject a stale lockfile too.
 
-Both also call `build.yml`. CI runs its Linux jobs; releases run the full matrix
-with reproducibility verification, then publish using `release-notes.sh`.
+Both also call `build.yml` — gated on `quality` in CI, in parallel with it on a
+release, where the build matrix is the long pole. CI runs its Linux jobs;
+releases run the full matrix with reproducibility verification, then gate on
+`tests/release-e2e.sh` before publishing with `release-notes.sh`.
 
 ## Commit Messages
 
