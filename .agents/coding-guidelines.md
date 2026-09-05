@@ -26,12 +26,14 @@
 ## Formatting Requirements
 
 Generated code **must** pass CI's checks (`.github/workflows/quality.yml`: fmt,
-clippy, `cargo test --workspace`, `cargo audit --deny warnings`). Only the Rust
-row below is CI-enforced; the rest are conventions to follow by hand.
+clippy, `cargo test --workspace --locked`, `cargo audit --deny warnings`). Only
+the Rust row below is CI-enforced; the rest are conventions to follow by hand.
+`--locked` rejects a stale `Cargo.lock` instead of updating it. Commit
+dependency changes with their lockfile updates.
 
 | Language | Formatter / Linter | Check command | Fix command |
 |----------|--------------------|---------------|-------------|
-| Rust | rustfmt + clippy (CI-enforced) | `cargo fmt --all -- --check` && `cargo clippy --workspace --all-targets -- -D warnings` | `cargo fmt --all` |
+| Rust | rustfmt + clippy (CI-enforced) | `cargo fmt --all -- --check` && `cargo clippy --workspace --all-targets --locked -- -D warnings` | `cargo fmt --all` |
 | Shell (*.sh) | — (no formatter configured) | `bash -n <file>`, or `sh -n <file>` for the POSIX scripts | — |
 | YAML / JSON / Markdown | `.prettierrc.yml` + `.editorconfig` (advisory — no prettier in CI, and no prettier in the repo or the devcontainer) | — | — |
 

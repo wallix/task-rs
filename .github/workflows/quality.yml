@@ -27,10 +27,10 @@ jobs:
             cmd: cargo fmt --all -- --check
             timeout: 20
           - name: clippy
-            cmd: cargo clippy --workspace --all-targets -- -D warnings
+            cmd: cargo clippy --workspace --all-targets --locked -- -D warnings
             timeout: 45
           - name: test
-            cmd: cargo test --workspace
+            cmd: cargo test --workspace --locked
             timeout: 45
           # cargo-audit comes from the image's closure, so its version moves with the
           # flake lock. --deny warnings fails the job on any advisory. It picks up

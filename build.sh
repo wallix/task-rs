@@ -83,7 +83,7 @@ BUILD_ENV=(
   # remap its output paths here.
   "CFLAGS_${TARGET//-/_}=-ffile-prefix-map=/work=/src -ffile-prefix-map=/work/target/.cargo-home=/cargo"
 )
-BUILD_CMD="cargo build --release -p task --target $TARGET"
+BUILD_CMD="cargo build --release -p task --target $TARGET --locked"
 
 # Read and validate the manifest's pinned inputs. The flake lock digest identifies
 # every package version in the image's toolchain closure.

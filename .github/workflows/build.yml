@@ -113,7 +113,7 @@ jobs:
           fi
           export RUSTFLAGS="--remap-path-prefix=$workspace=/src --remap-path-prefix=$cargo_home=/cargo"
           echo "RUSTFLAGS=$RUSTFLAGS"
-          cargo build --release -p task --target ${{ matrix.target }}
+          cargo build --release -p task --target ${{ matrix.target }} --locked
 
       - name: Upload binary
         uses: actions/upload-artifact@v7

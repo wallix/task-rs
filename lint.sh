@@ -22,7 +22,7 @@ if [ -z "$FORCE_DOCKER" ] && command -v vk >/dev/null 2>&1; then
   exec vk run \
     --file .devcontainer/Dockerfile --context .devcontainer --target task-build \
     --workdir "$PWD" --net --cpus host --mem 8G \
-    -- cargo clippy --workspace --all-targets -- -D warnings "${args[@]}"
+    -- cargo clippy --workspace --all-targets --locked -- -D warnings "${args[@]}"
 fi
 
 docker build --target task-build -t task-build -f .devcontainer/Dockerfile .devcontainer
@@ -31,4 +31,4 @@ docker run --rm \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -e CARGO_HOME=/work/target/.cargo-home \
   -v "$PWD":/work -w /work \
   task-build \
-  cargo clippy --workspace --all-targets -- -D warnings "${args[@]}"
+  cargo clippy --workspace --all-targets --locked -- -D warnings "${args[@]}"

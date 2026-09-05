@@ -106,8 +106,8 @@ host `cargo` is enough for the edit loop.
 
 ```bash
 cargo build -p task                                  # debug binary
-cargo test --workspace                               # full suite (CI parity)
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked                      # full suite (CI parity)
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all                                      # check: --all -- --check
 ```
 
@@ -135,8 +135,8 @@ cargo test -p taskcore --lib fingerprint::
 cargo test -p task --test cache
 ```
 
-Run the full `cargo test --workspace` before calling a change done — the parity
-suite is the safety net for the compatibility constraint above.
+Run the full `cargo test --workspace --locked` before calling a change done —
+the suite is the safety net for the compatibility constraint above.
 
 ### Build / container scripts
 
@@ -156,7 +156,7 @@ Nix.
            [--verify]     # rebuild from a pristine copy and assert identical bytes
 ./package.sh --platform <name> --binary <path>   # deterministic release archive
 ./release-notes.sh v<X.Y.Z>   # that tag's CHANGELOG section, for the release notes
-./lint.sh  [--docker]     # cargo clippy --workspace --all-targets -- -D warnings
+./lint.sh  [--docker]     # cargo clippy --workspace --all-targets --locked -- -D warnings
 ./fmt.sh   [--docker]     # cargo fmt (--check to verify)
 ./audit.sh [--docker]     # cargo-audit against the committed Cargo.lock
 ./update.sh               # bump the pinned toolchain + re-pin the base image and flake lock
@@ -192,8 +192,8 @@ a published tag.
 
    ```bash
    cargo fmt --all -- --check
-   cargo clippy --workspace --all-targets -- -D warnings
-   cargo test --workspace          # also refreshes Cargo.lock
+   cargo clippy --workspace --all-targets --locked -- -D warnings
+   cargo test --workspace --locked   # commit any Cargo.lock change first
    ./audit.sh --deny warnings      # bare cargo audit passes what CI denies
    ```
 
@@ -241,9 +241,11 @@ when build inputs change.
 
 `.github/workflows/`: `ci.yml` (push to `main` + PRs) and `release.yml` (on a
 `v*` tag) both call the reusable `quality.yml`, which runs fmt, clippy, `cargo
-test --workspace`, and `cargo audit --deny warnings` — one matrix entry each,
-all four inside the pinned `task-build` image, so CI uses exactly the toolchain
-the release build uses. Generated code **must** pass those checks.
+test --workspace --locked`, and `cargo audit --deny warnings` — one matrix entry
+each, all four inside the pinned `task-build` image, so CI uses exactly the
+toolchain the release build uses. Generated code **must** pass those checks.
+Commit dependency changes with their `Cargo.lock` updates. `build.sh` and
+`lint.sh` also pass `--locked`, so local runs reject a stale lockfile too.
 
 Both also call `build.yml`. CI runs its Linux jobs; releases run the full matrix
 with reproducibility verification, then publish using `release-notes.sh`.
