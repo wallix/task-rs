@@ -65,7 +65,9 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with three crates:
 Shared test fixtures live in the top-level `testdata/` (one directory per case),
 driven by the black-box binary tests in `crates/task/tests/`. `taskcore`'s own
 integration tests (`crates/taskcore/tests/`) build their Taskfiles in temporary
-directories instead.
+directories instead. The one test outside cargo is
+[`tests/release-e2e.sh`](tests/release-e2e.sh), which drives the packaged binary
+out of `dist/` rather than the workspace.
 
 User-facing documentation lives in `docs/` — the guide, the getting-started /
 installation / FAQ / integrations / cache-server / style-guide /
@@ -143,11 +145,11 @@ the suite is the safety net for the compatibility constraint above.
 `build.sh`, `lint.sh`, `fmt.sh` and `audit.sh` run inside the pinned
 devcontainer image (one stage, `task-build`). They use `vk` when available and
 fall back to Docker; `--docker` forces Docker.
-`package.sh`, `release-notes.sh`, `update.sh` and `install-task.sh` run on the
-host; `update.sh` additionally needs `rustup`, `curl` and `docker` with the
-`buildx` plugin — it resolves the base-image version and digest over the
-network and refreshes the flake lock inside a container, so the host needs no
-Nix.
+`package.sh`, `release-notes.sh`, `update.sh`, `tests/release-e2e.sh` and
+`install-task.sh` run on the host; `update.sh` additionally needs `rustup`,
+`curl` and `docker` with the `buildx` plugin — it resolves the base-image
+version and digest over the network and refreshes the flake lock inside a
+container, so the host needs no Nix.
 
 ```bash
 ./build.sh [--docker]     # reproducible static-musl binary -> dist/task (+ dist/task.sha256)
@@ -161,6 +163,7 @@ Nix.
 ./audit.sh [--docker]     # cargo-audit against the committed Cargo.lock
 ./update.sh               # bump the pinned toolchain + re-pin the base image and flake lock
 ./install-task.sh         # the POSIX-sh installer published for end users
+RELEASE_TAG=v<X.Y.Z> tests/release-e2e.sh   # the release gate, against dist/
 ```
 
 `build.sh` output is a stripped static ELF that links no system C libraries

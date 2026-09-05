@@ -53,6 +53,11 @@ tasks:
     cmds:
       - ./build.sh {{ CLI_ARGS }}
 
+  release:e2e:
+    desc: Run the release end-to-end gate over the archives in dist/
+    cmds:
+      - ./tests/release-e2e.sh
+
   clean:
     desc: Clean build artifacts
     aliases: [clear]
