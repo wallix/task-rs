@@ -585,6 +585,14 @@ tasks:
       - go build -o app ./cmd
 ```
 
+When collecting generated files for a cache archive, wildcards include hidden
+entries such as `node_modules/.bin`. Recursive patterns such as
+`node_modules/**/*` store directory symlinks as links without traversing their
+targets. A literal directory segment can still resolve through a symlink, as
+in `node_modules/workspace/*`. Exclusions use the same matching rules.
+Fingerprint checksums retain their existing matching rules, so existing
+`.task` state stays valid.
+
 #### `status`
 
 - **Type**: `[]string`

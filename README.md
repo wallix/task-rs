@@ -227,6 +227,13 @@ generates:
     fingerprint: node_modules/.yarn-state.yml
 ```
 
+The cache archives the whole tree under a `generates` glob, not what a shell
+listing of it would show: hidden entries such as `node_modules/.bin` are
+included, and a symlink to a directory is stored as the link rather than
+followed into its target. Literal directory segments can still resolve through
+symlinks, as in `node_modules/workspace/*`. Fingerprint checksums keep the
+shell's view, so existing `.task` state stays valid.
+
 `sources` and `generates` may also inherit entries from direct dependencies or
 task calls. This keeps wrapper tasks aligned with the work they aggregate:
 

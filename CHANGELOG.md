@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Cache archives carry the whole generated tree.** Collecting a `generates`
+  glob for the cache now includes hidden entries — `node_modules/.bin` and
+  every other dot file or directory under `**/*` — and stores a symlink to a
+  directory as the link instead of following it into its target, so a restored
+  `node_modules` runs and a Yarn workspace keeps its links. Fingerprint
+  checksums still see what the shell lists, so `.task` state is unaffected.
+
 ## v4.6.0 - 2026-09-18
 
 - **`run: once` tasks run once across direct and nested includes.**

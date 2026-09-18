@@ -1,0 +1,10 @@
+version: '3'
+tasks:
+  install:
+    sources:
+      - input.txt
+    generates:
+      - glob: node_modules/**/*
+        fingerprint: node_modules/.yarn-state.yml
+    cmds:
+      - sh install.sh

@@ -114,6 +114,61 @@ fn export_import_cache() {
     );
 }
 
+// A `generates` tree is archived whole: hidden entries (`.bin` shims, a
+// `.yarn-state.yml` fingerprint, per-package `.github`) travel with it, and a
+// symlink to a directory is stored as the link rather than followed into its
+// target. After the round trip the tree is byte-for-byte the install.
+#[cfg(unix)]
+#[test]
+fn export_import_cache_keeps_hidden_entries_and_directory_symlinks() {
+    let dir = stage("cache_generated_tree");
+    assert!(run(&dir, &["install"]).ok());
+
+    let cache = dir.join("cache.zip");
+    let cache_s = cache.to_str().unwrap();
+    let exp = run(&dir, &["--export-cache", cache_s, "install"]);
+    assert!(exp.ok(), "export failed: {}", exp.combined());
+
+    // Simulate a fresh runner: the install is gone, the sources remain.
+    std::fs::remove_dir_all(dir.join("node_modules")).unwrap();
+    std::fs::remove_dir_all(dir.join(".task")).unwrap();
+
+    let imp = run(&dir, &["--import-cache", cache_s, "install"]);
+    assert!(imp.ok(), "import failed: {}", imp.combined());
+
+    let nm = dir.join("node_modules");
+    assert_eq!(
+        std::fs::read_to_string(nm.join(".yarn-state.yml")).unwrap(),
+        "state\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(nm.join("pkg/.github/FUNDING.yml")).unwrap(),
+        "fund\n"
+    );
+    assert_eq!(
+        std::fs::read_link(nm.join(".bin/pkg")).unwrap(),
+        Path::new("../pkg/index.js")
+    );
+    assert_eq!(
+        std::fs::read_link(nm.join("@ws/lib")).unwrap(),
+        Path::new("../../packages/lib")
+    );
+    // The workspace package is reached through the link, not a copy.
+    assert_eq!(
+        std::fs::read_to_string(nm.join("@ws/lib/index.js")).unwrap(),
+        "lib\n"
+    );
+    assert_eq!(dir_len(&dir.join("packages/lib")), 1);
+
+    let status = run(&dir, &["--status", "install"]);
+    assert!(status.ok(), "status failed: {}", status.combined());
+    assert!(
+        status.combined().contains("is up to date"),
+        "expected up to date after import: {}",
+        status.combined()
+    );
+}
+
 // Ports Go `TestExportCacheSkipsNotUpToDate`. A task that has never run is not
 // up to date, so export must produce no zip.
 #[test]
