@@ -169,6 +169,145 @@ fn export_import_cache_keeps_hidden_entries_and_directory_symlinks() {
     );
 }
 
+// Hidden outputs do not affect the stored generates checksum. A partial
+// restore must invalidate it even while all visible outputs still match.
+#[cfg(unix)]
+#[test]
+fn failed_import_leaves_the_task_not_up_to_date() {
+    for calls in [&["build"][..], &["default"][..], &[][..]] {
+        for temp_dir in [".task", ".state"] {
+            let dir = stage("cache_failed_import");
+            let env = [("TASK_TEMP_DIR", temp_dir)];
+            let (output, code) = run_env(&dir, &["build", "other"], &env);
+            assert_eq!(code, 0, "build failed: {output}");
+
+            let cache = dir.join("cache.zip");
+            let cache_s = cache.to_str().unwrap();
+            let (output, code) =
+                run_env(&dir, &["--export-cache", cache_s, "build", "other"], &env);
+            assert_eq!(code, 0, "export failed: {output}");
+
+            // Extraction refuses symlink parents, even inside the project.
+            // Keep visible output intact to isolate checksum invalidation.
+            std::fs::remove_dir_all(dir.join("out/.hidden")).unwrap();
+            std::fs::remove_dir_all(dir.join(temp_dir)).unwrap();
+            std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
+            std::os::unix::fs::symlink("../elsewhere", dir.join("out/.hidden")).unwrap();
+            std::fs::write(dir.join("fail-vars"), "").unwrap();
+
+            let mut args = vec!["--import-cache", cache_s];
+            args.extend_from_slice(calls);
+            let (output, code) = run_env(&dir, &args, &env);
+            assert_ne!(code, 0, "import should fail: {output}");
+            assert!(
+                output.contains("is a symlink"),
+                "unexpected failure: {output}"
+            );
+            assert!(!dir.join(temp_dir).join("checksum").exists());
+            assert!(!dir.join("vars-evaluated").exists());
+            assert!(!dir.join("out/.hidden/data").exists());
+
+            std::fs::remove_file(dir.join("fail-vars")).unwrap();
+            for task in ["build", "other"] {
+                let (output, code) = run_env(&dir, &["--status", task], &env);
+                assert_eq!(code, 0, "status failed for {task}: {output}");
+                assert!(output.contains("is not up to date"), "{output}");
+            }
+        }
+    }
+}
+
+#[test]
+fn failed_import_reports_checksum_cleanup_errors() {
+    let dir = stage("cache_failed_import");
+    std::fs::create_dir_all(dir.join(".task")).unwrap();
+    // A file where the checksum directory should be makes cleanup fail
+    // without relying on permissions or the user running the test.
+    std::fs::write(dir.join(".task/checksum"), "invalid state").unwrap();
+    let imp = run(&dir, &["--import-cache", "missing.zip"]);
+    assert!(!imp.ok(), "import should fail: {}", imp.combined());
+    assert!(
+        imp.combined().contains("could not discard checksums"),
+        "{}",
+        imp.combined()
+    );
+    assert!(
+        imp.combined().contains("tasks may still appear up to date"),
+        "{}",
+        imp.combined()
+    );
+    // The extraction error remains visible alongside the cleanup diagnostic.
+    let extraction_error = std::fs::File::open(dir.join("missing.zip"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        imp.combined().contains(&extraction_error),
+        "{}",
+        imp.combined()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_import_cannot_redirect_checksum_cleanup_through_symlinks() {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    for (temp_dir, link, target_suffix) in [
+        (".task", ".task", ""),
+        (".state/nested", ".state", ""),
+        (".task", ".task/checksum", "checksum"),
+    ] {
+        let dir = stage("cache_failed_import");
+        let outside = cache_dir();
+        for checksum_dir in ["checksum", "nested/checksum"] {
+            std::fs::create_dir_all(outside.join(checksum_dir)).unwrap();
+            std::fs::write(outside.join(checksum_dir).join("valuable"), "keep").unwrap();
+        }
+
+        let cache = dir.join("cache.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&cache).unwrap());
+        let target = outside.join(target_suffix);
+        zip.add_symlink(link, target.to_str().unwrap(), SimpleFileOptions::default())
+            .unwrap();
+        zip.start_file(format!("{link}/fail"), SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"must not be written").unwrap();
+        zip.finish().unwrap();
+
+        let (output, code) = run_env(
+            &dir,
+            &["--import-cache", cache.to_str().unwrap()],
+            &[("TASK_TEMP_DIR", temp_dir)],
+        );
+        assert_ne!(code, 0, "import should fail: {output}");
+        assert!(output.contains("is a symlink"), "{output}");
+        for checksum_dir in ["checksum", "nested/checksum"] {
+            assert_eq!(
+                std::fs::read_to_string(outside.join(checksum_dir).join("valuable")).unwrap(),
+                "keep",
+                "cleanup escaped through {link}: {output}"
+            );
+        }
+    }
+}
+
+#[test]
+fn failed_import_invalidates_external_temp_dir() {
+    let dir = stage("cache_failed_import");
+    let external = cache_dir();
+    let env = [("TASK_TEMP_DIR", external.to_str().unwrap())];
+    let (output, code) = run_env(&dir, &["build"], &env);
+    assert_eq!(code, 0, "build failed: {output}");
+    let checksums = external.join(dir.file_name().unwrap()).join("checksum");
+    assert!(checksums.join("build").is_file());
+
+    let (output, code) = run_env(&dir, &["--import-cache", "missing.zip"], &env);
+    assert_ne!(code, 0, "import should fail: {output}");
+    assert!(!checksums.exists());
+    assert!(!output.contains("could not discard checksums"), "{output}");
+}
+
 // Ports Go `TestExportCacheSkipsNotUpToDate`. A task that has never run is not
 // up to date, so export must produce no zip.
 #[test]

@@ -64,6 +64,25 @@ task --init
 task -i
 ```
 
+### `task --export-cache` / `task --import-cache`
+
+Export generated files and saved task checksums to a ZIP archive, then restore
+that archive on another runner:
+
+```bash
+task --export-cache state.zip build test
+task --import-cache state.zip
+```
+
+Import restores all archive entries, regardless of the tasks named on the
+command line. If extraction fails, Task removes the project's saved checksums
+so partially restored outputs do not leave tasks marked up to date. This
+also invalidates tasks outside the archive and respects `TASK_TEMP_DIR`.
+Generated files already extracted remain on disk. If checksum cleanup fails,
+Task reports it alongside the extraction error. Cleanup refuses symbolic-link
+parents; fix the reported problem and invalidate saved task state before
+relying on task status again.
+
 ### `task --update`
 
 Replace this `task` binary with a published

@@ -19,6 +19,7 @@ serde_yaml_ng = { workspace = true }
 indexmap = { workspace = true }
 twox-hash = { workspace = true }
 zip = { workspace = true }
+cap-primitives = { workspace = true }
 regex = { workspace = true }
 redis = { workspace = true }
 minijinja = { workspace = true }

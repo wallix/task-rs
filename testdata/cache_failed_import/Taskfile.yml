@@ -1,0 +1,23 @@
+version: '3'
+tasks:
+  default:
+    cmds: []
+  build:
+    vars:
+      PROBE:
+        sh: 'if test -f fail-vars; then touch vars-evaluated; exit 1; fi; echo ready'
+    sources:
+      - input.txt
+    generates:
+      - out/**/*
+    cmds:
+      - mkdir -p out/.hidden
+      - cp input.txt out/output.txt
+      - echo '{{.PROBE}}' > out/.hidden/data
+  other:
+    sources:
+      - input.txt
+    generates:
+      - other.txt
+    cmds:
+      - cp input.txt other.txt

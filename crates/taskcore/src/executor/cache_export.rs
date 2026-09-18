@@ -4,8 +4,12 @@
 //! `collectCacheFiles` half of Go `cache.go`.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::fs::File;
+use std::io;
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
+
+use cap_primitives::fs::{open_ambient_dir, open_dir_nofollow, remove_dir_all};
 
 use crate::cache::archive::{self, CacheMeta};
 use crate::call::Call;
@@ -67,6 +71,10 @@ impl Executor {
     /// then runs setup tasks so preparation steps are applied. Ports Go
     /// `ImportCache`.
     ///
+    /// Extraction stops at the first failing entry. Discard the project's
+    /// checksums on failure, since some may already describe a partial tree.
+    /// Report cleanup failures alongside the original extraction error.
+    ///
     /// # Panics
     ///
     /// Must be awaited inside a [`tokio::task::LocalSet`]: dependencies, setup
@@ -77,12 +85,36 @@ impl Executor {
         zip_path: &Path,
         calls: &[Call],
     ) -> Result<(), ExecutorError> {
+        // Hold the trusted parent before extraction can replace path entries.
+        let cleanup =
+            ChecksumCleanup::prepare(Path::new(&self.dir), Path::new(&self.temp_dir.fingerprint));
         self.logger().borrow_mut().outf(
             Color::Magenta,
             &format!("task: importing cache from {:?}\n", zip_path.display()),
         );
-        archive::extract_archive(zip_path, Path::new(&self.dir))?;
+        if let Err(e) = archive::extract_archive(zip_path, Path::new(&self.dir)) {
+            self.discard_checksums(cleanup);
+            return Err(e.into());
+        }
         self.run_setup_for_calls(calls).await
+    }
+
+    /// An archive can restore tasks absent from `calls`. Clear all project
+    /// checksums without compiling tasks against partially restored outputs.
+    fn discard_checksums(&self, cleanup: io::Result<ChecksumCleanup>) {
+        let dir = Path::new(&self.temp_dir.fingerprint).join("checksum");
+        if let Err(e) = cleanup.and_then(ChecksumCleanup::discard)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            // Preserve the extraction error, but expose retained stale state.
+            self.logger().borrow_mut().errf(
+                Color::Yellow,
+                &format!(
+                    "task: could not discard checksums at {}: {e}; tasks may still appear up to date\n",
+                    dir.display()
+                ),
+            );
+        }
     }
 
     /// Runs the setup tasks of each call, so their outputs exist before a cache
@@ -149,5 +181,56 @@ impl Executor {
             }
         }
         Ok(())
+    }
+}
+
+/// A trusted directory held across extraction, plus the path to the project's
+/// fingerprint directory. Resolve each remaining component without symlinks.
+struct ChecksumCleanup {
+    parent: File,
+    relative: PathBuf,
+}
+
+impl ChecksumCleanup {
+    fn prepare(project: &Path, fingerprint: &Path) -> io::Result<Self> {
+        if let Ok(relative) = fingerprint.strip_prefix(project) {
+            return Ok(Self {
+                parent: open_ambient_dir(project, cap_primitives::ambient_authority())?,
+                relative: relative.to_path_buf(),
+            });
+        }
+
+        // An external TASK_TEMP_DIR is user-selected. Anchor its closest
+        // existing parent before the archive can create any missing children.
+        for ancestor in fingerprint.ancestors().skip(1) {
+            match open_ambient_dir(ancestor, cap_primitives::ambient_authority()) {
+                Ok(parent) => {
+                    let relative = fingerprint
+                        .strip_prefix(ancestor)
+                        .map_err(io::Error::other)?;
+                    return Ok(Self {
+                        parent,
+                        relative: relative.to_path_buf(),
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::other("no parent for fingerprint directory"))
+    }
+
+    fn discard(self) -> io::Result<()> {
+        let mut parent = self.parent;
+        for component in self.relative.components() {
+            match component {
+                Component::CurDir => continue,
+                Component::Normal(name) => {
+                    parent = open_dir_nofollow(&parent, Path::new(name))?;
+                }
+                _ => return Err(io::Error::other("invalid fingerprint directory path")),
+            }
+        }
+        remove_dir_all(&parent, Path::new("checksum"))
     }
 }

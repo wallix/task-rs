@@ -56,6 +56,9 @@ notify = "8"
 # Zip archive format for the classic (non-OCI) remote build cache, and the
 # Windows release archive `task --update` installs from. No stdlib zip.
 zip = "2"
+# Directory-handle-relative filesystem operations confine checksum cleanup
+# after untrusted cache imports, including on Windows; std has no such API.
+cap-primitives = "4"
 # gzip decoding for the release archive `task --update` installs from (the tar
 # walk itself is hand-rolled in `crates/task/src/update.rs`). Already in the tree
 # as zip's deflate backend, and pure Rust (miniz_oxide), so the musl-static build

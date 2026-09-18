@@ -8,6 +8,9 @@
   directory as the link instead of following it into its target, so a restored
   `node_modules` runs and a Yarn workspace keeps its links. Fingerprint
   checksums still see what the shell lists, so `.task` state is unaffected.
+- **Failed cache imports invalidate saved task status.** After an import
+  fails, tasks rebuild instead of trusting partially restored outputs. If
+  saved status cannot be removed, Task reports that cleanup failure too.
 
 ## v4.6.0 - 2026-09-18
 
