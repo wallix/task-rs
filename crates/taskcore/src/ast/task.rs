@@ -87,9 +87,17 @@ impl Task {
         &self.task
     }
 
-    /// Returns the task name with its namespace prefix (and separator) trimmed.
+    /// Returns the task name with its namespace prefix (and separator) trimmed:
+    /// the name as written in the Taskfile that defines the task, independent
+    /// of how it was included. Uses the wildcard-resolved `full_name` when
+    /// compiled, falling back to the raw task key before compilation so the
+    /// name is usable on a merged but uncompiled task.
     pub fn local_name(&self) -> String {
-        let name = self.full_name.as_str();
+        let name = if self.full_name.is_empty() {
+            self.task.as_str()
+        } else {
+            self.full_name.as_str()
+        };
         let name = name.strip_prefix(&self.namespace).unwrap_or(name);
         name.strip_prefix(':').unwrap_or(name).to_string()
     }
@@ -409,6 +417,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(t.local_name(), "build");
+    }
+
+    // Before compilation, recover the local name from the qualified task key
+    // because `full_name` is empty.
+    #[test]
+    fn local_name_falls_back_to_task_key() {
+        let t = Task {
+            namespace: "outer:sub".to_string(),
+            task: "outer:sub:build".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(t.local_name(), "build");
+    }
+
+    // Compiled wildcard names retain their captures, keeping matches distinct.
+    #[test]
+    fn local_name_prefers_resolved_full_name() {
+        let matched = |m: &str| Task {
+            namespace: "ns".to_string(),
+            task: "ns:generate:*".to_string(),
+            full_name: format!("ns:generate:{m}"),
+            ..Default::default()
+        };
+        assert_eq!(matched("mocks").local_name(), "generate:mocks");
+        assert_eq!(matched("stubs").local_name(), "generate:stubs");
+        assert_ne!(matched("mocks").local_name(), matched("stubs").local_name());
     }
 
     #[test]
