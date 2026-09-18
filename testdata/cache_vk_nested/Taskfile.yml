@@ -1,0 +1,10 @@
+version: '3'
+
+caches:
+  default:
+    vk: '{{.VK_REGISTRY}}'
+    namespace: '{{.VK_NAMESPACE}}'
+
+includes:
+  sub: ./sub.yml
+  outer: ./mid.yml

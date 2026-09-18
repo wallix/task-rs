@@ -6,6 +6,14 @@
 //! vk: host[:port]/repo      →  url:  oci://host[:port]/repo:<namespace>-<task>-<checksum>
 //!                              lock: vks://host[:port]/repo/<namespace>
 //! ```
+//!
+//! `<task>` is the task's name in the Taskfile that defines it, with no include
+//! namespace or `label`, so every include path to a task shares its entry.
+//! `<checksum>` is `hash::cache_checksum`: the sources checksum, extended with
+//! a digest of the task's and the include's `vars`. Nothing in the tag names
+//! the defining Taskfile, so two Taskfiles defining a task of the same name
+//! whose sources, commands, generates and `vars` all match share an entry;
+//! only file-level `vars:`, `env:` or `dotenv:` could then tell them apart.
 
 /// Longest tag an OCI registry accepts (`[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`).
 const MAX_TAG_LEN: usize = 128;

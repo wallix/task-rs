@@ -1,0 +1,14 @@
+version: '3'
+
+tasks:
+  build:
+    sources:
+      - input.txt
+    generates:
+      - output.txt
+    cache:
+      # CACHE_DIR is set by the test harness via a variable. The URL names no
+      # task, so both include paths reach the same archive.
+      url: 'file://{{.CACHE_DIR}}/build-{{.CHECKSUM}}.zip'
+    cmds:
+      - cp input.txt output.txt

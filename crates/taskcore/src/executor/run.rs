@@ -782,7 +782,7 @@ impl Executor {
         // Acquire the build-once lock covering deps, fingerprint, execution and
         // the up-to-date write, for tasks with fingerprint state.
         let lock = self
-            .acquire_task_lock(t, &t.source_hash, cache_url.as_ref())
+            .acquire_task_lock(t, &t.cache_checksum, cache_url.as_ref())
             .await?;
 
         let result = self
@@ -1368,21 +1368,23 @@ impl Executor {
     /// covering deps, the fingerprint check, execution, and the up-to-date
     /// write. Uses the configured `cache.lock` when set, otherwise a local
     /// filesystem lock under `<temp>/locks`, so concurrent invocations of the
-    /// same fingerprinted task serialize. Ports the locking block of Go
-    /// `RunTask` (`e.Locker` = a flock).
+    /// same fingerprinted task serialize. The key is the task's local name and
+    /// `cache_checksum` — the identity its cache entry is keyed by — so every
+    /// include path to a task takes the same lock. Ports the locking block of
+    /// Go `RunTask` (`e.Locker` = a flock).
     async fn acquire_task_lock(
         &self,
         t: &Task,
-        source_hash: &str,
+        cache_checksum: &str,
         _cache_url: Option<&CacheUrl>,
     ) -> Result<Option<cache::Guard>, ExecutorError> {
         if self.dry || t.sources.is_empty() || t.generates.is_empty() {
             return Ok(None);
         }
-        let lock_name = if source_hash.is_empty() {
-            t.name().to_string()
+        let lock_name = if cache_checksum.is_empty() {
+            t.local_name()
         } else {
-            format!("{}:{}", t.name(), source_hash)
+            format!("{}:{}", t.local_name(), cache_checksum)
         };
 
         let file_locker = CacheLock::File {
@@ -1451,19 +1453,21 @@ impl Executor {
     }
 
     /// Validates cache metadata against the task's current state and records the
-    /// fingerprint as up to date on success. Ports Go `cacheVerifyMeta`.
+    /// fingerprint as up to date on success. The task annotation is the local
+    /// name the entry is keyed by, so a copy reached through another include
+    /// verifies against it. Ports Go `cacheVerifyMeta`.
     fn cache_verify_meta(
         &self,
         t: &Task,
         checker: &mut ChecksumChecker,
         meta: &cache::CacheMeta,
     ) -> Result<(), ExecutorError> {
-        if !meta.task.is_empty() && meta.task != t.name() {
+        let local_name = t.local_name();
+        if !meta.task.is_empty() && meta.task != local_name {
             return Err(ExecutorError::Cache(Box::new(cache::CacheError::msg(
                 format!(
-                    "task name mismatch: cached {:?}, expected {:?}",
-                    meta.task,
-                    t.name()
+                    "task name mismatch: cached {:?}, expected {local_name:?}",
+                    meta.task
                 ),
             ))));
         }

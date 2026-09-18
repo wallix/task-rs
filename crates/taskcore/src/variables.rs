@@ -89,6 +89,13 @@ pub enum CompileError {
         /// The rendered value.
         vk: String,
     },
+    /// A cache block's entry key could not be derived from the task.
+    CacheKey {
+        /// The task being compiled.
+        task: String,
+        /// The underlying error message.
+        message: String,
+    },
     /// A cached task references a generates path outside the project root.
     CacheGeneratesOutsideRoot {
         /// The task being compiled.
@@ -128,6 +135,12 @@ impl std::fmt::Display for CompileError {
                 f,
                 "task: {task}: cache: `vk` must be a bare host[:port]/repo, got {vk:?}"
             ),
+            Self::CacheKey { task, message } => {
+                write!(
+                    f,
+                    "task: {task}: cache: cannot derive the entry key: {message}"
+                )
+            }
             Self::CacheGeneratesOutsideRoot { task, glob, root } => write!(
                 f,
                 "task: {task}: generates path {glob:?} is outside project root {root:?}; caching requires all outputs to be within the project directory"
@@ -160,6 +173,14 @@ pub struct CompileContext<'a> {
     pub env_precedence: bool,
     /// The taskfile-level named cache models (`caches:`), for `cache.inherit`.
     pub caches: &'a Caches,
+}
+
+/// Computes the cache key, converting hash errors to compile errors.
+fn cache_checksum(orig_task: &Task, source_hash: &str) -> Result<String, CompileError> {
+    crate::hash::cache_checksum(orig_task, source_hash).map_err(|e| CompileError::CacheKey {
+        task: orig_task.name().to_string(),
+        message: e.to_string(),
+    })
 }
 
 /// Compiles `orig_task` against `vars`, returning the fully-templated task.
@@ -315,6 +336,7 @@ pub async fn compiled_task(
     if !orig_task.sources.is_empty() {
         let mut checker = ChecksumChecker::new(ctx.fingerprint_temp_dir, new.clone());
         let source_hash = checker.source_value().to_string();
+        new.cache_checksum = cache_checksum(orig_task, &source_hash)?;
         new.source_hash = source_hash.clone();
         vars.set(
             "CHECKSUM".to_string(),
@@ -398,6 +420,7 @@ pub async fn compiled_task(
         if has_from_entries(&orig_task.sources) && !new.sources.is_empty() {
             let mut checker = ChecksumChecker::new(ctx.fingerprint_temp_dir, new.clone());
             let source_hash = checker.source_value().to_string();
+            new.cache_checksum = cache_checksum(orig_task, &source_hash)?;
             new.source_hash = source_hash.clone();
             vars.set(
                 "CHECKSUM".to_string(),
@@ -520,11 +543,15 @@ pub async fn compiled_task(
                     vk: resolved.vk.clone(),
                 });
             } else {
+                // Key the entry by the task's local name, not its qualified
+                // one, so every include path to a task shares one entry; the
+                // checksum carries the declared `vars`, which the source hash
+                // does not, so tasks that render different commands stay apart.
                 resolved.url = crate::cache::vk::cache_url(
                     &resolved.vk,
                     &resolved.namespace,
-                    orig_task.name(),
-                    &new.source_hash,
+                    &new.local_name(),
+                    &new.cache_checksum,
                 );
                 resolved.lock = crate::cache::vk::lock_url(&resolved.vk, &resolved.namespace);
             }
@@ -1194,16 +1221,105 @@ mod tests {
             .await
             .unwrap();
         let hash = out.source_hash.clone();
+        let key = out.cache_checksum.clone();
         assert!(!hash.is_empty());
+        assert!(key.starts_with(&format!("{hash}-")), "{key}");
         let cache = out.cache.unwrap();
         assert_eq!(cache.vk, "reg.example/task-cache");
         assert_eq!(cache.api_key, "vkr_k");
         assert_eq!(
             cache.url,
-            format!("oci://reg.example/task-cache:gcc-13-build-{hash}")
+            format!("oci://reg.example/task-cache:gcc-13-build-{key}")
         );
         assert_eq!(cache.lock, "vks://reg.example/task-cache/gcc-13");
         assert!(cache.enabled.is_none());
+    }
+
+    /// The directly included copy (`sub:build`) and the nested one
+    /// (`outer:sub:build`) key their entries by the task's local name, so
+    /// neither include path appears in the tag and both share one entry.
+    #[tokio::test]
+    async fn vk_cache_url_is_independent_of_include_depth() {
+        let caches = vk_model("reg.example/task-cache");
+        let included = |name: &str, namespace: &str| {
+            let mut t = vk_task(crate::ast::Cache {
+                inherit: "default".to_string(),
+                ..Default::default()
+            });
+            t.task = name.to_string();
+            t.namespace = namespace.to_string();
+            t
+        };
+        let direct = included("sub:build", "sub");
+        let nested = included("outer:sub:build", "outer:sub");
+        let env = Vars::new();
+        let c = compiler();
+        let mut logger = silent_logger();
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let ctx = ctx_with_caches(&env, &tmp, &caches);
+        let a = compiled_task(&direct, vk_vars(), true, &ctx, &c, &mut logger, None)
+            .await
+            .unwrap();
+        let b = compiled_task(&nested, vk_vars(), true, &ctx, &c, &mut logger, None)
+            .await
+            .unwrap();
+        let key = a.cache_checksum.clone();
+        assert!(!key.is_empty());
+        assert_eq!(a.cache_checksum, b.cache_checksum);
+        let (a, b) = (a.cache.unwrap(), b.cache.unwrap());
+        assert_eq!(
+            a.url,
+            format!("oci://reg.example/task-cache:gcc-13-build-{key}")
+        );
+        assert_eq!(a.url, b.url);
+    }
+
+    /// Two includes of one Taskfile that pass different `vars` share a local
+    /// name and a source hash but render different commands, so their entries
+    /// carry a digest of those vars and stay apart; the same key is stored on
+    /// the task for the build-once lock.
+    #[tokio::test]
+    async fn vk_cache_url_keeps_includes_with_different_vars_apart() {
+        let caches = vk_model("reg.example/task-cache");
+        let included = |namespace: &str, cc: &str| {
+            let mut t = vk_task(crate::ast::Cache {
+                inherit: "default".to_string(),
+                ..Default::default()
+            });
+            t.task = format!("{namespace}:build");
+            t.namespace = namespace.to_string();
+            t.include_vars = Some(Vars::from_elements([VarElement {
+                key: "CC".to_string(),
+                value: string_var(cc),
+            }]));
+            t
+        };
+        let env = Vars::new();
+        let c = compiler();
+        let mut logger = silent_logger();
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let ctx = ctx_with_caches(&env, &tmp, &caches);
+        let mut urls = Vec::new();
+        for t in [
+            included("gcc", "gcc"),
+            included("clang", "clang"),
+            included("gcc2", "gcc"),
+        ] {
+            let out = compiled_task(&t, vk_vars(), true, &ctx, &c, &mut logger, None)
+                .await
+                .unwrap();
+            let hash = out.source_hash.clone();
+            let key = out.cache_checksum.clone();
+            let url = out.cache.unwrap().url;
+            assert!(key.starts_with(&format!("{hash}-")), "{key}");
+            assert_eq!(
+                url,
+                format!("oci://reg.example/task-cache:gcc-13-build-{key}")
+            );
+            urls.push(url);
+        }
+        assert_ne!(urls[0], urls[1]);
+        assert_eq!(urls[0], urls[2]);
     }
 
     /// A registry that renders empty — its CI variable is unset locally — is

@@ -254,6 +254,10 @@ pub async fn cache_save(
     logger: &mut Logger,
 ) {
     let task_name = task.name().to_string();
+    // The annotation names the task as its own Taskfile does — the identity
+    // the entry is keyed by — so a copy reached through another include
+    // verifies against it.
+    let entry_task = task.local_name();
     let mut checker = ChecksumChecker::new(temp_dir, task.clone());
     let st = match checker.status() {
         Ok(st) if st.up_to_date && !st.cache_files.is_empty() => st,
@@ -270,14 +274,15 @@ pub async fn cache_save(
 
     match url {
         CacheUrl::Zip { path } => {
-            save_file(Path::new(path), &task_name, dir, &source_value, &st, logger);
+            let dest = Path::new(path);
+            save_file(dest, &entry_task, dir, &source_value, &st, logger);
         }
         CacheUrl::Oci { repo, tag, opts } => {
             save_oci(
                 repo,
                 tag,
                 opts.clone(),
-                &task_name,
+                &entry_task,
                 dir,
                 &source_value,
                 &st,

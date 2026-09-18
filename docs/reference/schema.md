@@ -730,16 +730,19 @@ Cache fields:
 **vk-registry**: `vk: host[:port]/repo` names one vk-registry repository that
 serves both the cache and the build-once lock, and derives the two URLs below
 from it — the entry `oci://host/repo:<namespace>-<task>-<checksum>` (made
-tag-safe and length-capped) and the lock `vks://host/repo/<namespace>`. The
-credential is `api_key` (a bearer token, minted by the registry), else
-`$TASK_VK_API_KEY` (the lock also honours `$TASK_VK_LOCK_TOKEN` in between);
-the trust anchor for a private certificate is
-`$TASK_CACHE_OCI_CA`. `namespace` keeps entries built by different toolchains
-apart (it has no effect without `vk`). A `vk` that renders empty — its CI
-variable unset on a developer machine — disables the block; one that renders to
-anything but `host[:port]/repo` is an error. `vk` cannot be combined with `url`
-or `lock`. `api_key` also works with an explicit `oci://` URL and `vk://` lock,
-where it outranks every other credential.
+tag-safe and length-capped) and the lock `vks://host/repo/<namespace>`. `<task>`
+is the task's name in the Taskfile that defines it — no include namespace, no
+`label` — so a task included under several namespaces shares one entry; the
+checksum carries the task's and the include's `vars`, so tasks that render
+different commands from the same text stay apart. The credential is `api_key` (a
+bearer token, minted by the registry), else `$TASK_VK_API_KEY` (the lock also
+honours `$TASK_VK_LOCK_TOKEN` in between); the trust anchor for a private
+certificate is `$TASK_CACHE_OCI_CA`. `namespace` keeps entries built by
+different toolchains apart (it has no effect without `vk`). A `vk` that renders
+empty — its CI variable unset on a developer machine — disables the block; one
+that renders to anything but `host[:port]/repo` is an error. `vk` cannot be
+combined with `url` or `lock`. `api_key` also works with an explicit `oci://`
+URL and `vk://` lock, where it outranks every other credential.
 
 ```yaml
 caches:

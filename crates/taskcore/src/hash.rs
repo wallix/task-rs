@@ -45,6 +45,37 @@ pub fn name(task: &ast::Task) -> Result<String, HashError> {
     Ok(format!("{}:{}", taskfile, task.local_name()))
 }
 
+/// Returns the cache entry and build-once lock checksum: `source_hash`, `-`,
+/// then a digest of raw task and include `vars`. The source hash uses raw
+/// commands, so the digest separates tasks whose commands render differently:
+/// one Taskfile included twice with different `vars`, or two Taskfiles whose
+/// `build` tasks differ only in `vars`. `task` must be uncompiled so its `vars`
+/// are still declarations. Returns empty when `source_hash` is empty: a task
+/// without sources has no cache identity.
+pub fn cache_checksum(task: &ast::Task, source_hash: &str) -> Result<String, HashError> {
+    if source_hash.is_empty() {
+        return Ok(String::new());
+    }
+    let mut enc = Encoder::new();
+    encode_vars_flat(&mut enc, task.vars.as_ref())?;
+    encode_vars_flat(&mut enc, task.include_vars.as_ref())?;
+    let hex = format!("{:016x}", XxHash3_64::oneshot(&enc.finish()));
+    Ok(format!("{source_hash}-{hex}"))
+}
+
+/// Encodes `vars` as a length-prefixed list. `None` and an empty map encode
+/// identically so a root task without include vars matches an included copy
+/// with an empty map.
+fn encode_vars_flat(enc: &mut Encoder, vars: Option<&ast::Vars>) -> Result<(), HashError> {
+    let vars = vars.filter(|v| !v.is_empty());
+    enc.len(vars.map_or(0, ast::Vars::len));
+    for (key, var) in vars.into_iter().flat_map(ast::Vars::all) {
+        enc.str(key);
+        encode_var(enc, var)?;
+    }
+    Ok(())
+}
+
 /// Returns the task's content hash as `<taskfile>:<local name>:<digest>`.
 ///
 /// The digest is stable for a given task and changes when any meaningful field
@@ -433,6 +464,68 @@ mod tests {
         nested.full_name = "outer:sub:build".to_string();
         assert_eq!(name(&direct).unwrap(), name(&nested).unwrap());
         assert_eq!(name(&nested).unwrap(), "Taskfile.yml:build");
+    }
+
+    fn vars(key: &str, value: &str) -> Option<Vars> {
+        Some(Vars::from_elements([VarElement {
+            key: key.to_string(),
+            value: Var {
+                value: Some(Value::String(value.to_string())),
+                ..Default::default()
+            },
+        }]))
+    }
+
+    // The key is the source hash plus a digest of the declared vars; a task
+    // without sources has no key at all.
+    #[test]
+    fn cache_checksum_extends_the_source_hash() {
+        let t = sample_task();
+        let key = cache_checksum(&t, "abc").unwrap();
+        assert!(
+            key.starts_with("abc-") && key.len() == "abc-".len() + 16,
+            "{key}"
+        );
+        assert_eq!(cache_checksum(&t, "abc").unwrap(), key);
+        assert_eq!(cache_checksum(&t, "").unwrap(), "");
+    }
+
+    // A root task (no include vars) and an included copy (an empty map) are
+    // the same task, so they key alike; the direct and nested copies do too.
+    #[test]
+    fn cache_checksum_ignores_an_empty_include_vars_map() {
+        let root = sample_task();
+        let mut included = sample_task();
+        included.include_vars = Some(Vars::new());
+        included.namespace = "outer:sub".to_string();
+        included.task = "outer:sub:build".to_string();
+        assert_eq!(
+            cache_checksum(&root, "abc").unwrap(),
+            cache_checksum(&included, "abc").unwrap()
+        );
+    }
+
+    // Tasks whose commands render differently from the same raw text — through
+    // the include's `vars` or their own — must not share an entry.
+    #[test]
+    fn cache_checksum_digests_include_and_task_vars() {
+        let mut gcc = sample_task();
+        gcc.include_vars = vars("CC", "gcc");
+        let mut clang = gcc.clone();
+        clang.include_vars = vars("CC", "clang");
+        assert_ne!(
+            cache_checksum(&gcc, "abc").unwrap(),
+            cache_checksum(&clang, "abc").unwrap()
+        );
+
+        let mut o2 = sample_task();
+        o2.vars = vars("CFLAGS", "-O2");
+        let mut o0 = sample_task();
+        o0.vars = vars("CFLAGS", "-O0");
+        assert_ne!(
+            cache_checksum(&o2, "abc").unwrap(),
+            cache_checksum(&o0, "abc").unwrap()
+        );
     }
 
     #[test]

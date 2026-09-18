@@ -7,6 +7,16 @@
   the root includes `lib`, and also `app`, which itself includes `lib` — a
   `run: once` task in it now runs once for both paths instead of once per
   path. Go Task v3 treats the nested copy as a separate task.
+- **A task included under several namespaces shares one cache entry.**
+  vk-registry entries, the build-once lock and the archive's task annotation
+  are keyed by the task's name in the Taskfile that defines it, so the copy
+  reached through a nested include restores what the directly included copy
+  built instead of rebuilding it. Tasks that differ only in their `vars`, or
+  in the `vars` their include passes, keep separate entries. Every vk-registry
+  tag changes — the include namespace and `label` no longer appear in it — and
+  an archive saved by a namespaced or labelled task is rebuilt once, so the
+  first build on this version repopulates the cache. `.task` fingerprints are
+  unaffected.
 
 ## v4.5.0 - 2026-09-05
 

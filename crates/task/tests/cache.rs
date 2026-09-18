@@ -184,6 +184,44 @@ fn cache_restore_hit() {
     );
 }
 
+// One Taskfile included directly (`sub`) and through another include
+// (`outer:sub`) shares one cache entry: the archive the direct copy saved is
+// restored by the nested copy, whose task annotation names the task as its own
+// Taskfile does rather than by the include path.
+#[test]
+fn cache_nested_include_restores_the_direct_copy_entry() {
+    let dir = stage("cache_includes_nested");
+    let cache = cache_dir();
+    let env = [("CACHE_DIR", cache.to_str().unwrap())];
+
+    let (first, code) = run_env(&dir, &["sub:build"], &env);
+    assert_eq!(code, 0, "first run failed: {first}");
+    assert_eq!(dir_len(&cache), 1, "cache dir should have one zip");
+
+    std::fs::remove_file(dir.join("output.txt")).unwrap();
+    std::fs::remove_dir_all(dir.join(".task")).unwrap();
+
+    let (second, code) = run_env(&dir, &["outer:sub:build"], &env);
+    assert_eq!(code, 0, "second run failed: {second}");
+    assert!(
+        second.contains("restored from cache"),
+        "expected cache restore: {second}"
+    );
+    assert!(
+        !second.contains("task name mismatch"),
+        "the nested copy must verify against the direct copy's archive: {second}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("output.txt")).unwrap(),
+        "hello\n"
+    );
+    assert_eq!(
+        dir_len(&cache),
+        1,
+        "the nested copy must not save a second archive"
+    );
+}
+
 // Ports Go `TestCacheDisabled`. With `cache.enabled: false` the cache dir must
 // never be created.
 #[test]
@@ -818,5 +856,41 @@ fn cache_vk_derives_cache_and_lock_from_the_registry() {
     assert!(
         out.contains("https://127.0.0.1:1/v2/"),
         "the cache should have pinged the derived registry: {out}"
+    );
+}
+
+// The nested copy (`outer:sub:build`) takes the same build-once lock as the
+// directly included one (`sub:build`): the key carries the task's local name
+// and cache checksum, not the include path.
+#[test]
+fn cache_vk_nested_include_shares_the_lock_key() {
+    let dir = stage("cache_vk_nested");
+    let env = [
+        ("VK_REGISTRY", "127.0.0.1:1/task-cache"),
+        ("VK_NAMESPACE", "gcc 13"),
+    ];
+    // The `name=` query value of the lock request: the lock key.
+    let lock_key = |out: &str| {
+        let (_, rest) = out
+            .split_once("/lock/acquire?name=")
+            .unwrap_or_else(|| panic!("no lock request in output: {out}"));
+        rest.split('&').next().unwrap_or_default().to_string()
+    };
+
+    let (direct, code) = run_env(&dir, &["--verbose", "sub:build"], &env);
+    assert_eq!(code, 0, "direct run failed: {direct}");
+    let (nested, code) = run_env(&dir, &["--verbose", "outer:sub:build"], &env);
+    assert_eq!(code, 0, "nested run failed: {nested}");
+    assert!(dir.join("output.txt").exists());
+
+    let direct_key = lock_key(&direct);
+    assert!(
+        direct_key.starts_with("task-cache%2Fgcc-13%3Abuild%3A"),
+        "lock key should be <repo>/<namespace>:<local name>:<checksum>: {direct_key}"
+    );
+    assert_eq!(
+        direct_key,
+        lock_key(&nested),
+        "both include paths must take one lock"
     );
 }

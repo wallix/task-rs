@@ -70,8 +70,12 @@ pub struct Task {
     /// stable checksumming independent of variable resolution.
     pub raw_cmds: Vec<Cmd>,
     /// The checksum of sources + raw commands + generates, computed once during
-    /// compilation and reused for locking, up-to-date checks, and cache keys.
+    /// compilation and reused for up-to-date checks and the `CHECKSUM` variable.
     pub source_hash: String,
+    /// Cache entry and build-once lock checksum: `source_hash` plus a digest of
+    /// raw task and include `vars` (`hash::cache_checksum`). Set alongside
+    /// `source_hash` during compilation.
+    pub cache_checksum: String,
 }
 
 impl Task {

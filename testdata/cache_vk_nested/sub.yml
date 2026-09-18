@@ -1,0 +1,11 @@
+version: '3'
+
+tasks:
+  build:
+    sources:
+      - input.txt
+    generates:
+      - output.txt
+    cache: default
+    cmds:
+      - cp input.txt output.txt
