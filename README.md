@@ -314,6 +314,9 @@ v3 are intentional.
   immediately and exits with status `1`.
 - Fingerprints include commands and variables as well as file contents, and
   report source and generated-output staleness independently.
+- A task included both directly and through a nested include is one task for
+  `run: once`, whichever include path names it. Go Task counts each path
+  separately.
 
 For release-specific compatibility notes, including migration fixes and known
 gaps, read the [changelog](CHANGELOG.md).

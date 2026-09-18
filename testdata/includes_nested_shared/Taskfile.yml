@@ -1,0 +1,11 @@
+version: '3'
+
+includes:
+  sub: ./sub.yml
+  outer: ./mid.yml
+
+tasks:
+  default:
+    cmds:
+      - task: sub:build
+      - task: outer:sub:build

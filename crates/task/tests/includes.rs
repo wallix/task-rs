@@ -63,6 +63,18 @@ fn includes_multi_level() {
     assert_file(&dir, "called_three.txt", "three");
 }
 
+// One Taskfile included directly (`sub`) and through another include
+// (`outer:sub`) defines one task: `run: once` runs it once for both names.
+// Go Task counts the two paths as separate tasks; this is a deliberate
+// divergence (see README "Changed").
+#[test]
+fn includes_nested_shared_task_runs_once() {
+    let dir = stage("includes_nested_shared");
+    let o = run(&dir, &["default"]);
+    assert!(o.ok(), "run failed: {}", o.combined());
+    assert_file(&dir, "built.txt", "built");
+}
+
 // Ports Go `TestIncludeCycle`.
 #[test]
 fn include_cycle() {

@@ -3,10 +3,11 @@
 //! A task's hash combines the originating Taskfile and local name with a
 //! deterministic digest of the task's meaningful fields. Fields populated
 //! during merging or compilation (`task`, `prefix`, `namespace`, `full_name`,
-//! `raw_cmds`, `source_hash`) are excluded so that a task hashes to the same
-//! value regardless of how it was assembled. The digest is an xxHash3 over a
-//! canonical byte encoding: it need not match any external tool, only be
-//! stable for a given task and change when a meaningful field changes.
+//! `raw_cmds`, `source_hash`) are excluded, so the include path alone does not
+//! change the hash. Namespaced aliases and `task:` references still do. The
+//! digest is an xxHash3 over a canonical byte encoding: it need not match any
+//! external tool, only be stable for a given task and change when a meaningful
+//! field changes.
 
 use twox_hash::XxHash3_64;
 
@@ -415,6 +416,23 @@ mod tests {
     fn name_uses_taskfile_and_local_name() {
         let t = sample_task();
         assert_eq!(name(&t).unwrap(), "Taskfile.yml:build");
+    }
+
+    // The same source task included directly and through a nested include
+    // hashes to one identity, so `run: once` dedups it and both reach the same
+    // cache entry.
+    #[test]
+    fn name_is_independent_of_include_depth() {
+        let mut direct = sample_task();
+        direct.namespace = "sub".to_string();
+        direct.task = "sub:build".to_string();
+        direct.full_name = "sub:build".to_string();
+        let mut nested = sample_task();
+        nested.namespace = "outer:sub".to_string();
+        nested.task = "outer:sub:build".to_string();
+        nested.full_name = "outer:sub:build".to_string();
+        assert_eq!(name(&direct).unwrap(), name(&nested).unwrap());
+        assert_eq!(name(&nested).unwrap(), "Taskfile.yml:build");
     }
 
     #[test]

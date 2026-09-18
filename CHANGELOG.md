@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **`run: once` tasks run once across direct and nested includes.**
+  When one Taskfile is included both directly and through another include —
+  the root includes `lib`, and also `app`, which itself includes `lib` — a
+  `run: once` task in it now runs once for both paths instead of once per
+  path. Go Task v3 treats the nested copy as a separate task.
+
 ## v4.5.0 - 2026-09-05
 
 - **A Linux release stays rebuildable for good.** The pinned build environment

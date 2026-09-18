@@ -150,7 +150,17 @@ impl Tasks {
                 }
 
                 task_name = task_name_with_namespace(name, &include.namespace);
-                task.namespace = include.namespace.clone();
+                // Accumulate the include path (`a:b` for `a` including `b`
+                // including this file) so `local_name` strips it whole and
+                // every copy of the task shares one identity.
+                task.namespace = if task.namespace.is_empty() {
+                    include.namespace.clone()
+                } else {
+                    format!(
+                        "{}{NAMESPACE_SEPARATOR}{}",
+                        include.namespace, task.namespace
+                    )
+                };
                 task.task = task_name.clone();
             }
 
@@ -273,6 +283,86 @@ mod tests {
         base.merge(&other, &include, &Vars::new()).unwrap();
         assert!(base.get("sub:build").is_some());
         assert_eq!(base.get("sub:build").unwrap().namespace, "sub");
+    }
+
+    fn build_task() -> Task {
+        Task {
+            task: "build".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn include(namespace: &str, flatten: bool) -> Include {
+        Include {
+            namespace: namespace.to_string(),
+            flatten,
+            ..Default::default()
+        }
+    }
+
+    // The root includes `inner` directly as `sub` and again through `mid`
+    // (which includes it as `sub`) as `outer`: the nested copy records the
+    // whole include path as its namespace, so both copies have the same local
+    // name and therefore the same dedup and cache identity.
+    #[test]
+    fn merge_nested_include_accumulates_namespace() {
+        let mut inner = Tasks::new();
+        inner.set("build".to_string(), build_task());
+        let mut mid = Tasks::new();
+        mid.merge(&inner, &include("sub", false), &Vars::new())
+            .unwrap();
+
+        let mut root = Tasks::new();
+        root.merge(&inner, &include("sub", false), &Vars::new())
+            .unwrap();
+        root.merge(&mid, &include("outer", false), &Vars::new())
+            .unwrap();
+
+        let direct = root.get("sub:build").unwrap();
+        let nested = root.get("outer:sub:build").unwrap();
+        assert_eq!(direct.namespace, "sub");
+        assert_eq!(nested.namespace, "outer:sub");
+        assert_eq!(nested.task, "outer:sub:build");
+        assert_eq!(direct.local_name(), "build");
+        assert_eq!(nested.local_name(), "build");
+    }
+
+    // A flattened outer include adds nothing to the path: the task keeps the
+    // inner include's key and namespace.
+    #[test]
+    fn merge_nested_include_flatten_outer_keeps_inner_namespace() {
+        let mut inner = Tasks::new();
+        inner.set("build".to_string(), build_task());
+        let mut mid = Tasks::new();
+        mid.merge(&inner, &include("sub", false), &Vars::new())
+            .unwrap();
+
+        let mut root = Tasks::new();
+        root.merge(&mid, &include("outer", true), &Vars::new())
+            .unwrap();
+
+        let t = root.get("sub:build").unwrap();
+        assert_eq!(t.namespace, "sub");
+        assert_eq!(t.local_name(), "build");
+    }
+
+    // A flattened inner include leaves the namespace empty, so the outer
+    // include's namespace becomes the whole path.
+    #[test]
+    fn merge_nested_include_flatten_inner_starts_path_at_outer() {
+        let mut inner = Tasks::new();
+        inner.set("build".to_string(), build_task());
+        let mut mid = Tasks::new();
+        mid.merge(&inner, &include("sub", true), &Vars::new())
+            .unwrap();
+
+        let mut root = Tasks::new();
+        root.merge(&mid, &include("outer", false), &Vars::new())
+            .unwrap();
+
+        let t = root.get("outer:build").unwrap();
+        assert_eq!(t.namespace, "outer");
+        assert_eq!(t.local_name(), "build");
     }
 
     #[test]
