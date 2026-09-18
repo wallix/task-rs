@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.6.0 - 2026-09-18
+
 - **`run: once` tasks run once across direct and nested includes.**
   When one Taskfile is included both directly and through another include —
   the root includes `lib`, and also `app`, which itself includes `lib` — a
