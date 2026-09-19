@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.6.2 - 2026-09-19
+
 - **A cache transfer no longer fails on one dropped connection to the registry.**
   A pull or push request whose connection could not be made, timed out, or was
   cut short under the response is now made again a few times, seconds apart,
