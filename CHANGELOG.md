@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.6.1 - 2026-09-19
+
 - **Cache archives carry the whole generated tree.** Collecting a `generates`
   glob for the cache now includes hidden entries — `node_modules/.bin` and
   every other dot file or directory under `**/*` — and stores a symlink to a
