@@ -5,7 +5,7 @@ use std::fmt;
 
 /// How deep [`with_causes`] walks. Deeper than any chain observed from a
 /// `reqwest` failure (three links); the rest is headroom.
-const MAX_CAUSES: usize = 8;
+pub(crate) const MAX_CAUSES: usize = 8;
 
 /// Result specialized to this crate's [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;

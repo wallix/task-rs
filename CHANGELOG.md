@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **A cache transfer no longer fails on one dropped connection to the registry.**
+  A pull or push request whose connection could not be made, timed out, or was
+  cut short under the response is now made again a few times, seconds apart,
+  before the cache entry is given up on. A registry answer — a miss, a refusal,
+  a digest that does not match — is still final at once.
+
 ## v4.6.1 - 2026-09-19
 
 - **Cache archives carry the whole generated tree.** Collecting a `generates`

@@ -770,6 +770,12 @@ Supported `url` (storage) schemes:
   the other environment settings. Against a vk-registry server, Task also
   negotiates its transparent-zstd upload mode automatically.
 
+OCI cache requests retry connection failures, timeouts and interrupted transfers
+up to three times, waiting 2, 4 and 8 seconds between attempts. Each retry starts
+the transfer again. HTTP errors, malformed responses and digest mismatches are
+not retried. If the registry remains unreachable, Task continues without its
+cache.
+
 Supported `lock` schemes:
 
 - `file://<dir>` — local lockfiles (single host only).

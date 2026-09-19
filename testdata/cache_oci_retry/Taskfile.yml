@@ -1,0 +1,10 @@
+version: '3'
+
+tasks:
+  build:
+    sources: [input.txt]
+    generates: [output.txt]
+    cache:
+      url: 'oci://{{.REGISTRY}}/repo:build?plainhttp=1'
+    cmds:
+      - cp input.txt output.txt

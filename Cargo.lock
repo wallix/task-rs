@@ -2092,7 +2092,9 @@ dependencies = [
 name = "ocicas"
 version = "4.6.1"
 dependencies = [
+ "bytes",
  "fastcdc",
+ "hyper",
  "oci-client",
  "reqwest",
  "rustls",

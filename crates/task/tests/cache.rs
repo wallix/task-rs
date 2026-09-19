@@ -918,6 +918,101 @@ tasks:
     );
 }
 
+/// A cut-short manifest response is retried before treating the entry as a
+/// miss. The subsequent build still publishes its cache entry.
+#[test]
+fn cache_oci_retries_an_interrupted_manifest() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let authority = listener.local_addr().unwrap().to_string();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut manifest_reads = 0;
+        let mut manifest_writes = 0;
+        while !stopped.load(Ordering::Relaxed) && Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(e) => panic!("accept: {e}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let (status, body) = if request.starts_with("GET /v2/repo/manifests/") {
+                manifest_reads += 1;
+                if manifest_reads == 1 {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{",
+                        )
+                        .unwrap();
+                    continue;
+                }
+                (
+                    404,
+                    r#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"missing"}]}"#,
+                )
+            } else if request.starts_with("PUT /v2/repo/manifests/") {
+                manifest_writes += 1;
+                (201, "")
+            } else {
+                // Capability/auth probes succeed; every uploaded blob already exists.
+                assert!(
+                    request.starts_with("GET /v2/ ") || request.starts_with("HEAD /v2/repo/blobs/"),
+                    "{request}"
+                );
+                (200, "")
+            };
+            write!(stream, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nLocation: /v2/repo/manifests/build\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+        (manifest_reads, manifest_writes)
+    });
+
+    let dir = stage("cache_oci_retry");
+    let (out, code) = run_env(&dir, &["build"], &[("REGISTRY", &authority)]);
+    stop.store(true, Ordering::Relaxed);
+    let (reads, writes) = server.join().unwrap();
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        std::fs::read(dir.join("output.txt")).unwrap(),
+        b"cached build\n"
+    );
+    assert!(out.contains("saved to cache"), "{out}");
+    assert!(!out.contains("unreachable"), "{out}");
+    assert_eq!(
+        reads, 3,
+        "two restore attempts and one pre-push check: {out}"
+    );
+    assert_eq!(writes, 1, "{out}");
+}
+
 /// A fake vk-registry lock API: answers every `POST /lock/<action>` with a
 /// canned success body and records the request paths in arrival order. Each
 /// path is recorded before its response goes out, so a request the binary saw

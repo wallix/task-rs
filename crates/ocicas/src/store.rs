@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
+use bytes::Bytes;
 use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientProtocol};
 use oci_client::errors::{OciDistributionError, OciErrorCode};
 use oci_client::manifest::{OciDescriptor, OciImageManifest, OciManifest};
@@ -25,6 +26,7 @@ use crate::error::{Error, Result, with_causes};
 use crate::index::{
     ARTIFACT_TYPE, ChunkRef, Index, MEDIA_TYPE_CHUNK, MEDIA_TYPE_INDEX, unmarshal_index,
 };
+use crate::retry::{is_transport, with_retry};
 
 /// Bounds parallel chunk transfers (pull fetches and push uploads).
 const FETCH_CONCURRENCY: usize = 8;
@@ -182,12 +184,18 @@ impl Store {
     /// not exist — the cheap "is this entry already pushed and matching" check.
     pub async fn resolve_annotations(&self, tag: &str) -> Result<Option<BTreeMap<String, String>>> {
         let image = self.reference(tag)?;
-        match self
-            .client
-            .pull_manifest(&image, &self.auth.registry_auth())
-            .await
-        {
-            Ok((OciManifest::Image(m), _)) => {
+        let (client, image, auth) = (&self.client, &image, &self.auth.registry_auth());
+        // A miss is decided on the raw error, before the retry sees it as final.
+        let manifest = with_retry(|| async move {
+            match client.pull_manifest(image, auth).await {
+                Ok((manifest, _)) => Ok(Some(manifest)),
+                Err(e) if is_missing(&e) => Ok(None),
+                Err(e) => Err(oci_err(e)),
+            }
+        })
+        .await?;
+        match manifest {
+            Some(OciManifest::Image(m)) => {
                 if m.artifact_type.as_deref() != Some(ARTIFACT_TYPE) {
                     return Err(Error::format(format!(
                         "{tag} is not a {ARTIFACT_TYPE} artifact"
@@ -195,11 +203,10 @@ impl Store {
                 }
                 Ok(Some(m.annotations.unwrap_or_default()))
             }
-            Ok((OciManifest::ImageIndex(_), _)) => Err(Error::format(format!(
+            Some(OciManifest::ImageIndex(_)) => Err(Error::format(format!(
                 "{tag} is an image index, not an artifact"
             ))),
-            Err(e) if is_missing(&e) => Ok(None),
-            Err(e) => Err(oci_err(e)),
+            None => Ok(None),
         }
     }
 
@@ -323,10 +330,9 @@ impl Store {
             artifact_type: Some(ARTIFACT_TYPE.to_string()),
             annotations: Some(annotations.clone()),
         };
-        self.client
-            .push_manifest(image, &OciManifest::Image(manifest))
-            .await
-            .map_err(oci_err)?;
+        let (client, manifest) = (&self.client, &OciManifest::Image(manifest));
+        with_retry(|| async move { client.push_manifest(image, manifest).await.map_err(oci_err) })
+            .await?;
         Ok(())
     }
 
@@ -336,19 +342,10 @@ impl Store {
         desc: &OciDescriptor,
         data: Vec<u8>,
     ) -> Result<()> {
-        if self
-            .client
-            .blob_exists(image, &desc.digest)
-            .await
-            .map_err(oci_err)?
-        {
+        if blob_exists(&self.client, image, &desc.digest).await? {
             return Ok(());
         }
-        self.client
-            .push_blob(image, data, &desc.digest)
-            .await
-            .map_err(oci_err)?;
-        Ok(())
+        push_blob(&self.client, image, Bytes::from(data), &desc.digest).await
     }
 
     /// Resolve `tag`, fetch the missing chunks (through the local CAS when
@@ -356,11 +353,10 @@ impl Store {
     /// the manifest annotations.
     pub async fn pull(&self, tag: &str, dir: &Path) -> Result<(Index, BTreeMap<String, String>)> {
         let image = self.reference(tag)?;
-        let (manifest, _digest) = self
-            .client
-            .pull_manifest(&image, &self.auth.registry_auth())
-            .await
-            .map_err(oci_err)?;
+        let (client, image, auth) = (&self.client, &image, &self.auth.registry_auth());
+        let (manifest, _digest) =
+            with_retry(|| async move { client.pull_manifest(image, auth).await.map_err(oci_err) })
+                .await?;
         let OciManifest::Image(m) = manifest else {
             return Err(Error::format(format!("{tag} is not an image manifest")));
         };
@@ -374,10 +370,10 @@ impl Store {
             .iter()
             .find(|l| l.media_type == MEDIA_TYPE_INDEX)
             .ok_or_else(|| Error::format(format!("{tag} has no index layer")))?;
-        let raw_idx = pull_blob_bytes(&self.client, &image, index_desc).await?;
+        let raw_idx = pull_blob_bytes(&self.client, image, index_desc).await?;
         let idx = unmarshal_index(&raw_idx)?;
 
-        let source = self.chunk_source(&image, &idx).await?;
+        let source = self.chunk_source(image, &idx).await?;
         let owned_idx = idx.clone();
         let dir = dir.to_path_buf();
         tokio::task::spawn_blocking(move || assemble(&owned_idx, &dir, source))
@@ -462,17 +458,40 @@ fn descriptor(media_type: &str, digest: String, size: i64) -> OciDescriptor {
     }
 }
 
+/// Pull a blob fully into memory; `oci-client` verifies it against the descriptor's
+/// digest while streaming.
 async fn pull_blob_bytes(
     client: &Client,
     image: &Reference,
     desc: &OciDescriptor,
 ) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(desc.size.max(0) as usize);
-    client
-        .pull_blob(image, desc, &mut buf)
-        .await
-        .map_err(oci_err)?;
-    Ok(buf)
+    with_retry(|| async move {
+        let mut buf = Vec::with_capacity(desc.size.max(0) as usize);
+        client
+            .pull_blob(image, desc, &mut buf)
+            .await
+            .map_err(oci_err)?;
+        Ok(buf)
+    })
+    .await
+}
+
+async fn blob_exists(client: &Client, image: &Reference, digest: &str) -> Result<bool> {
+    with_retry(|| async move { client.blob_exists(image, digest).await.map_err(oci_err) }).await
+}
+
+/// Upload `data` under `digest` through `oci-client`. `Bytes`, so every attempt
+/// hands the client the same buffer without copying it.
+async fn push_blob(client: &Client, image: &Reference, data: Bytes, digest: &str) -> Result<()> {
+    let data = &data;
+    with_retry(|| async move {
+        client
+            .push_blob(image, data.clone(), digest)
+            .await
+            .map_err(oci_err)
+    })
+    .await?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -489,31 +508,30 @@ async fn upload_chunk(
     frame: Vec<u8>,
     counters: &Counters,
 ) -> Result<()> {
-    if client
-        .blob_exists(image, &refc.digest)
-        .await
-        .map_err(oci_err)?
-    {
+    if blob_exists(client, image, &refc.digest).await? {
         counters.skipped.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
     let n = frame.len() as i64;
+    let frame = Bytes::from(frame);
     if transparent {
-        push_blob_zstd(
-            http,
-            scheme,
-            registry,
-            repository,
-            auth,
-            &refc.digest,
-            frame,
-        )
+        // Retried as a whole: an upload session whose PUT got no answer is left
+        // behind and a new one begun, rather than the PUT repeated into a session
+        // the registry may have discarded.
+        with_retry(|| {
+            push_blob_zstd(
+                http,
+                scheme,
+                registry,
+                repository,
+                auth,
+                &refc.digest,
+                frame.clone(),
+            )
+        })
         .await?;
     } else {
-        client
-            .push_blob(image, frame, &refc.digest)
-            .await
-            .map_err(oci_err)?;
+        push_blob(client, image, frame, &refc.digest).await?;
     }
     counters.pushed.fetch_add(1, Ordering::Relaxed);
     counters.bytes.fetch_add(n, Ordering::Relaxed);
@@ -536,11 +554,14 @@ async fn detect_transparent(
     auth: &Auth,
 ) -> Result<bool> {
     let url = format!("{scheme}://{registry}/v2/");
-    match auth.apply(http.get(&url)).send().await {
-        Ok(resp) => Ok(resp.headers().contains_key(TRANSPARENT_ZSTD_HEADER)),
-        Err(e) if e.is_connect() || e.is_timeout() => Err(req_err(e)),
-        Err(_) => Ok(false),
-    }
+    with_retry(|| async {
+        match auth.apply(http.get(&url)).send().await {
+            Ok(resp) => Ok(resp.headers().contains_key(TRANSPARENT_ZSTD_HEADER)),
+            Err(e) if is_transport(&e) => Err(req_err(e)),
+            Err(_) => Ok(false),
+        }
+    })
+    .await
 }
 
 /// Upload an already-zstd-compressed frame keyed by the digest of its
@@ -554,7 +575,7 @@ async fn push_blob_zstd(
     repository: &str,
     auth: &Auth,
     digest: &str,
-    frame: Vec<u8>,
+    frame: Bytes,
 ) -> Result<()> {
     let uploads = format!("{scheme}://{registry}/v2/{repository}/blobs/uploads/");
     let resp = auth
@@ -651,12 +672,15 @@ fn is_missing(e: &OciDistributionError) -> bool {
     }
 }
 
+/// Map an `oci-client` error, a transport failure to [`Error::Network`] — which is
+/// what [`with_retry`] repeats — and everything the registry answered to
+/// [`Error::Format`].
 fn oci_err(e: OciDistributionError) -> Error {
     // `RequestError` is transparent over the `reqwest` error, so its chain
     // carries the same reason a direct request's does.
     let msg = with_causes("oci", &e);
     if let OciDistributionError::RequestError(re) = &e
-        && (re.is_connect() || re.is_timeout())
+        && is_transport(re)
     {
         return Error::network(msg);
     }
@@ -665,7 +689,7 @@ fn oci_err(e: OciDistributionError) -> Error {
 
 fn req_err(e: reqwest::Error) -> Error {
     let msg = with_causes("http", &e);
-    if e.is_connect() || e.is_timeout() {
+    if is_transport(&e) {
         return Error::network(msg);
     }
     Error::format(msg)
@@ -701,6 +725,112 @@ mod tests {
         assert_eq!(seen[0].path, "/v2/");
         // base64("ci:s3cret")
         assert_eq!(seen[0].authorization.as_deref(), Some("Basic Y2k6czNjcmV0"));
+    }
+
+    #[tokio::test]
+    async fn the_capability_probe_recovers_after_a_disconnect() {
+        install_crypto();
+        let server = FakeServer::start_raw(vec![
+            String::new(),
+            "HTTP/1.1 200 OK\r\nx-virtkit-transparent-zstd: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        ]);
+        let store = Store::open(
+            &format!("{}/repo", server.authority()),
+            RemoteOptions {
+                plain_http: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("probe retries");
+        assert!(store.transparent());
+        assert_eq!(server.seen().len(), 2);
+    }
+
+    fn http_client() -> Client {
+        Client::new(ClientConfig {
+            protocol: ClientProtocol::Http,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_blob_retry_discards_the_partial_body() {
+        install_crypto();
+        let server = FakeServer::start_raw(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\npart".into(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\ncomplete".into(),
+        ]);
+        let image = format!("{}/repo:tag", server.authority()).parse().unwrap();
+        let desc = descriptor(MEDIA_TYPE_CHUNK, sha256_hex(b"complete"), 8);
+        let body = pull_blob_bytes(&http_client(), &image, &desc)
+            .await
+            .unwrap();
+        assert_eq!(body, b"complete");
+        let seen = server.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].path, seen[1].path);
+    }
+
+    #[tokio::test]
+    async fn a_blob_digest_mismatch_is_final() {
+        install_crypto();
+        let server = FakeServer::start(vec![(200, "corrupt")]);
+        let image = format!("{}/repo:tag", server.authority()).parse().unwrap();
+        let desc = descriptor(MEDIA_TYPE_CHUNK, sha256_hex(b"correct"), 7);
+        let error = pull_blob_bytes(&http_client(), &image, &desc)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Format(_)), "{error}");
+        assert!(error.to_string().contains("digest"), "{error}");
+        assert_eq!(server.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_transparent_upload_retry_starts_a_new_session() {
+        install_crypto();
+        let server = FakeServer::start_raw(vec![
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            "HTTP/1.1 202 Accepted\r\nLocation: /upload/first\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            String::new(),
+            "HTTP/1.1 202 Accepted\r\nLocation: /upload/second\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        ]);
+        let image = format!("{}/repo:tag", server.authority()).parse().unwrap();
+        let frame = zstd::bulk::compress(b"chunk", 3).unwrap();
+        let chunk = ChunkRef {
+            digest: sha256_hex(b"chunk"),
+            size: 5,
+            raw_size: 5,
+        };
+        let counters = Counters::default();
+        upload_chunk(
+            &http_client(),
+            &reqwest::Client::new(),
+            &image,
+            true,
+            "http",
+            &server.authority(),
+            "repo",
+            &Auth::None,
+            &chunk,
+            frame.clone(),
+            &counters,
+        )
+        .await
+        .unwrap();
+        let seen = server.seen();
+        assert_eq!(
+            seen.iter().map(|r| r.method.as_str()).collect::<Vec<_>>(),
+            ["HEAD", "POST", "PUT", "POST", "PUT"]
+        );
+        assert_eq!(seen[2].path, "/upload/first");
+        assert_eq!(seen[4].path, "/upload/second");
+        assert_eq!(seen[2].body, frame);
+        assert_eq!(seen[4].body, frame);
+        assert_eq!(seen[2].query, seen[4].query);
+        assert_eq!(counters.pushed.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.bytes.load(Ordering::Relaxed), frame.len() as i64);
     }
 
     fn registry_error(code: &str) -> OciDistributionError {

@@ -28,6 +28,7 @@ mod chunker;
 mod error;
 mod index;
 mod lock;
+mod retry;
 mod store;
 #[cfg(test)]
 mod testutil;

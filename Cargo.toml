@@ -92,6 +92,10 @@ twox-hash = "2"
 # `task` binary installs the ring provider at startup.
 oci-client = { version = "0.17", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "query", "stream"] }
+# Named only to be recognized: hyper's error under a reqwest one is how a body cut
+# short arrives, and Bytes is what a retried upload hands the client each attempt.
+hyper = { version = "1", default-features = false }
+bytes = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 tokio = { version = "1" }
