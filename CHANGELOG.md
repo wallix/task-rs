@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.7.0 - 2026-09-21
+
 - **Included tasks share saved fingerprints when their build inputs match,**
   even across separate runs without a build cache. Variables that change
   commands or declared environment values keep separate entries; namespaced
