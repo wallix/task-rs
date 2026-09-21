@@ -114,6 +114,43 @@ fn export_import_cache() {
     );
 }
 
+#[test]
+fn exported_fingerprints_survive_project_relocation() {
+    let first = stage("includes_checksum_identity");
+    let second = stage("includes_checksum_identity");
+    let built = run(&first, &["leaf:build"]);
+    assert!(built.ok(), "{}", built.combined());
+    let archive = first.join("cache.zip");
+    let exported = run(
+        &first,
+        &["--export-cache", archive.to_str().unwrap(), "leaf:build"],
+    );
+    assert!(exported.ok(), "{}", exported.combined());
+    let imported = run(
+        &second,
+        &[
+            "--import-cache",
+            archive.to_str().unwrap(),
+            "mid:leaf:build",
+        ],
+    );
+    assert!(imported.ok(), "{}", imported.combined());
+    let status = run(&second, &["--status", "mid:leaf:build"]);
+    assert!(status.ok(), "{}", status.combined());
+    let again = run(&second, &["mid:leaf:build"]);
+    assert!(again.ok(), "{}", again.combined());
+    assert!(
+        again.combined().contains("up to date"),
+        "{}",
+        again.combined()
+    );
+    assert_eq!(
+        std::fs::read_to_string(second.join("out.txt")).unwrap(),
+        "default\n"
+    );
+    assert!(!second.join("built.log").exists());
+}
+
 // A `generates` tree is archived whole: hidden entries (`.bin` shims, a
 // `.yarn-state.yml` fingerprint, per-package `.github`) travel with it, and a
 // symlink to a directory is stored as the link rather than followed into its
@@ -300,7 +337,7 @@ fn failed_import_invalidates_external_temp_dir() {
     let (output, code) = run_env(&dir, &["build"], &env);
     assert_eq!(code, 0, "build failed: {output}");
     let checksums = external.join(dir.file_name().unwrap()).join("checksum");
-    assert!(checksums.join("build").is_file());
+    assert!(checksum_file_in(&checksums, "build").is_some());
 
     let (output, code) = run_env(&dir, &["--import-cache", "missing.zip"], &env);
     assert_ne!(code, 0, "import should fail: {output}");

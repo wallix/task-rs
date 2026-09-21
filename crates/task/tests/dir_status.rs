@@ -96,13 +96,12 @@ fn dynamic_variables_run_on_created_dir() {
 fn status_checksum_build() {
     let dir = stage("checksum");
     let _ = std::fs::remove_file(dir.join("generated.txt"));
-    let checksum = dir.join(".task/checksum/build");
-    assert!(!checksum.exists());
+    assert!(checksum_file(&dir, "build").is_none());
 
     let o = run(&dir, &["build"]);
     assert!(o.ok(), "build failed: {}", o.combined());
     assert!(dir.join("generated.txt").exists(), "generated.txt missing");
-    assert!(checksum.exists(), "checksum file missing after run");
+    let checksum = checksum_file(&dir, "build").expect("checksum file missing after run");
 
     // Rerun with unchanged sources: reported up to date, checksum untouched.
     let mtime_before = std::fs::metadata(&checksum).unwrap().modified().unwrap();
@@ -135,13 +134,13 @@ fn status_checksum_build_wildcard() {
 fn status_checksum_build_with_status() {
     let dir = stage("checksum");
     let _ = std::fs::remove_file(dir.join("generated.txt"));
-    let checksum = dir.join(".task/checksum/build-with-status");
-    assert!(!checksum.exists());
+    assert!(checksum_file(&dir, "build-with-status").is_none());
 
     let o = run(&dir, &["build-with-status"]);
     assert!(o.ok(), "build-with-status failed: {}", o.combined());
     assert!(dir.join("generated.txt").exists(), "generated.txt missing");
-    assert!(checksum.exists(), "checksum file missing after run");
+    let checksum =
+        checksum_file(&dir, "build-with-status").expect("checksum file missing after run");
 
     let mtime_before = std::fs::metadata(&checksum).unwrap().modified().unwrap();
     let second = run(&dir, &["build-with-status"]);

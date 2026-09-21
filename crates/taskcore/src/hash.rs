@@ -94,6 +94,54 @@ pub fn hash(task: &ast::Task) -> Result<String, HashError> {
     Ok(format!("{}:{}:{}", taskfile, task.local_name(), hex))
 }
 
+/// Persistent identity for a compiled task's checksum file. Compilation puts
+/// the project root first in `dirs`. Resolve structural paths relative to the
+/// project or task directory so exported fingerprints survive relocation.
+/// Explicit values in commands and env remain significant, even when they
+/// contain absolute paths.
+pub fn fingerprint(task: &ast::Task) -> Result<String, HashError> {
+    let root = task.dirs.first().map(String::as_str).unwrap_or_default();
+    let dir = task.compute_dir();
+    let dir = dir.to_string_lossy();
+    let relative = |base: &str, path: &str| {
+        if !base.is_empty() && std::path::Path::new(path).is_absolute() {
+            crate::filepathext::rel_str(base, path).unwrap_or_else(|| path.to_string())
+        } else {
+            path.to_string()
+        }
+    };
+    let mut normalized = task.clone();
+    normalized.dirs = vec![relative(root, &dir)];
+    if let Some(location) = &mut normalized.location {
+        location.taskfile = relative(root, &location.taskfile);
+        location.line = 0;
+        location.column = 0;
+    }
+    for glob in normalized
+        .sources
+        .iter_mut()
+        .chain(&mut normalized.generates)
+    {
+        glob.glob = relative(&dir, &glob.glob);
+        glob.fingerprint = relative(&dir, &glob.fingerprint);
+    }
+    normalized.dotenv = task
+        .dotenv
+        .iter()
+        .map(|path| relative(&dir, path))
+        .collect();
+    // Aliases name entry points and gain namespace prefixes during merging;
+    // they do not change the build. Task references still affect its identity.
+    normalized.aliases.clear();
+    let mut enc = Encoder::new();
+    enc.str(&task.local_name());
+    encode_task(&mut enc, &normalized)?;
+    // Include declared, compiled env, not the inherited process environment.
+    // Variables used only by env must not collapse across include namespaces.
+    encode_vars_flat(&mut enc, task.env.as_ref())?;
+    Ok(format!("{:016x}", XxHash3_64::oneshot(&enc.finish())))
+}
+
 /// A length-prefixed byte encoder producing a canonical, unambiguous
 /// serialization. Every scalar is written with its byte length first so that
 /// no two distinct field layouts can collide.

@@ -32,8 +32,11 @@ and locking, setup tasks); v4.0.0 is a full Rust rewrite of that fork.
 
 It stays **drop-in compatible** with Taskfile v3: same schema, CLI flags, exit
 codes and observable behaviour, verified by a black-box suite that ports the
-entire Go test corpus. Fingerprint checksums are byte-identical with the Go
-implementation, so existing `.task` caches stay valid. See
+entire Go test corpus. Fingerprint checksum *values* are byte-identical with the
+Go implementation, though `.task` entries are keyed by each task's identity
+rather than its namespaced name. Included copies with matching compiled build
+inputs share state (diverging from Go's per-namespace files); namespaced task
+references still distinguish copies. See
 [`README.md`](README.md) for the feature tour and the deliberate differences
 from upstream v3.
 

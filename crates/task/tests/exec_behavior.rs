@@ -220,20 +220,18 @@ fn silence_semantics() {
 #[test]
 fn dry_run_does_not_write_checksum() {
     let dir = stage("dry_checksum");
-    let checksum = dir.join(".task/checksum/default");
-    let _ = std::fs::remove_file(&checksum);
 
     let dry = run(&dir, &["--dry", "default"]);
     assert!(dry.ok(), "dry run failed: {}", dry.combined());
     assert!(
-        !checksum.exists(),
+        checksum_file(&dir, "default").is_none(),
         "checksum file must not exist after a dry run"
     );
 
     let real = run(&dir, &["default"]);
     assert!(real.ok(), "real run failed: {}", real.combined());
     assert!(
-        checksum.exists(),
+        checksum_file(&dir, "default").is_some(),
         "checksum file must exist after a real run"
     );
 }

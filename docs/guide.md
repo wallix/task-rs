@@ -843,14 +843,22 @@ export TASK_TEMP_DIR='~/.task'
 
 ::: info
 
-Each task has only one checksum stored for its `sources`. If you want to
-distinguish a task by any of its input variables, you can add those variables as
-part of the task's label, and it will be considered a different task.
+Saved checksums are keyed by task identity, including the defining Taskfile,
+local task name, compiled build inputs and declared environment. Copies reached
+through different include namespaces share a checksum when those inputs match,
+even across separate `task` processes and without a build cache. Aliases do not
+affect this identity. Namespaced references in `deps`, `setup` or `task:`
+commands still distinguish otherwise identical copies.
 
-This is useful if you want to run a task once for each distinct set of inputs
-until the sources actually change. For example, if the sources depend on the
-value of a variable, or you if you want the task to rerun if some arguments
-change even if the source has not.
+Variables that change compiled commands, directories, sources or declared
+`env` values give a task a separate checksum entry. A variable that changes none
+of the hashed inputs does not; include it in `label` to distinguish that case.
+
+Checksum values keep the format used by the Go fork, but filenames differ.
+Upgrading from the name-based filenames rebuilds each task once. Project paths
+in the identity are relative, so exported fingerprints can be imported in a
+different checkout directory. Explicit absolute paths in commands or environment
+values still distinguish tasks.
 
 :::
 

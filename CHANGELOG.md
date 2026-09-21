@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Included tasks share saved fingerprints when their build inputs match,**
+  even across separate runs without a build cache. Variables that change
+  commands or declared environment values keep separate entries; namespaced
+  task references still distinguish copies. Checksum values keep the Go fork's
+  format, but filenames differ, so upgrading rebuilds each task once.
+
 ## v4.6.2 - 2026-09-19
 
 - **A cache transfer no longer fails on one dropped connection to the registry.**

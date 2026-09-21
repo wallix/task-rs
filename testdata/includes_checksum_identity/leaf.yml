@@ -1,0 +1,16 @@
+version: '3'
+tasks:
+  build:
+    aliases: [compile]
+    env:
+      MODE: '{{.MODE}}'
+    sources: ['{{.ROOT_DIR}}/in.txt']
+    generates: [out.txt]
+    cmds:
+      - echo "$MODE" > out.txt
+      - echo built >> built.log
+  templated:
+    sources: [in.txt]
+    generates: [templated.txt]
+    cmds:
+      - echo '{{.MODE}}' > templated.txt

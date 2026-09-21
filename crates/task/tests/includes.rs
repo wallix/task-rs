@@ -395,3 +395,66 @@ fn include_dir_with_absolute_var() {
         got
     );
 }
+
+#[test]
+fn checksum_shared_across_nested_includes() {
+    let root = stage("includes_checksum_identity");
+    let first = run(&root, &["leaf:compile"]);
+    assert!(first.ok(), "leaf:compile failed: {}", first.combined());
+
+    let second = run(&root, &["mid:leaf:build"]);
+    assert!(second.ok(), "mid:leaf:build failed: {}", second.combined());
+    assert!(
+        second.combined().contains("up to date"),
+        "mid:leaf:build should be up to date, got: {}",
+        second.combined()
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("built.log")).unwrap(),
+        "built\n"
+    );
+}
+
+#[test]
+fn checksum_separates_include_vars_in_commands_and_env() {
+    for (task, output) in [("build", "out.txt"), ("templated", "templated.txt")] {
+        let root = stage("includes_checksum_identity");
+        for (namespace, expected) in [("one", "A"), ("two", "B")] {
+            let name = format!("{namespace}:{task}");
+            let built = run(&root, &[&name]);
+            assert!(built.ok(), "{name} failed: {}", built.combined());
+            assert_eq!(
+                std::fs::read_to_string(root.join(output)).unwrap().trim(),
+                expected
+            );
+            let again = run(&root, &[&name]);
+            assert!(again.ok(), "{name} failed: {}", again.combined());
+            assert!(
+                again.combined().contains("up to date"),
+                "{}",
+                again.combined()
+            );
+        }
+    }
+}
+
+#[test]
+fn checksum_ignores_taskfile_line_numbers() {
+    let root = stage("includes_checksum_identity");
+    let first = run(&root, &["leaf:build"]);
+    assert!(first.ok(), "{}", first.combined());
+    let leaf = root.join("leaf.yml");
+    let original = std::fs::read_to_string(&leaf).unwrap();
+    std::fs::write(
+        &leaf,
+        format!("# A comment moves the task definition.\n{original}"),
+    )
+    .unwrap();
+    let second = run(&root, &["leaf:build"]);
+    assert!(second.ok(), "{}", second.combined());
+    assert!(
+        second.combined().contains("up to date"),
+        "{}",
+        second.combined()
+    );
+}

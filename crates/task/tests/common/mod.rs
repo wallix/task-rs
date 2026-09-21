@@ -164,3 +164,29 @@ pub fn run_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Run {
         code: out.status.code().unwrap_or(-1),
     }
 }
+
+/// Locates a task's fingerprint file under `<dir>/.task/checksum`.
+///
+/// Entries are named `<local name>-<digest>` (a 16-hex identity digest that is
+/// independent of the include namespace), so tests match on that shape rather
+/// than a fixed filename. Returns `None` when no matching entry exists yet.
+pub fn checksum_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    checksum_file_in(&dir.join(".task/checksum"), name)
+}
+
+/// Like [`checksum_file`] but against an explicit checksum directory, for tests
+/// that point the fingerprint state at a custom `TASK_TEMP_DIR`.
+pub fn checksum_file_in(checksum_dir: &Path, name: &str) -> Option<PathBuf> {
+    let prefix = format!("{name}-");
+    for entry in std::fs::read_dir(checksum_dir).ok()?.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if let Some(suffix) = file_name.strip_prefix(&prefix)
+            && suffix.len() == 16
+            && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Some(entry.path());
+        }
+    }
+    None
+}

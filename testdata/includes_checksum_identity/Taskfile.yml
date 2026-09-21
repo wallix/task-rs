@@ -1,0 +1,12 @@
+version: '3'
+includes:
+  leaf:
+    taskfile: ./leaf.yml
+    vars: {MODE: default}
+  mid: ./mid.yml
+  one:
+    taskfile: ./leaf.yml
+    vars: {MODE: A}
+  two:
+    taskfile: ./leaf.yml
+    vars: {MODE: B}

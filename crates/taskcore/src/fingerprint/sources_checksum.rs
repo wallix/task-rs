@@ -110,7 +110,7 @@ impl ChecksumChecker {
         let current_sources_hash = self.sources_checksum()?;
         self.pre_exec_disk_hash = current_sources_hash.clone();
 
-        let checksum_file = self.checksum_file_path();
+        let checksum_file = self.checksum_file_path()?;
         let stored = std::fs::read_to_string(&checksum_file).unwrap_or_default();
         let (old_sources_hash, old_generates_hash) = split_hashes(&stored);
 
@@ -132,7 +132,7 @@ impl ChecksumChecker {
 
     /// Returns the full fingerprint state for the task.
     pub fn status(&self) -> std::io::Result<TaskStatus> {
-        let checksum_file = self.checksum_file_path();
+        let checksum_file = self.checksum_file_path()?;
         let stored = std::fs::read_to_string(&checksum_file).unwrap_or_default();
         let (old_sources_hash, old_generates_hash) = split_hashes(&stored);
 
@@ -184,7 +184,7 @@ impl ChecksumChecker {
         let checksum_dir = Path::new(&self.temp_dir).join("checksum");
         let _ = std::fs::create_dir_all(&checksum_dir);
         std::fs::write(
-            self.checksum_file_path(),
+            self.checksum_file_path()?,
             format!("{new_sources_hash}\n{new_generates_hash}\n"),
         )
     }
@@ -195,7 +195,7 @@ impl ChecksumChecker {
         if self.task.sources.is_empty() {
             return Ok(());
         }
-        match std::fs::remove_file(self.checksum_file_path()) {
+        match std::fs::remove_file(self.checksum_file_path()?) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
@@ -222,12 +222,15 @@ impl ChecksumChecker {
         checksum_files(&dir, &sources, data)
     }
 
-    fn checksum_file_path(&self) -> String {
-        Path::new(&self.temp_dir)
+    /// Namespaced copies share state when their compiled build inputs match.
+    fn checksum_file_path(&self) -> std::io::Result<String> {
+        let digest = crate::hash::fingerprint(&self.task).map_err(std::io::Error::other)?;
+        let key = format!("{}-{digest}", normalize_filename(&self.task.local_name()));
+        Ok(Path::new(&self.temp_dir)
             .join("checksum")
-            .join(normalize_filename(self.task.name()))
+            .join(key)
             .to_string_lossy()
-            .into_owned()
+            .into_owned())
     }
 
     fn compute_dir(&self) -> String {
@@ -452,5 +455,91 @@ mod tests {
         // Characters in the A-z gap are preserved, mirroring Go.
         assert_eq!(normalize_filename("a_b"), "a_b");
         assert_eq!(normalize_filename("a.b"), "a-b");
+    }
+
+    // Build a compiled-looking task: the local name comes from `full_name` minus
+    // `namespace`, and `cmds` carry resolved values (so the digest reflects vars).
+    fn included_task(
+        dir: &str,
+        full_name: &str,
+        namespace: &str,
+        taskfile: &str,
+        cmd: &str,
+    ) -> Task {
+        Task {
+            task: "build".to_string(),
+            full_name: full_name.to_string(),
+            namespace: namespace.to_string(),
+            dirs: vec![dir.to_string()],
+            sources: vec![g("src.txt")],
+            cmds: vec![Cmd {
+                cmd: cmd.to_string(),
+                ..Default::default()
+            }],
+            location: Some(crate::ast::Location {
+                taskfile: taskfile.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn key_of(tmp_dir: &str, task: Task) -> String {
+        ChecksumChecker::new(tmp_dir.to_string(), task)
+            .checksum_file_path()
+            .unwrap()
+    }
+
+    #[test]
+    fn checksum_key_shared_across_include_namespaces() {
+        let dir = tmp();
+        let tmp_dir = tmp();
+        let tf = join(&dir, "leaf.yml");
+        // The same task (leaf.yml `build`) reached directly and through a nested
+        // include: identical local name, defining file and compiled body.
+        let direct = included_task(&dir, "leaf:build", "leaf", &tf, "echo hi");
+        let nested = included_task(&dir, "app:leaf:build", "app:leaf", &tf, "echo hi");
+        assert_eq!(
+            key_of(&tmp_dir, direct),
+            key_of(&tmp_dir, nested),
+            "same task via two include paths must share one checksum entry"
+        );
+    }
+
+    #[test]
+    fn checksum_key_differs_by_defining_file() {
+        let dir = tmp();
+        let tmp_dir = tmp();
+        let a = included_task(&dir, "a:build", "a", &join(&dir, "a.yml"), "echo hi");
+        let b = included_task(&dir, "b:build", "b", &join(&dir, "b.yml"), "echo hi");
+        assert_ne!(
+            key_of(&tmp_dir, a),
+            key_of(&tmp_dir, b),
+            "same local name in different files must stay apart"
+        );
+    }
+
+    #[test]
+    fn checksum_key_differs_by_resolved_vars() {
+        let dir = tmp();
+        let tmp_dir = tmp();
+        let tf = join(&dir, "leaf.yml");
+        // Same file and local name, but the include passed different vars, so
+        // the compiled command differs — they must not share an entry.
+        let a = included_task(&dir, "one:build", "one", &tf, "echo A");
+        let b = included_task(&dir, "two:build", "two", &tf, "echo B");
+        assert_ne!(key_of(&tmp_dir, a), key_of(&tmp_dir, b));
+    }
+
+    #[test]
+    fn checksum_key_distinguishes_source_paths_in_a_subdirectory() {
+        let dir = tmp();
+        let tmp_dir = tmp();
+        let mut absolute = included_task(&dir, "build", "", &join(&dir, "Taskfile.yml"), "echo hi");
+        absolute.dirs.push("sub".to_string());
+        absolute.sources = vec![g(&join(&dir, "src.txt"))];
+        let mut relative = absolute.clone();
+        relative.sources = vec![g("src.txt")];
+        assert_ne!(key_of(&tmp_dir, absolute), key_of(&tmp_dir, relative));
     }
 }

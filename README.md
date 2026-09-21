@@ -11,8 +11,9 @@ need stronger guarantees around incremental builds and CI reuse.
 The Rust rewrite preserves the Taskfile v3 schema, CLI flags, exit codes, and
 observable behaviour of the previous Go implementation. Its black-box test
 suite ports the Go test corpus, and its fingerprint checksums are
-byte-compatible with the pre-rewrite WALLIX fork, so existing `.task` state
-remains valid.
+byte-compatible with the pre-rewrite WALLIX fork. Checksum filenames now use
+task identity rather than include namespaces, so upgrading rebuilds each task
+once.
 
 This is not upstream Task. The fork deliberately removes a few features and
 changes some semantics; review
@@ -321,6 +322,9 @@ v3 are intentional.
   immediately and exits with status `1`.
 - Fingerprints include commands and variables as well as file contents, and
   report source and generated-output staleness independently.
+- Included copies of a task share saved fingerprints when their compiled build
+  inputs match. Different commands, declared environment values or directories
+  keep separate entries. Namespaced task references still distinguish copies.
 - A task included both directly and through a nested include is one task for
   `run: once`, whichever include path names it. Go Task counts each path
   separately.
