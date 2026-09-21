@@ -949,10 +949,18 @@ impl Executor {
             if lock_lost {
                 let _ = checker.on_error();
             } else if checker.sources_changed()? {
-                self.logger().borrow_mut().verbose_errf(
+                let changed = checker.changed_sources().unwrap_or_default();
+                let files = if changed.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", changed.join(", "))
+                };
+                self.logger().borrow_mut().errf(
                     Color::Yellow,
                     &format!(
-                        "task: sources changed during execution of {:?}, skipping fingerprint and cache update\n",
+                        "task: WARNING: sources for {:?} changed during execution{files}; \
+                         not publishing its fingerprint or cache entry. If these are files the \
+                         task generates, tighten its sources/exclude so they are not matched\n",
                         t.name()
                     ),
                 );

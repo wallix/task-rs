@@ -339,6 +339,51 @@ login server=bar user=bar";
     );
 }
 
+/// Appending to a matched source changes it on every run. The warning names
+/// the file, and the unpublished fingerprint keeps the task out of date.
+#[test]
+fn sources_changed_during_execution_warns_and_names_files() {
+    let dir = scratch(
+        "\
+version: '3'
+tasks:
+  build:
+    sources:
+      - '*.txt'
+    cmds:
+      - cmd: printf out >> generated.txt
+",
+    );
+    write(&dir, "input.txt", "in");
+
+    let warns_about_generated = |out: &str| {
+        out.contains("WARNING: sources for")
+            && out.contains("changed during execution")
+            && out.contains("generated.txt")
+    };
+
+    let first = run(&dir, &["build"]);
+    assert!(first.ok(), "run failed: {}", first.combined());
+    assert!(
+        warns_about_generated(&first.combined()),
+        "expected a warning naming generated.txt, got: {}",
+        first.combined()
+    );
+
+    // Source drift makes the task run and warn again.
+    let second = run(&dir, &["build"]);
+    assert!(
+        !second.combined().contains("up to date"),
+        "task should not be up to date after source drift, got: {}",
+        second.combined()
+    );
+    assert!(
+        warns_about_generated(&second.combined()),
+        "expected the warning to recur on the second run, got: {}",
+        second.combined()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Nil elements (GAP)
 // ---------------------------------------------------------------------------

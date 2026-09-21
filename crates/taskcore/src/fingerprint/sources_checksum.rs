@@ -1,5 +1,6 @@
 //! The checksum-based up-to-date checker.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::Serialize;
@@ -25,6 +26,11 @@ pub struct ChecksumChecker {
     /// execution). `sources_changed` compares it against a fresh disk
     /// computation to detect drift.
     pre_exec_disk_hash: String,
+    /// A per-file snapshot (relative path -> (len, mtime nanos)) taken at the
+    /// same time, so `changed_sources` can name the files that drifted. Best
+    /// effort attribution for the warning; `pre_exec_disk_hash` remains the
+    /// authoritative drift check.
+    pre_exec_files: BTreeMap<String, (u64, u128)>,
 }
 
 /// The full fingerprint state for a task, including which parts are up to date.
@@ -63,6 +69,7 @@ impl ChecksumChecker {
             sources_globs: Vec::new(),
             src_data: Vec::new(),
             pre_exec_disk_hash: String::new(),
+            pre_exec_files: BTreeMap::new(),
         };
         let (globs, data) = c.build_checksum_data();
         c.sources_globs = globs;
@@ -107,8 +114,12 @@ impl ChecksumChecker {
             return Ok(false);
         }
 
-        let current_sources_hash = self.sources_checksum()?;
+        // Share one source list between the checksum and drift snapshot.
+        let dir = self.compute_dir();
+        let source_files = globs(&dir, &self.sources_globs)?;
+        let current_sources_hash = checksum_files(&dir, &source_files, &self.src_data)?;
         self.pre_exec_disk_hash = current_sources_hash.clone();
+        self.pre_exec_files = stat_map(&dir, &source_files);
 
         let checksum_file = self.checksum_file_path()?;
         let stored = std::fs::read_to_string(&checksum_file).unwrap_or_default();
@@ -128,6 +139,33 @@ impl ChecksumChecker {
         }
         let current = self.sources_checksum()?;
         Ok(current != self.pre_exec_disk_hash)
+    }
+
+    /// Names the source files that were added, removed, or modified since the
+    /// pre-execution snapshot, relative to the task directory and sorted. Used
+    /// to point the warning at the generated files a too-broad `sources:` glob
+    /// picked up. Best effort: an empty result does not disprove drift, which
+    /// [`ChecksumChecker::sources_changed`] alone decides.
+    pub fn changed_sources(&self) -> std::io::Result<Vec<String>> {
+        // Mirror `sources_changed`: with no snapshot, name nothing rather than
+        // treat every current file as newly added.
+        if self.task.sources.is_empty() || self.pre_exec_disk_hash.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dir = self.compute_dir();
+        let now = stat_map(&dir, &globs(&dir, &self.sources_globs)?);
+        let mut changed: BTreeSet<String> = BTreeSet::new();
+        for (path, meta) in &now {
+            if self.pre_exec_files.get(path) != Some(meta) {
+                changed.insert(path.clone());
+            }
+        }
+        for path in self.pre_exec_files.keys() {
+            if !now.contains_key(path) {
+                changed.insert(path.clone());
+            }
+        }
+        Ok(changed.into_iter().collect())
     }
 
     /// Returns the full fingerprint state for the task.
@@ -240,6 +278,30 @@ impl ChecksumChecker {
 
 fn serialize_cmd(idx: usize, c: &Cmd) -> String {
     format!("cmd[{idx}]:{}", c.cmd)
+}
+
+/// Snapshots each file's length and modification time, keyed by path relative
+/// to `dir`. Cheap metadata used only to attribute drift to specific files;
+/// unreadable entries are skipped. `symlink_metadata` stats the link itself
+/// rather than its target, and an mtime bump without a content change can name
+/// a file the run only touched. Both are acceptable for best-effort
+/// attribution — the content hash, not this map, decides drift.
+fn stat_map(dir: &str, files: &[String]) -> BTreeMap<String, (u64, u128)> {
+    let mut map = BTreeMap::new();
+    for f in files {
+        let Ok(meta) = std::fs::symlink_metadata(f) else {
+            continue;
+        };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let key = filepathext::rel_str(dir, f).unwrap_or_else(|| f.clone());
+        map.insert(key, (meta.len(), mtime));
+    }
+    map
 }
 
 /// Returns `glob` relative to `dir` so checksums are stable across workspace
@@ -405,9 +467,10 @@ mod tests {
         assert!(!checker2.sources_changed().unwrap());
 
         // Modify the source: out of date, and drift detected relative to the
-        // snapshot taken above.
+        // snapshot taken above, naming the changed file.
         write_file(&dir, "src.txt", "two");
         assert!(checker2.sources_changed().unwrap());
+        assert_eq!(checker2.changed_sources().unwrap(), vec!["src.txt"]);
         let mut checker3 = ChecksumChecker::new(&tmp_dir, task.clone());
         assert!(!checker3.is_up_to_date().unwrap());
 
@@ -416,6 +479,30 @@ mod tests {
         checker.on_error().unwrap();
         let mut checker4 = ChecksumChecker::new(&tmp_dir, task);
         assert!(!checker4.is_up_to_date().unwrap());
+    }
+
+    #[test]
+    fn changed_sources_names_added_removed_and_modified() {
+        let dir = tmp();
+        let tmp_dir = tmp();
+        write_file(&dir, "a.txt", "one");
+        write_file(&dir, "b.txt", "two");
+
+        // Model a sources glob that also matches generated files.
+        let task = new_task(&dir, vec![g("*.txt")], vec![]);
+        let mut checker = ChecksumChecker::new(&tmp_dir, task);
+        checker.set_up_to_date().unwrap();
+        assert!(checker.is_up_to_date().unwrap());
+
+        write_file(&dir, "a.txt", "one-longer");
+        std::fs::remove_file(join(&dir, "b.txt")).unwrap();
+        write_file(&dir, "c.txt", "three");
+
+        assert!(checker.sources_changed().unwrap());
+        assert_eq!(
+            checker.changed_sources().unwrap(),
+            vec!["a.txt", "b.txt", "c.txt"]
+        );
     }
 
     #[test]

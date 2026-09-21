@@ -816,6 +816,12 @@ tasks:
       - public/bundle.css
 ```
 
+If a task's own commands write files that its `sources` glob also matches, the
+sources checksum changes during the run. Task then prints a warning naming the
+offending files and skips publishing the task's fingerprint and cache entry for
+that run, so the task is not treated as up to date. Tighten the glob or add an
+`exclude:` for those generated paths.
+
 In situations where you need more flexibility the `status` keyword can be used.
 You can even combine the two. See the documentation for
 [status](#using-programmatic-checks-to-indicate-a-task-is-up-to-date) for an

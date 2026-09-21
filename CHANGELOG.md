@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **A task that overwrites its own sources is now called out.** When a task's
+  commands write files its `sources:` glob also matches, the checksum changes
+  mid-run, so the task can never be cached. Task now prints a warning naming
+  those files and skips publishing the task's fingerprint and cache entry;
+  previously this was logged only under `--verbose`.
+
 ## v4.7.0 - 2026-09-21
 
 - **Included tasks share saved fingerprints when their build inputs match,**
