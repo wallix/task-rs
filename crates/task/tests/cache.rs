@@ -415,6 +415,26 @@ fn cache_restore_hit() {
     );
 }
 
+// A failed file:// cache save warns without failing the task; previously it
+// logged only under `--verbose`. A destination beneath a regular file makes
+// `create_dir_all` fail.
+#[test]
+fn cache_save_failure_warns() {
+    let dir = stage("cache");
+    let blocker = cache_dir();
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let bad = blocker.join("nested");
+    let env = [("CACHE_DIR", bad.to_str().unwrap())];
+
+    let (out, code) = run_env(&dir, &["build"], &env);
+    assert_eq!(code, 0, "the task itself should still succeed: {out}");
+    assert!(dir.join("output.txt").exists(), "task did not run: {out}");
+    assert!(
+        out.contains("WARNING: cache save") && out.contains("\"build\""),
+        "expected a visible cache-save warning naming the task, got: {out}"
+    );
+}
+
 // One Taskfile included directly (`sub`) and through another include
 // (`outer:sub`) shares one cache entry: the archive the direct copy saved is
 // restored by the nested copy, whose task annotation names the task as its own

@@ -7,6 +7,10 @@
   mid-run, so the task can never be cached. Task now prints a warning naming
   those files and skips publishing the task's fingerprint and cache entry;
   previously this was logged only under `--verbose`.
+- **Cache save and push failures are now reported.** A cache entry that cannot
+  be archived, written, or pushed prints a warning instead of being logged only
+  under `--verbose`. An unreachable registry warns once per host; other failures
+  warn per task.
 
 ## v4.7.0 - 2026-09-21
 

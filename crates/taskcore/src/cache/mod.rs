@@ -111,6 +111,21 @@ fn warn_cache_unreachable(logger: &mut Logger, repo: &str, err: &ocicas::Error) 
     }
 }
 
+/// Report a failure to save/push a task's cache entry as a visible warning so a
+/// silently disabled cache does not go unnoticed. An unreachable registry keeps
+/// its once-per-host dedup (a build pushes many tasks); every other failure is
+/// warned per occurrence, since those are rarer and task-specific.
+fn warn_cache_save_failed(logger: &mut Logger, repo: &str, task_name: &str, err: &ocicas::Error) {
+    if err.is_unreachable() {
+        warn_cache_unreachable(logger, repo, err);
+    } else {
+        logger.errf(
+            Color::Yellow,
+            &format!("task: WARNING: cache save {task_name:?} failed: {err}\n"),
+        );
+    }
+}
+
 /// Attempt to download and restore a cached entry into `dir`. On success
 /// returns `(true, meta)`; the caller verifies the metadata against the current
 /// task state. A miss or any recoverable failure returns `(false, _)`.
@@ -263,9 +278,9 @@ pub async fn cache_save(
         Ok(st) if st.up_to_date && !st.cache_files.is_empty() => st,
         Ok(_) => return,
         Err(e) => {
-            logger.verbose_errf(
+            logger.errf(
                 Color::Yellow,
-                &format!("task: cache save {task_name:?}: {e}\n"),
+                &format!("task: WARNING: cache save {task_name:?} failed: {e}\n"),
             );
             return;
         }
@@ -319,9 +334,9 @@ fn save_file(
     let tmp = temp_zip_path();
     if let Err(e) = archive::write_archive(&tmp, dir, &st.cache_files, &meta) {
         let _ = std::fs::remove_file(&tmp);
-        logger.verbose_errf(
+        logger.errf(
             Color::Yellow,
-            &format!("task: cache save {task_name:?}: {e}\n"),
+            &format!("task: WARNING: cache save {task_name:?} failed: {e}\n"),
         );
         return;
     }
@@ -329,12 +344,18 @@ fn save_file(
         && let Err(e) = std::fs::create_dir_all(parent)
     {
         let _ = std::fs::remove_file(&tmp);
-        logger.verbose_errf(Color::Yellow, &format!("task: cache save mkdir: {e}\n"));
+        logger.errf(
+            Color::Yellow,
+            &format!("task: WARNING: cache save {task_name:?} failed: mkdir {parent:?}: {e}\n"),
+        );
         return;
     }
     if let Err(e) = rename_or_copy(&tmp, dest) {
         let _ = std::fs::remove_file(&tmp);
-        logger.verbose_errf(Color::Yellow, &format!("task: cache save {dest:?}: {e}\n"));
+        logger.errf(
+            Color::Yellow,
+            &format!("task: WARNING: cache save {task_name:?} failed: {dest:?}: {e}\n"),
+        );
         return;
     }
     logger.verbose_errf(
@@ -357,11 +378,7 @@ async fn save_oci(
     let store = match ocicas::Store::open(repo, opts).await {
         Ok(s) => s,
         Err(e) => {
-            logger.verbose_errf(
-                Color::Yellow,
-                &format!("task: cache save {task_name:?}: {e}\n"),
-            );
-            warn_cache_unreachable(logger, repo, &e);
+            warn_cache_save_failed(logger, repo, task_name, &e);
             return;
         }
     };
@@ -379,9 +396,11 @@ async fn save_oci(
             match p.strip_prefix(dir) {
                 Ok(r) => r.to_path_buf(),
                 Err(_) => {
-                    logger.verbose_errf(
+                    logger.errf(
                         Color::Yellow,
-                        &format!("task: cache save {task_name:?}: {f:?} is outside {dir:?}\n"),
+                        &format!(
+                            "task: WARNING: cache save {task_name:?} failed: {f:?} is outside {dir:?}\n"
+                        ),
                     );
                     return;
                 }
@@ -410,11 +429,7 @@ async fn save_oci(
             );
         }
         Err(e) => {
-            logger.verbose_errf(
-                Color::Yellow,
-                &format!("task: cache save {task_name:?}: {e}\n"),
-            );
-            warn_cache_unreachable(logger, repo, &e);
+            warn_cache_save_failed(logger, repo, task_name, &e);
         }
     }
 }
