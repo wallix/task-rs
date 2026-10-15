@@ -71,6 +71,28 @@ tasks:
     cmds:
       - echo x > mixed/new
 
+  # linked/pkg/config holds only a symlink to linked/rootfs/conf.txt: nothing
+  # it holds is out of reach, so linked/pkg is writable.
+  create-beside-a-symlink:
+    sources: [linked/pkg/**]
+    sandbox: true
+    cmds:
+      - mkdir linked/pkg/.pybuild
+      - cat linked/pkg/config/conf
+
+  # A writable directory reaches no further through a new link.
+  hard-link-beside-a-symlink:
+    sources: [linked/pkg/**]
+    sandbox: true
+    cmds:
+      - ln linked/rootfs/other linked/pkg/config/h; cat linked/pkg/config/h
+
+  symlink-beside-a-symlink:
+    sources: [linked/pkg/**]
+    sandbox: true
+    cmds:
+      - ln -s ../../rootfs/other linked/pkg/config/s && cat linked/pkg/config/s
+
   outer:
     sources: [src/**]
     sandbox: true

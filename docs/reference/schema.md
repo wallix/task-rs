@@ -904,7 +904,8 @@ cache, but two things in `cmds` see only the task's own entries:
 What a command can change inside the root directory:
 
 - a directory whose files are all readable, so commands can create files next
-  to the sources;
+  to the sources. Symlinks do not count: reading through one is checked on the
+  file it leads to;
 - the directories `generates` writes in, the `.task` directory and `writes`
   (created when missing). Reads inside them are not restricted, so task warns
   when a `generates` directory also holds sources (`generates: [src/main.o]`

@@ -307,6 +307,43 @@ fn creating_in_a_directory_with_other_files_fails() {
 }
 
 #[test]
+fn a_directory_holding_only_a_symlink_to_a_source_is_writable() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        let dir = stage("sandbox");
+        let r = run_with_env(
+            &dir,
+            &["create-beside-a-symlink"],
+            &[("TASK_SANDBOX", mode)],
+        );
+        assert!(r.ok(), "{mode}: {}", r.combined());
+        assert!(dir.join("linked/pkg/.pybuild").is_dir(), "{mode}");
+        assert_eq!(r.stdout, "conf\n", "{mode}: {}", r.combined());
+        let _ = std::fs::remove_dir_all(&dir);
+        // Nor does it let a new link read what may not be read: a hard link
+        // fails (Landlock with EXDEV), a symlink is checked on its target.
+        for (task, want) in [
+            (
+                "hard-link-beside-a-symlink",
+                "ln: failed to create hard link",
+            ),
+            (
+                "symlink-beside-a-symlink",
+                "cat: linked/pkg/config/s: Permission denied",
+            ),
+        ] {
+            let dir = stage("sandbox");
+            let r = run_with_env(&dir, &[task], &[("TASK_SANDBOX", mode)]);
+            let out = r.combined();
+            assert!(!r.ok(), "{mode} {task}: expected a failure: {out}");
+            assert!(out.contains(want), "{mode} {task}: {out}");
+            assert!(!r.stdout.contains("other"), "{mode} {task}: {out}");
+            assert!(!dir.join("linked/pkg/config/h").exists(), "{mode} {task}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+#[test]
 fn reads_and_writes_widen_the_sandbox() {
     for mode in ENFORCING.into_iter().filter(|m| available(m)) {
         let dir = stage("sandbox");

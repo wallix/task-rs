@@ -10,7 +10,8 @@
 //!
 //! - a directory whose files are all readable, recursively, may be changed
 //!   freely: what it holds is readable anyway, and what the commands create in
-//!   it are their outputs;
+//!   it are their outputs. Symlinks do not count: reading through one is
+//!   checked on what it leads to;
 //! - a `writes` directory may be changed freely, whatever it holds;
 //! - in any other directory, each readable file gets a read rule, and nothing
 //!   can be created.
@@ -335,13 +336,7 @@ impl Walker {
             return Walk::Restricted(Vec::new());
         };
         if !self.interesting.contains(dir) {
-            // Nothing beneath is readable: free only when it is empty.
-            let mut entries = entries;
-            return if entries.next().is_none() {
-                Walk::Free(Vec::new())
-            } else {
-                Walk::Restricted(Vec::new())
-            };
+            return self.walk_unread(entries);
         }
         let mut free = true;
         let mut rules = Vec::new();
@@ -357,7 +352,9 @@ impl Walker {
             };
             let path = entry.path();
             // A symlink grants nothing: what it points to is checked on its own
-            // path.
+            // path, both by Landlock and by the seccomp supervisor, so one that
+            // leads to a file that may not be read opens no hole. Freeing its
+            // directory lets the commands only remove or replace the link.
             if kind.is_symlink() {
                 continue;
             }
@@ -379,6 +376,34 @@ impl Walker {
             Walk::Free(rules)
         } else {
             Walk::Restricted(rules)
+        }
+    }
+
+    /// Runs [`Walker::walk`] for a directory with no readable descendants. It
+    /// is free if it holds only symlinks and free directories. Readable symlink
+    /// targets are tracked by their canonical paths elsewhere. Stops at the
+    /// first other entry, before descending into potentially large output trees
+    /// (`target/`, `node_modules/`).
+    fn walk_unread(&self, entries: std::fs::ReadDir) -> Walk {
+        let mut dirs = Vec::new();
+        for entry in entries {
+            // An entry that cannot be read may be a file.
+            let Some(entry) = entry.ok() else {
+                return Walk::Restricted(Vec::new());
+            };
+            let Ok(kind) = entry.file_type() else {
+                return Walk::Restricted(Vec::new());
+            };
+            if kind.is_dir() {
+                dirs.push(entry.path());
+            } else if !kind.is_symlink() {
+                return Walk::Restricted(Vec::new());
+            }
+        }
+        if dirs.iter().all(|d| matches!(self.walk(d), Walk::Free(_))) {
+            Walk::Free(Vec::new())
+        } else {
+            Walk::Restricted(Vec::new())
         }
     }
 }
@@ -949,6 +974,29 @@ mod tests {
         assert!(p.allows(&root.join("pkg"), MAKE_DIR));
         assert!(!p.allows(&root.join("other"), READ_FILE));
         assert!(!p.allows(&root, MAKE_REG));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_leave_a_directory_free() {
+        let (_d, root) = tree(&["pkg/setup.py", "rootfs/conf", "rootfs/other", "secret"]);
+        std::fs::create_dir_all(root.join("pkg/config/deep")).unwrap();
+        std::os::unix::fs::symlink("../../rootfs/conf", root.join("pkg/config/conf")).unwrap();
+        // One leading to a file that may not be read.
+        std::os::unix::fs::symlink("../../../secret", root.join("pkg/config/deep/s")).unwrap();
+        // `pkg/**` matches the links, which resolve outside `pkg/`.
+        let p = build(&root, &["pkg/setup.py", "pkg/config/conf"], &[]);
+        assert!(p.allows(&root.join("pkg"), MAKE_DIR));
+        assert!(p.allows(&root.join("pkg/config/new"), MAKE_REG));
+        assert!(p.allows(&root.join("rootfs/conf"), READ_FILE));
+        assert!(!p.allows(&root.join("rootfs/other"), READ_FILE));
+        assert!(!p.allows(&root.join("secret"), READ_FILE));
+        drop(p);
+        // Beside another file, still restricted.
+        std::fs::write(root.join("pkg/config/deep/other"), "x").unwrap();
+        let p = build(&root, &["pkg/setup.py", "pkg/config/conf"], &[]);
+        assert!(!p.allows(&root.join("pkg"), MAKE_DIR));
+        assert!(!p.allows(&root.join("pkg/config/deep/other"), READ_FILE));
     }
 
     #[test]
