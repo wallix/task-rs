@@ -25,6 +25,7 @@ redis = { workspace = true }
 minijinja = { workspace = true }
 semver = { workspace = true }
 notify = { workspace = true }
+libc = { workspace = true }
 brush-core = "0.5.0"
 brush-parser = "0.4.0"
 # brush-core ships the shell interpreter but no builtins; brush-builtins

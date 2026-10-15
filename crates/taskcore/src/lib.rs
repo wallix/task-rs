@@ -31,6 +31,7 @@ pub mod precondition;
 pub mod reader;
 pub(crate) mod reap;
 pub mod requires;
+pub mod sandbox;
 pub mod slicesext;
 pub mod sort;
 pub mod summary;

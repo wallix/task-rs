@@ -256,6 +256,32 @@
             }
           ]
         },
+        "sandbox": {
+          "description": "Restricts the task's commands, and the tasks they call, to its sources inside the root directory: reading any other file there fails. Directories holding only readable files, the generates directories, the `.task` directory and `writes` stay writable; the root directory itself never is. Enforced with Landlock; TASK_SANDBOX selects the mode (auto, landlock, off). Linux only.",
+          "oneOf": [
+            { "type": "boolean" },
+            {
+              "type": "object",
+              "properties": {
+                "reads": {
+                  "description": "Files the commands may also read, which are not fingerprinted (e.g. `.git/**`). Same syntax as sources, without `from`.",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/sandbox_read"
+                  }
+                },
+                "writes": {
+                  "description": "Directories the commands may change freely, relative to the task directory; created if missing. Reads inside them are not restricted.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
         "watch": {
           "description": "Configures a task to run in watch mode automatically.",
           "type": "boolean",
@@ -631,6 +657,31 @@
         },
         {
           "$ref": "#/definitions/glob_obj"
+        }
+      ]
+    },
+    "sandbox_read": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "exclude": {
+              "description": "File or glob pattern to exclude from the list",
+              "type": "string"
+            },
+            "glob": {
+              "description": "Glob pattern matching the files",
+              "type": "string"
+            },
+            "fingerprint": {
+              "description": "Accepted for symmetry with sources; the files the glob matches are readable either way.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },

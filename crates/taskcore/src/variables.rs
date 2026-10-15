@@ -212,6 +212,10 @@ pub async fn compiled_task(
         aliases: orig_task.aliases.clone(),
         sources: cache.replace_globs(&orig_task.sources),
         generates: cache.replace_globs(&orig_task.generates),
+        sandbox: orig_task.sandbox.as_ref().map(|s| crate::ast::Sandbox {
+            reads: cache.replace_globs(&s.reads),
+            writes: cache.replace_vec(&s.writes),
+        }),
         dirs: cache.replace_vec(&orig_task.dirs),
         set: orig_task.set.clone(),
         shopt: orig_task.shopt.clone(),

@@ -79,6 +79,8 @@ pub enum ExecutorError {
         /// The underlying error.
         source: Box<ExecutorError>,
     },
+    /// `TASK_SANDBOX` holds a value it does not know.
+    SandboxMode(crate::sandbox::UnknownMode),
     /// The run was cancelled by a signal.
     Cancelled,
     /// An I/O error occurred.
@@ -137,6 +139,7 @@ impl std::fmt::Display for ExecutorError {
             Self::TaskRun { task_name, source } => {
                 write!(f, "task: Failed to run task {task_name:?}: {source}")
             }
+            Self::SandboxMode(e) => write!(f, "task: {e}"),
             Self::Cancelled => write!(f, "task: run cancelled"),
             Self::Io(e) => write!(f, "task: {e}"),
         }
@@ -236,6 +239,11 @@ impl From<crate::execext::Error> for ExecutorError {
 impl From<CacheError> for ExecutorError {
     fn from(e: CacheError) -> Self {
         Self::Cache(Box::new(e))
+    }
+}
+impl From<crate::sandbox::UnknownMode> for ExecutorError {
+    fn from(e: crate::sandbox::UnknownMode) -> Self {
+        Self::SandboxMode(e)
     }
 }
 impl From<LoggerError> for ExecutorError {

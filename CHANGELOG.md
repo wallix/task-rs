@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Tasks can check that their sources are complete (Linux only).** With
+  `sandbox: true`, a task's commands and the tasks they call can read only the
+  task's sources inside the root directory (the Taskfile's). A file missing
+  from `sources` then fails the build instead of leaving a stale up-to-date
+  result or cache entry. `sandbox.reads` and `sandbox.writes` widen it. The
+  restriction uses Landlock; without it, the default `TASK_SANDBOX=auto` runs
+  commands unrestricted with a warning (`TASK_SANDBOX=landlock` makes it an
+  error).
+
 ## v4.7.1 - 2026-09-21
 
 - **A task that overwrites its own sources is now called out.** When a task's

@@ -30,6 +30,7 @@ impl Executor {
         self.setup_temp_dir()?;
         self.read_taskfile(node.as_ref())?;
         self.setup_env_precedence();
+        self.setup_sandbox()?;
         self.setup_output()?;
         self.setup_compiler()?;
         self.read_dotenv_files().await?;
@@ -67,6 +68,7 @@ impl Executor {
         let reader = Reader::new();
         let mut graph = reader.read(node)?;
         self.warn_deprecated_go_dialect(&graph);
+        self.taskfile_paths = graph.vertices().map(|v| v.uri.clone()).collect();
         let taskfile = graph.merge().map_err(ExecutorError::Merge)?;
         self.taskfile = Some(taskfile);
         Ok(())
@@ -97,6 +99,12 @@ impl Executor {
     /// behaviour, where a value already in the process environment wins.
     fn setup_env_precedence(&mut self) {
         self.env_precedence = env::get_task_env("X_ENV_PRECEDENCE") != "0";
+    }
+
+    /// Reads `TASK_SANDBOX`, rejecting a value it does not know up front.
+    fn setup_sandbox(&mut self) -> Result<(), ExecutorError> {
+        self.sandbox_mode = crate::sandbox::Mode::parse(&env::get_task_env("SANDBOX"))?;
+        Ok(())
     }
 
     fn setup_temp_dir(&mut self) -> Result<(), ExecutorError> {

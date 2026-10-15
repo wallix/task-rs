@@ -13,11 +13,13 @@ use crate::cache::{self, CacheLock, CacheUrl};
 use crate::call::Call;
 use crate::env;
 use crate::execext::{self, RunCommandOptions, Stdio};
-use crate::fingerprint::ChecksumChecker;
+use crate::filepathext;
+use crate::fingerprint::{self, ChecksumChecker};
 use crate::logger::Color;
 use crate::output::{Output, SharedWriter};
 use crate::precondition;
 use crate::requires;
+use crate::sandbox::{Backend, Layers, Policy, PolicyInput, Sandbox, remove_stale_tmp};
 use crate::slicesext;
 use crate::templater::Cache as TemplaterCache;
 use crate::variables::{self, CompileContext};
@@ -50,16 +52,86 @@ pub(crate) struct CallPath {
     key: String,
     name: String,
     parent: Ancestors,
+    /// The sandbox policies the task at this level runs within, outermost
+    /// first: those of the sandboxed tasks whose commands called it.
+    layers: Option<Arc<Layers>>,
+    /// Whether the caller ignores this task's failures, which then need no
+    /// sandbox hint.
+    ignored: bool,
+    /// Which failures of the tasks this level calls are ignored.
+    calls: Ignored,
+}
+
+/// Which failures of a called task its caller ignores, for the sandbox hint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Ignored {
+    /// None.
+    #[default]
+    No,
+    /// Its own commands' (`ignore_error`): a failure of a task it calls
+    /// still fails the caller.
+    Callee,
+    /// Every one beneath it (a deferred `task:` call).
+    All,
 }
 
 impl CallPath {
     /// The path with a level appended, for handing to that task's own callees.
+    /// The new level runs within the same sandbox layers as this one.
     fn extend(path: &Ancestors, key: &str, name: &str) -> Rc<Self> {
+        let calls = path.as_ref().map(|level| level.calls).unwrap_or_default();
         Rc::new(Self {
             key: key.to_string(),
             name: name.to_string(),
             parent: path.clone(),
+            layers: Self::layers(path),
+            ignored: calls != Ignored::No,
+            calls: if calls == Ignored::All {
+                Ignored::All
+            } else {
+                Ignored::No
+            },
         })
+    }
+
+    /// This level calling a task whose failures `how` are ignored.
+    fn calling(path: &Ancestors, how: Ignored) -> Ancestors {
+        path.as_ref().map(|level| {
+            Rc::new(Self {
+                key: level.key.clone(),
+                name: level.name.clone(),
+                parent: level.parent.clone(),
+                layers: level.layers.clone(),
+                ignored: level.ignored,
+                calls: level.calls.max(how),
+            })
+        })
+    }
+
+    /// Whether the caller of the innermost level of `path` ignores its
+    /// failures.
+    fn ignored(path: &Ancestors) -> bool {
+        path.as_ref().is_some_and(|level| level.ignored)
+    }
+
+    /// This level with `layers` in place of its own, for what a sandboxed
+    /// task's commands call.
+    fn with_layers(path: &Ancestors, layers: Arc<Layers>) -> Ancestors {
+        path.as_ref().map(|level| {
+            Rc::new(Self {
+                key: level.key.clone(),
+                name: level.name.clone(),
+                parent: level.parent.clone(),
+                layers: Some(layers),
+                ignored: level.ignored,
+                calls: level.calls,
+            })
+        })
+    }
+
+    /// The sandbox layers at the innermost level of `path`.
+    fn layers(path: &Ancestors) -> Option<Arc<Layers>> {
+        path.as_ref().and_then(|level| level.layers.clone())
     }
 
     /// Reports whether a task with this key is already running on this path.
@@ -624,6 +696,7 @@ impl Executor {
                 bash_opts: Vec::new(),
                 stdout: Stdio::Inherit,
                 stderr: Stdio::Inherit,
+                sandbox: None,
             };
             if execext::run_command(opts).await.is_err() {
                 self.logger().borrow_mut().verbose_outf(
@@ -887,6 +960,17 @@ impl Executor {
             );
         }
 
+        // Commands run within the sandbox layers above this task, plus its own.
+        let mut sandbox_tmp = SandboxTmp(None);
+        let ancestors = match self.sandbox_policy(t).await? {
+            Some(policy) => {
+                sandbox_tmp.0 = policy.tmpdir.clone();
+                let layers = Layers::push(CallPath::layers(&ancestors).as_deref(), policy);
+                CallPath::with_layers(&ancestors, layers)
+            }
+            None => ancestors,
+        };
+
         // Run commands; deferred commands run after the rest, in reverse.
         let mut deferred = Vec::new();
         let mut run_err = None;
@@ -921,6 +1005,7 @@ impl Executor {
             self.run_deferred(t, call, i, deferred_exit_code, &ancestors)
                 .await;
         }
+        drop(sandbox_tmp);
 
         // A remote lock lost mid-run means a peer may have been running this
         // same task concurrently, so this run's fingerprint and cache entry
@@ -1106,6 +1191,9 @@ impl Executor {
             return Ok(());
         };
 
+        // Like a task-level `if` and preconditions, a command's `if` runs
+        // unsandboxed: under Landlock a denial would only make it false,
+        // skipping the command as if it did not apply.
         if !cmd.if_.trim().is_empty() {
             let opts = RunCommandOptions {
                 command: cmd.if_.clone(),
@@ -1115,6 +1203,7 @@ impl Executor {
                 bash_opts: Vec::new(),
                 stdout: Stdio::Inherit,
                 stderr: Stdio::Inherit,
+                sandbox: None,
             };
             if execext::run_command(opts).await.is_err() {
                 self.logger().borrow_mut().verbose_outf(
@@ -1132,7 +1221,15 @@ impl Executor {
                 silent: cmd.silent,
                 indirect: true,
             };
-            let result = self.spawn_task(sub, ancestors.clone()).join().await;
+            let how = if cmd.defer {
+                Ignored::All
+            } else if cmd.ignore_error || t.ignore_error {
+                Ignored::Callee
+            } else {
+                Ignored::No
+            };
+            let path = CallPath::calling(ancestors, how);
+            let result = self.spawn_task(sub, path).join().await;
             if let Err(ExecutorError::TaskRun { source, .. }) = &result
                 && matches!(
                     &**source,
@@ -1197,7 +1294,13 @@ impl Executor {
                 cmd.shopt.as_slice(),
             ]);
 
-            let result = self.exec_shell(t, call, &cmd.cmd, posix, bash).await;
+            // Failures ignored by the command, task or caller, including deferred
+            // commands whose errors are discarded.
+            let ignored =
+                cmd.ignore_error || t.ignore_error || cmd.defer || CallPath::ignored(ancestors);
+            let result = self
+                .exec_shell(t, call, &cmd.cmd, posix, bash, ancestors, ignored)
+                .await;
             if let Err(ExecutorError::Exec(execext::Error::NonZeroExit(_))) = &result
                 && cmd.ignore_error
             {
@@ -1222,6 +1325,8 @@ impl Executor {
     /// rewrites each line) capture the output into thread-safe buffers and replay
     /// it through the style on close — keeping the `!Send` style writers on the
     /// current thread while the shell's capture drain runs on a helper thread.
+    /// A failure `ignore_error` lets pass is not pointed at the sandbox.
+    #[allow(clippy::too_many_arguments)]
     async fn exec_shell(
         &self,
         t: &Task,
@@ -1229,8 +1334,10 @@ impl Executor {
         command: &str,
         posix: Vec<String>,
         bash: Vec<String>,
+        ancestors: &Ancestors,
+        ignore_error: bool,
     ) -> Result<(), ExecutorError> {
-        let env = split_env(env::get(t, self.env_precedence));
+        let (env, sandbox) = self.command_env(t, ancestors);
 
         // Stream directly to the process streams when nothing needs to intercept
         // the output: no capture, no replay, output seen live.
@@ -1243,10 +1350,13 @@ impl Executor {
                 bash_opts: bash,
                 stdout: Stdio::Inherit,
                 stderr: Stdio::Inherit,
+                sandbox: sandbox.clone(),
             };
             let _permit = self.limiter.acquire().await;
             let run_result = execext::run_command(opts).await;
             drop(_permit);
+            let failed = !ignore_error && exited_nonzero(&run_result);
+            self.report_sandbox(t, sandbox.as_ref(), failed);
             return run_result.map_err(ExecutorError::Exec);
         }
 
@@ -1270,6 +1380,7 @@ impl Executor {
             bash_opts: bash,
             stdout: Stdio::Capture(Box::new(out_buf.clone())),
             stderr: Stdio::Capture(Box::new(err_buf.clone())),
+            sandbox: sandbox.clone(),
         };
 
         // Bound concurrent command execution by the configured limit.
@@ -1298,7 +1409,189 @@ impl Executor {
                 &format!("task: unable to close writer: {close_err}\n"),
             );
         }
+        // After the command's own output, which `group` only now flushed.
+        let failed = !ignore_error && exited_nonzero(&run_result);
+        self.report_sandbox(t, sandbox.as_ref(), failed);
         run_result.map_err(ExecutorError::Exec)
+    }
+
+    /// The sandbox backend, resolved from `TASK_SANDBOX` on first use; a
+    /// fallback is warned about once.
+    async fn sandbox_backend(&self) -> Result<Backend, ExecutorError> {
+        let resolved = self
+            .sandbox_backend
+            .get_or_init(|| async {
+                let resolved = Backend::resolve(self.sandbox_mode);
+                if let Ok((_, Some(warning))) = &resolved {
+                    self.logger()
+                        .borrow_mut()
+                        .warnf(&format!("sandbox: {warning}\n"));
+                }
+                resolved.map(|(backend, _)| backend)
+            })
+            .await;
+        resolved.clone().map_err(ExecutorError::Io)
+    }
+
+    /// Builds the policy of a task with `sandbox:`, after its deps have run so
+    /// that the sources they generate exist; `None` when the task has none or
+    /// sandboxing is off.
+    async fn sandbox_policy(&self, t: &Task) -> Result<Option<Arc<Policy>>, ExecutorError> {
+        let Some(sandbox) = &t.sandbox else {
+            return Ok(None);
+        };
+        if self.dry || self.sandbox_backend().await? == Backend::None {
+            return Ok(None);
+        }
+        let dir = t.compute_dir();
+        let dir_str = dir.to_string_lossy();
+        let root = std::path::Path::new(&self.dir);
+        let fail = |e: std::io::Error| {
+            ExecutorError::Io(format!("setting up the sandbox of {:?}: {e}", t.name()))
+        };
+
+        let mut readable: Vec<std::path::PathBuf> = declared_files(&dir_str, &t.sources)
+            .map_err(fail)?
+            .into_iter()
+            .chain(declared_files(&dir_str, &sandbox.reads).map_err(fail)?)
+            .chain(self.taskfile_paths.iter().cloned())
+            .map(std::path::PathBuf::from)
+            .collect();
+        if let Some(tf) = &self.taskfile {
+            readable.extend(
+                tf.dotenv
+                    .iter()
+                    .map(|f| filepathext::smart_join(&self.dir, f)),
+            );
+        }
+        readable.extend(
+            t.dotenv
+                .iter()
+                .map(|f| filepathext::smart_join(&dir_str, f)),
+        );
+
+        let writable: Vec<std::path::PathBuf> = sandbox
+            .writes
+            .iter()
+            .map(|w| filepathext::smart_join(&dir_str, w))
+            .collect();
+        let temp_dir = std::path::PathBuf::from(&self.temp_dir.fingerprint);
+        let generated = t
+            .generates
+            .iter()
+            .filter(|g| !g.negate && !g.glob.is_empty())
+            .map(|g| {
+                let dir = generated_dir(&filepathext::smart_join(&dir_str, &g.glob));
+                (g.glob.clone(), dir)
+            })
+            .collect();
+
+        // A directory per run, locked while it lives (see `Policy::build`), so
+        // that concurrent ones never clear each other's; removed once the task
+        // ran (see `SandboxTmp`). Random, as processes in other pid namespaces
+        // may share `.task`.
+        let tmp = std::path::Path::new(&self.temp_dir.fingerprint).join("tmp");
+        static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let random = std::hash::BuildHasher::hash_one(
+            &std::collections::hash_map::RandomState::new(),
+            (std::process::id(), run, std::time::SystemTime::now()),
+        );
+        let private_tmp = tmp.join(format!("{}-{run}-{random:016x}", std::process::id()));
+
+        // The walk of the root can be long: off the engine's thread.
+        let (task, root) = (t.name().to_string(), root.to_path_buf());
+        let policy = tokio::task::spawn_blocking(move || {
+            remove_stale_tmp(&tmp);
+            Policy::build(PolicyInput {
+                task: &task,
+                root: &root,
+                readable,
+                writable,
+                temp_dir,
+                generated,
+                system_tmp: std::env::temp_dir(),
+                private_tmp,
+            })
+        })
+        .await
+        .map_err(|e| fail(std::io::Error::other(e)))?
+        .map_err(fail)?;
+        if let Some(tmp) = &policy.tmpdir
+            && tmp.to_str().is_none()
+        {
+            return Err(ExecutorError::Io(format!(
+                "sandbox of {:?}: TMPDIR {} is not UTF-8",
+                t.name(),
+                tmp.display()
+            )));
+        }
+        for warning in &policy.warnings {
+            self.logger()
+                .borrow_mut()
+                .warnf(&format!("sandbox: {:?}: {warning}\n", t.name()));
+        }
+        let backend = self.sandbox_backend().await?;
+        self.logger().borrow_mut().verbose_errf(
+            Color::Magenta,
+            &format!(
+                "task: [{}] sandboxed ({backend:?}, {} rules)\n",
+                t.name(),
+                policy.rule_count()
+            ),
+        );
+        Ok(Some(Arc::new(policy)))
+    }
+
+    /// The sandbox a command at `ancestors` runs in, if any task above it has
+    /// one.
+    fn sandbox_for(&self, ancestors: &Ancestors) -> Option<Sandbox> {
+        let layers = CallPath::layers(ancestors)?;
+        let backend = self.sandbox_backend.get()?.as_ref().ok().copied()?;
+        Some(Sandbox::new(backend, layers))
+    }
+
+    /// The environment a command of `t` at `ancestors` runs with, and the
+    /// sandbox it runs in: a sandbox may need its own `TMPDIR`.
+    fn command_env(
+        &self,
+        t: &Task,
+        ancestors: &Ancestors,
+    ) -> (Vec<(String, String)>, Option<Sandbox>) {
+        let mut env = split_env(env::get(t, self.env_precedence));
+        let sandbox = self.sandbox_for(ancestors);
+        // UTF-8, checked when the policy was built.
+        if let Some(tmp) = sandbox
+            .as_ref()
+            .and_then(Sandbox::tmpdir)
+            .and_then(std::path::Path::to_str)
+        {
+            if env.is_empty() {
+                // The shell inherits no environment once given one: pass the
+                // process's on, as far as it fits the `String` pairs.
+                env = std::env::vars_os()
+                    .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                    .collect();
+            }
+            env.retain(|(k, _)| k != "TMPDIR");
+            env.push(("TMPDIR".to_string(), tmp.to_string()));
+        }
+        (env, sandbox)
+    }
+
+    /// Points a sandboxed command's failure at the sandbox: Landlock reports
+    /// a denial only as the command's own "Permission denied".
+    fn report_sandbox(&self, t: &Task, sandbox: Option<&Sandbox>, failed: bool) {
+        if failed && sandbox.is_some_and(|s| matches!(s.backend, Backend::Landlock(_))) {
+            self.logger().borrow_mut().errf(
+                Color::Yellow,
+                &format!(
+                    "task: [{}] ran sandboxed: a \"Permission denied\" above may be a file \
+                     missing from sources\n",
+                    t.name()
+                ),
+            );
+        }
     }
 
     /// Creates the task's working directory if it does not exist, serialized per
@@ -1581,6 +1874,71 @@ fn cache_enabled(t: &Task) -> bool {
         return !v.is_empty() && v != "false" && v != "0";
     }
     true
+}
+
+/// Whether a command ran and failed, the only failure a sandbox denial can
+/// explain (not a shell syntax error, say).
+fn exited_nonzero(result: &Result<(), execext::Error>) -> bool {
+    matches!(result, Err(execext::Error::NonZeroExit(_)))
+}
+
+/// The `TMPDIR` of a sandboxed task's run, removed with what its commands left
+/// there once they are done (or dropped).
+struct SandboxTmp(Option<std::path::PathBuf>);
+
+impl Drop for SandboxTmp {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            crate::sandbox::remove_tmp(dir);
+        }
+    }
+}
+
+/// The files a `sources`-style list lets a sandboxed command read: everything
+/// its globs match, the files a `fingerprint` stands for included, plus the
+/// fingerprints themselves.
+fn declared_files(dir: &str, globs: &[crate::ast::Glob]) -> std::io::Result<Vec<String>> {
+    let globs: Vec<_> = globs
+        .iter()
+        .filter(|g| !g.glob.starts_with("value:"))
+        .cloned()
+        .collect();
+    let whole: Vec<_> = globs
+        .iter()
+        .map(|g| crate::ast::Glob {
+            fingerprint: String::new(),
+            ..g.clone()
+        })
+        .collect();
+    let mut files = fingerprint::globs(dir, &whole)?;
+    // The fingerprints, with the exclusions that may apply to them.
+    let fingerprints: Vec<_> = globs
+        .into_iter()
+        .filter(|g| g.negate || !g.fingerprint.is_empty())
+        .collect();
+    if fingerprints.iter().any(|g| !g.negate) {
+        files.extend(fingerprint::globs(dir, &fingerprints)?);
+    }
+    Ok(files)
+}
+
+/// The directory a `generates` pattern writes in: the part before its first
+/// wildcard segment, or the parent of a plain file path.
+fn generated_dir(pattern: &std::path::Path) -> std::path::PathBuf {
+    let mut dir = std::path::PathBuf::new();
+    for part in pattern.components() {
+        if part
+            .as_os_str()
+            .to_string_lossy()
+            .contains(['*', '?', '[', '{'])
+        {
+            return dir;
+        }
+        dir.push(part);
+    }
+    dir.parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or(dir)
 }
 
 /// Converts the `KEY=VALUE` list from [`env::get`] into `(name, value)` pairs.

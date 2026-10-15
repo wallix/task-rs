@@ -99,6 +99,26 @@ Task passes the signal to the commands it started, and the switch suppresses
 that too, so a command only ever sees what the terminal delivered to it
 directly.
 
+### `TASK_SANDBOX`
+
+How tasks with [`sandbox:`](schema.md#sandbox) are restricted:
+
+| Value             | Effect                                                                            |
+| ----------------- | --------------------------------------------------------------------------------- |
+| `auto` (or unset) | Landlock when the kernel offers ABI 2 or later, else unrestricted, with a warning |
+| `landlock`        | Landlock, or an error when the kernel lacks it                                    |
+| `off` (or `0`)    | No restriction                                                                    |
+
+Landlock reports a denial only as the command's own "Permission denied", so a
+command that recovers from one passes. It needs Linux. On other systems `auto`
+runs commands unrestricted, with a warning.
+
+A `task` started by a sandboxed command runs under the enclosing task's rules,
+with its own applied on top of them. Its sandbox is set up under the enclosing
+rules too: the `generates` and `writes` directories it would create when
+missing must already be writable there (for instance, in the enclosing task's
+`generates` or `writes`), or the inner task fails, naming the directory.
+
 ### `TASK_CACHE_OCI_USER`, `TASK_CACHE_OCI_PASSWORD`
 
 HTTP Basic credentials for a `cache.url: oci://...` registry, used when the URL

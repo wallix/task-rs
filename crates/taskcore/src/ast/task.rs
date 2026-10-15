@@ -17,6 +17,7 @@ use super::platforms::Platform;
 use super::precondition::Precondition;
 use super::prompt::Prompt;
 use super::requires::Requires;
+use super::sandbox::{Sandbox, de_opt_sandbox};
 use super::vars::Vars;
 
 /// A task definition.
@@ -39,6 +40,8 @@ pub struct Task {
     pub sources: Vec<Glob>,
     pub generates: Vec<Glob>,
     pub cache: Option<Cache>,
+    /// The files the commands may touch; `None` leaves them unrestricted.
+    pub sandbox: Option<Sandbox>,
     pub preconditions: Vec<Precondition>,
     pub dirs: Vec<String>,
     pub set: Vec<String>,
@@ -254,6 +257,8 @@ impl<'de> Deserialize<'de> for Task {
                     #[serde(default)]
                     generates: Vec<Glob>,
                     cache: Option<Cache>,
+                    #[serde(default, deserialize_with = "de_opt_sandbox")]
+                    sandbox: Option<Sandbox>,
                     #[serde(default, deserialize_with = "de_vec_skip_null")]
                     preconditions: Vec<Precondition>,
                     #[serde(default)]
@@ -318,6 +323,7 @@ impl<'de> Deserialize<'de> for Task {
                     sources: raw.sources,
                     generates: raw.generates,
                     cache: raw.cache,
+                    sandbox: raw.sandbox,
                     preconditions: raw.preconditions,
                     dirs,
                     set: raw.set,

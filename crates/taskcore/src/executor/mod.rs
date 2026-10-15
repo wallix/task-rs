@@ -169,6 +169,14 @@ pub struct Executor {
     /// Whether task env/vars override the process environment. Defaults to true;
     /// `TASK_X_ENV_PRECEDENCE=0` restores the old process-environment-wins order.
     pub(crate) env_precedence: bool,
+    /// What `TASK_SANDBOX` asks of tasks with `sandbox:`.
+    pub(crate) sandbox_mode: crate::sandbox::Mode,
+    /// The sandbox backend, resolved on the first sandboxed task so that a run
+    /// without one never probes the kernel or warns.
+    pub(crate) sandbox_backend: tokio::sync::OnceCell<Result<crate::sandbox::Backend, String>>,
+    /// Every Taskfile read, which sandboxed commands may read (a nested `task`
+    /// parses them).
+    pub(crate) taskfile_paths: Vec<String>,
 
     /// Variables collected via interactive prompts, injected into calls.
     pub(crate) prompted_vars: RefCell<Option<Vars>>,
@@ -230,6 +238,9 @@ impl Default for Executor {
             )),
             output: Rc::new(crate::output::Interleaved),
             env_precedence: false,
+            sandbox_mode: crate::sandbox::Mode::default(),
+            sandbox_backend: tokio::sync::OnceCell::new(),
+            taskfile_paths: Vec::new(),
             prompted_vars: RefCell::new(None),
             prompter: None,
             limiter: ConcurrencyLimiter::unlimited(),

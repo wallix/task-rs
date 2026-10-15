@@ -54,6 +54,7 @@ pub async fn check(
             bash_opts: Vec::new(),
             stdout: execext::Stdio::Inherit,
             stderr: execext::Stdio::Inherit,
+            sandbox: None,
         };
         if execext::run_command(opts).await.is_err() {
             logger.errf(Color::Magenta, &format!("task: {}\n", precondition.msg));

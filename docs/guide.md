@@ -868,6 +868,48 @@ values still distinguish tasks.
 
 :::
 
+### Checking that sources are complete with `sandbox`
+
+A file that a build reads but `sources` does not list never invalidates the
+fingerprint or the cache entry, so the task stays up to date after that file
+changes. `sandbox: true` makes the commands fail when they read such a file:
+
+```yaml
+version: '3'
+
+tasks:
+  build:
+    sources: ["src/**/*.go", go.mod, go.sum]
+    generates: [bin/app]
+    sandbox: true
+    cmds:
+      - go build -o bin/app ./src
+```
+
+Inside the root directory (the Taskfile's), the commands can read only the
+sources, the Taskfiles and `sandbox.reads`. They can also create files in
+directories that hold only sources, and in the `generates` directories. Outside
+the root directory, compilers, caches under `$HOME` and `/tmp` keep working,
+with one exception: the directories above the root directory can only be
+listed, so nothing can be created directly in them. The rule also applies to
+the tasks the commands call with `task:`. It does not apply to the sandboxed
+task's own `deps`. Linux only. See [`sandbox`](reference/schema.md#sandbox)
+for `reads` and `writes`.
+
+An up-to-date task or remote cache hit runs no commands, so the sandbox checks
+nothing. Use `--force-all` to bypass both for every task in the graph, including
+called tasks:
+
+```shell
+task build --force-all
+```
+
+Only commands are checked: dynamic variables (`sh:`), `if` conditions (of the
+task or of a command) and `preconditions` run outside the sandbox. A denial is
+only the command's own "Permission denied": a command that recovers from it
+(`cat secret || true`), or whose errors are ignored (`ignore_error`, `defer`),
+passes unnoticed.
+
 ### Using programmatic checks to indicate a task is up to date
 
 Alternatively, you can inform a sequence of tests as `status`. If no error is

@@ -317,6 +317,7 @@ impl Compiler {
             bash_opts: Vec::new(),
             stdout: execext::Stdio::Capture(Box::new(stdout.clone())),
             stderr: execext::Stdio::Inherit,
+            sandbox: None,
         };
         execext::run_command(opts)
             .await

@@ -1,0 +1,240 @@
+version: '3'
+
+tasks:
+  probe:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - cat src/a.txt
+
+  sources-and-outputs:
+    sources: [src/**]
+    generates: [out/**/*]
+    sandbox: true
+    cmds:
+      - mkdir -p out && cat src/a.txt > out/a.txt
+      # src holds only sources, so the command may create and remove files in it
+      - echo tmp > src/b.tmp && rm src/b.tmp
+
+  fingerprinted-sources:
+    sources:
+      - glob: src/**/*
+        fingerprint: src/a.txt
+    sandbox: true
+    cmds:
+      - cat src/b.txt
+
+  read-outside-sources:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - cat secret/key
+
+  if-reads-outside-sources:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - cmd: echo ran
+        if: cat secret/key >/dev/null
+
+  link-out-of-sources:
+    sources: [src/**]
+    generates: [out/**/*]
+    sandbox: true
+    cmds:
+      - mkdir -p out && ln secret/key out/key && cat out/key
+
+  reads-and-writes:
+    sources: [src/**]
+    sandbox:
+      reads: [secret/**]
+      writes: [mixed/cache]
+    cmds:
+      - cat secret/key
+      - echo x > mixed/cache/x
+
+  create-in-mixed-directory:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - echo x > mixed/new
+
+  outer:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - task: inner
+
+  inner:
+    cmds:
+      - cat secret/key
+
+  with-unsandboxed-dep:
+    sources: [src/**]
+    sandbox: true
+    deps: [inner]
+    cmds:
+      - cat src/a.txt
+
+  list-ancestors:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - ls .. > /dev/null && ls / > /dev/null
+
+  create-in-ancestor:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - touch "../$(basename "$PWD").escaped"
+
+  generates-at-root:
+    sources: [src/**]
+    generates: [app]
+    sandbox: true
+    cmds:
+      - echo app > app
+
+  writes-at-root:
+    sources: [src/**]
+    sandbox:
+      writes: ['.', '..']
+    cmds:
+      - cat secret/key
+
+  tmpdir:
+    sources: [src/**]
+    sandbox: true
+    env:
+      TMPDIR: /overridden
+    cmds:
+      - echo "tmp=$TMPDIR"
+      - echo x > "$TMPDIR/scratch" && cat "$TMPDIR/scratch"
+
+  dotenv:
+    sources: [src/**]
+    dotenv: [mixed/vars.env]
+    sandbox: true
+    cmds:
+      - cat mixed/vars.env
+
+  if-false:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - cmd: echo ran
+        if: test -f src/missing
+
+  nofollow:
+    sources: [src/**]
+    sandbox:
+      writes: [scratch]
+    cmds:
+      - ln -sf ../secret/key scratch/lnk
+      # The kernel refuses both before any permission check: no denial.
+      - dd if=scratch/lnk iflag=nofollow of=/dev/null 2>/dev/null || echo refused
+      - dd if=src/a.txt iflag=directory of=/dev/null 2>/dev/null || echo notdir
+      # Not replacing an existing entry: EEXIST, whatever mv makes of it.
+      - cp src/a.txt scratch/b && mv -n scratch/b mixed/keep; echo moved
+
+  ignored-denial:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - cmd: cat secret/key
+        ignore_error: true
+
+  # A nested task process, sandboxed in turn: out/ exists, from the outer
+  # task's generates, so the inner one needs to create nothing.
+  nested:
+    sources: [src/**]
+    generates: [out/**/*]
+    sandbox: true
+    cmds:
+      - '"{{.TASK_EXE}}" nested-inner'
+
+  # The same, but out/ is missing and the outer rules keep the inner task
+  # from creating it.
+  nested-missing-dir:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - '"{{.TASK_EXE}}" nested-inner'
+
+  nested-inner:
+    sources: [src/**]
+    generates: [out/**/*]
+    sandbox: true
+    cmds:
+      - cat src/a.txt > out/nested.txt
+
+  calls-task-with-dep:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - task: with-dep
+
+  with-dep:
+    deps: [inner]
+    cmds:
+      - echo called
+
+  generates-in-sources:
+    sources: [src/a.txt]
+    generates: [src/a.o]
+    sandbox: true
+    cmds:
+      - cat src/a.txt > src/a.o
+
+  reads-with-exclude:
+    sources: [src/**]
+    sandbox:
+      reads:
+        - secret/**
+        - exclude: secret/key
+    cmds:
+      - cat secret/other
+      - cat secret/key
+
+  task-ignored-denial:
+    sources: [src/**]
+    sandbox: true
+    ignore_error: true
+    cmds:
+      - cat secret/key
+
+  deferred-denial:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - defer: cat secret/key
+      - echo ran
+
+  # Two sandboxed tasks in one process: the inner one's wider sources do not
+  # widen what the outer one allows.
+  outer2:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - task: inner2
+
+  inner2:
+    sources: [src/**, secret/**]
+    sandbox: true
+    cmds:
+      - cat src/a.txt
+      - cat secret/key
+
+  call-ignored-denial:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - task: inner
+        ignore_error: true
+
+  deferred-call-denial:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - defer: {task: inner}
+      - echo ran

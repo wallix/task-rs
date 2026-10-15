@@ -23,6 +23,8 @@ pub enum Error {
     Shell(brush_core::Error),
     /// Stdio wiring (pipe creation or draining) failed.
     Io(std::io::Error),
+    /// The command's sandbox could not be set up, so it did not run.
+    Sandbox(std::io::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -31,6 +33,7 @@ impl std::fmt::Display for Error {
             Self::NonZeroExit(code) => write!(f, "command exited with status {code}"),
             Self::Shell(err) => write!(f, "{err}"),
             Self::Io(err) => write!(f, "{err}"),
+            Self::Sandbox(err) => write!(f, "cannot run sandboxed: {err}"),
         }
     }
 }
@@ -39,7 +42,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Shell(err) => Some(err),
-            Self::Io(err) => Some(err),
+            Self::Io(err) | Self::Sandbox(err) => Some(err),
             Self::NonZeroExit(_) => None,
         }
     }
@@ -88,6 +91,8 @@ pub struct RunCommandOptions {
     pub stdout: Stdio,
     /// Where standard error is sent.
     pub stderr: Stdio,
+    /// The sandbox to run the command in; `None` runs it unrestricted.
+    pub sandbox: Option<crate::sandbox::Sandbox>,
 }
 
 impl RunCommandOptions {
@@ -102,6 +107,7 @@ impl RunCommandOptions {
             bash_opts: Vec::new(),
             stdout: Stdio::default(),
             stderr: Stdio::default(),
+            sandbox: None,
         }
     }
 }
@@ -194,7 +200,39 @@ fn options_prelude(posix_opts: &[String], bash_opts: &[String]) -> String {
 /// The command runs under a fresh non-interactive bash-compatible shell with
 /// `errexit` enabled, the requested POSIX/bash options applied, and stdio wired
 /// per [`RunCommandOptions`].
-pub async fn run_command(opts: RunCommandOptions) -> Result<(), Error> {
+pub async fn run_command(mut opts: RunCommandOptions) -> Result<(), Error> {
+    let Some(sandbox) = opts.sandbox.take() else {
+        return run_shell(opts).await;
+    };
+    // The worker thread is restricted before running commands. Threads and
+    // processes the shell starts inherit the restriction; engine threads keep
+    // their access. Dropping this future drops `_cancel`, stopping the shell
+    // on the worker just as dropping it here would.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (_cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+    sandbox
+        .run(Box::new(move || {
+            Box::pin(async move {
+                let result = tokio::select! {
+                    r = run_shell(opts) => r,
+                    _ = cancelled => Err(Error::Io(std::io::ErrorKind::Interrupted.into())),
+                };
+                // The receiver is gone when the command was dropped: nobody wants
+                // the result.
+                let _ = tx.send(result);
+            })
+        }))
+        .await
+        .map_err(Error::Sandbox)?;
+    rx.await.unwrap_or_else(|_| {
+        Err(Error::Io(std::io::Error::other(
+            "sandboxed command thread died",
+        )))
+    })
+}
+
+/// [`run_command`] on the current thread.
+async fn run_shell(opts: RunCommandOptions) -> Result<(), Error> {
     let (stdout_file, stdout_drain) = open_file_for(OpenFiles::STDOUT_FD, opts.stdout)?;
     let (stderr_file, stderr_drain) = open_file_for(OpenFiles::STDERR_FD, opts.stderr)?;
 
@@ -509,6 +547,50 @@ mod tests {
         let (result, out) = run_capture(RunCommandOptions::new("echo hello")).await;
         assert!(result.is_ok());
         assert_eq!(out, "hello\n");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_sandboxed_command_stops_its_shell() {
+        use std::time::{Duration, Instant};
+        /// A directory of the test's own, removed however the test ends.
+        struct Dir(std::path::PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = Dir(std::env::temp_dir().join(format!(
+            "task-execext-cancel-{}-{nanos}",
+            std::process::id()
+        )));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let (started, done) = (dir.0.join("started"), dir.0.join("done"));
+        let mut opts = RunCommandOptions::new(format!(
+            "touch '{}'\nsleep 0.2\necho done > '{}'",
+            started.display(),
+            done.display()
+        ));
+        opts.sandbox = Some(crate::sandbox::Sandbox::new(
+            crate::sandbox::Backend::None,
+            crate::sandbox::Layers::new(Vec::new()),
+        ));
+        let mut command = Box::pin(run_command(opts));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !started.exists() {
+            assert!(Instant::now() < deadline, "the command never started");
+            tokio::select! {
+                r = &mut command => panic!("the command finished first: {r:?}"),
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+        drop(command);
+        // Well past the sleep: a shell still running has written by then.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!done.exists(), "the shell went on after being dropped");
     }
 
     #[tokio::test]

@@ -843,6 +843,81 @@ tasks:
       - task: build
 ```
 
+#### `sandbox`
+
+- **Type**: `bool | object`
+- **Description**: Restricts the task's commands, and the tasks they call, to
+  the files the task declares. Inside the root directory a command can read
+  only the task's `sources`, the Taskfiles and `reads`; reading any other file
+  fails with "Permission denied". This checks that `sources` lists every input
+  the build reads. A missed input otherwise leaves a stale up-to-date result or
+  cache entry. Outside the root directory nothing is restricted, except in the
+  directories above it (see below). Linux only.
+
+| Field    | Type       | Description                                                                      |
+| -------- | ---------- | -------------------------------------------------------------------------------- |
+| `reads`  | `[]glob`   | Files the commands may also read, not fingerprinted (e.g. `.git/**`); no `from:` |
+| `writes` | `[]string` | Directories the commands may change freely, relative to the task directory       |
+
+What a command can change inside the root directory:
+
+- a directory whose files are all readable, so commands can create files next
+  to the sources;
+- the directories `generates` writes in, the `.task` directory and `writes`
+  (created when missing). Reads inside them are not restricted, so task warns
+  when a `generates` directory also holds sources (`generates: [src/main.o]`
+  opens all of `src/`);
+- nothing else: a command cannot create a file in a directory that holds files
+  it may not read.
+
+The root directory itself is never writable, even when every file in it is
+readable: nothing can be created, removed or renamed directly in it, and its
+own files can only be read. A file generated directly in it
+(`generates: [app]`) cannot be created, and task warns to put it in a
+subdirectory (`generates: [bin/app]`). A `writes` entry that is the root
+directory or above it is ignored, with a warning.
+
+The directories above the root directory can be listed, but no entry can be
+created, removed or renamed directly in them: Landlock cannot grant that
+without granting it throughout the root directory. A root directory placed
+directly in `$HOME` or `/tmp` therefore cannot create files there, nor use an
+entry made there after the task started; deeper directories are not affected.
+When the system temporary directory contains the root directory, or is inside
+it, commands get `TMPDIR` set to a directory of their own under `.task/tmp`,
+replacing any `TMPDIR` the task sets. The directory is removed after the
+commands finish, or by a later sandboxed run if task was killed.
+
+The sandboxed task's own `deps` run outside its sandbox, because they run
+whether the task is up to date or not; a task it calls still runs its `deps`
+inside it. A task deduplicated by `run: once` or `run: when_changed` and
+reached both from a sandboxed task and from outside it runs only once, under
+the sandbox of whichever caller starts it first. `TASK_SANDBOX` selects how the
+sandbox is enforced; see the
+[environment reference](environment.md#task_sandbox).
+
+A denial is only the command's own "Permission denied": a command that fails
+on it fails the task as usual, but one that recovers from it
+(`cat secret || true`), or whose errors are ignored (`ignore_error`, `defer`),
+passes unnoticed. A command's `if`, like a task-level `if` and
+`preconditions`, runs outside the sandbox and is not checked.
+
+The sandbox checks a build's declared inputs; it is not a security boundary.
+Landlock sets `PR_SET_NO_NEW_PRIVS` on the commands, so setuid and
+file-capability programs (`sudo`, `ping` on some systems) do not gain their
+privileges and typically fail.
+
+```yaml
+tasks:
+  build:
+    sources: ["src/**/*.c", Makefile]
+    generates: ["build/**/*"]
+    sandbox:
+      reads: [".git/**"]
+      writes: [.ccache]
+    cmds:
+      - make
+```
+
 #### `platforms`
 
 - **Type**: `[]string`
