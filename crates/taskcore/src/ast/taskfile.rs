@@ -174,6 +174,17 @@ mod tests {
         assert!(tf.tasks.get("build").is_some());
     }
 
+    // A deliberate divergence from Go, which lets the last definition win.
+    #[test]
+    fn duplicate_task_keys_are_errors() {
+        let input = "version: '3'\ntasks:\n  a:\n    cmds: [echo a]\n  a:\n    cmds: [echo b]\n";
+        let err = serde_yaml_ng::from_str::<Taskfile>(input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "task: Failed to decode Taskfile: tasks: duplicate entry with key \"a\" at line 3 column 3"
+        );
+    }
+
     #[test]
     fn accepts_bare_integer_and_float_version() {
         // Go accepts an unquoted `version: 3`; both scalar forms map to "3"/"3.1".

@@ -685,4 +685,177 @@ mod tests {
         }]));
         assert_eq!(hash(&a).unwrap(), hash(&b).unwrap());
     }
+
+    // Fingerprints of Taskfiles full of scalars whose type depends on YAML
+    // resolution rules, pinned to the values serde_yaml_ng produced: a change
+    // in how any of them parses would invalidate every `.task` cache. The
+    // per-scalar expectations are in `tests/yaml_pins.rs`.
+    #[test]
+    fn fingerprints_of_tricky_scalars_are_stable() {
+        let yaml = indoc_yaml(
+            r#"
+        version: '3'
+        tasks:
+          build:
+            vars:
+              OCT: 017
+              UMASK: 0022
+              EIGHT: 08
+              ZEROS: 00
+              UNDER: 1_000
+              HEX: 0x1F
+              HEXU: 0x1_F
+              OCTO: 0o17
+              OCTU: 0O17
+              BINU: 0B1
+              ODDT: tRuE
+              ODDN: nUlL
+              NANS: .Nan
+              HUGE: 1e400
+              INF: .inf
+              NINF: -.inf
+              NAN: .NAN
+              FLT: 1.0
+              EXP: 1e3
+              AVO: 6.02e23
+              BIG: 1e20
+              UMAX: 18446744073709551615
+              IMIN: -9223372036854775808
+              BIN: !!binary aGk=
+              STR: !!str 123
+              INT: !!int '7'
+              TAG: !foo bar
+              TAGM: !foo {x: 1}
+              GLOB: !<tag:example.com,2000:x> 5
+              YES: yes
+              TRUEV: True
+              NUL: ~
+              EMPTY:
+              QUOTED: '0x1F'
+              BLOCK: |
+                0x1F
+              ANCH: &n 007
+              ALIAS: *n
+              SEQ: [1, -2, 3.5, true, null, 'x', !t 5]
+              MAP:
+                map: {1: a, true: b, ~: c, 1.5: d, 0x10: e, !k 2: f, [1, 2]: g, '1': h, <<: i}
+            env:
+              E1: 017
+              E2: 1e3
+              E3: .inf
+            cmds:
+              - echo hi
+"#,
+        );
+        let tf: crate::ast::Taskfile = serde_yaml_ng::from_str(&yaml).unwrap();
+        let t = tf.tasks.get("build").unwrap();
+        assert_eq!(cache_checksum(t, "abc").unwrap(), "abc-951c3ac90fa3d487");
+        assert_eq!(fingerprint(t).unwrap(), "fc60ade48e794989");
+    }
+
+    // The YAML 1.1 spellings, signs, tags, merges and block scalars of
+    // `tests/yaml_pins.rs`, pinned the same way.
+    #[test]
+    fn fingerprints_of_yaml_1_1_scalars_are_stable() {
+        let yaml = indoc_yaml(
+            r#"
+        version: 3.10
+        tasks:
+          build:
+            vars:
+              B1: yes
+              B2: no
+              B3: on
+              B4: off
+              B5: y
+              B6: n
+              B7: Y
+              B8: NO
+              B9: Off
+              B10: False
+              B11: FALSE
+              N1: Null
+              N2: NULL
+              N3: ~
+              P1: +1
+              P2: +1.5
+              P3: +.inf
+              Z1: -0
+              Z2: -0.0
+              TS1: 2001-12-14
+              TS2: 2001-12-14t21:59:43.10-05:00
+              SX1: 1:20
+              SX2: 190:20:30
+              F1: .5
+              F2: 5.
+              F3: 1E3
+              F4: 1e+3
+              F5: 1.0e-3
+              F6: 0.1
+              F7: .INF
+              F8: .Inf
+              F9: -.INF
+              F10: .nan
+              F11: 3.10
+              I1: -0x1F
+              I2: 0X1F
+              I3: 0b1
+              I4: 0o8
+              I5: 0x
+              I6: 0o17
+              I7: 017
+              I8: 0x1F
+              T1: !!float 1
+              T2: !!int 0x1F
+              T3: !!str 1
+              T4: !custom x
+              T5: !!seq [1, 2]
+              T6: !custom [1]
+              ESC: "\x41é\N"
+              FOLD: >
+                folded
+                text
+
+                para
+              LIT: |-
+                keep
+                lines
+              KEEP: |+
+                trail
+
+              STRIP: >-
+                a
+                b
+              PLAIN: plain
+                multi
+                line
+              BASE:
+                map: &base {a: 1, b: 2}
+              MERGE:
+                map: {<<: *base, b: 3}
+              MERGES:
+                map: {<<: [*base, {c: 4}], d: 5}
+              TAGGED:
+                map: !!map {x: !custom {y: 1}}
+              KEYS:
+                map: {1: a, 1.0: b, '1': c, -0: d, 0.: e}
+            cmds:
+              - echo hi
+"#,
+        );
+        let tf: crate::ast::Taskfile = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(tf.version.as_deref(), Some("3.1"));
+        let t = tf.tasks.get("build").unwrap();
+        assert_eq!(cache_checksum(t, "abc").unwrap(), "abc-14ea9dbc1e2459b7");
+        assert_eq!(fingerprint(t).unwrap(), "17b9784e4440d7ed");
+    }
+
+    /// Strips the 8-column indentation of the Taskfile literals above.
+    fn indoc_yaml(text: &str) -> String {
+        text.lines()
+            .skip(1)
+            .map(|line| line.strip_prefix("        ").unwrap_or(line))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
 }
