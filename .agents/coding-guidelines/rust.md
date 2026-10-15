@@ -103,9 +103,9 @@ rationale. Concrete guidance:
   hand-written `Display`/`From` impls are fine.
 - `std::process::Command` over `duct`/`subprocess`. Shell command bodies go
   through the `brush` interpreter, not by shelling out to `/bin/sh`.
-- `serde` + `serde_json` / `serde_yaml_ng` for structured I/O — but resist a
-  derive crate just for one struct; a 5-line `Display` impl is sometimes the
-  right answer.
+- `serde` + `serde_json` / `taskcore::yaml` (serde_yaml_ng's value model on
+  granit-parser) for structured I/O — but resist a derive crate just for
+  one struct; a 5-line `Display` impl is sometimes the right answer.
 - Acceptable where stdlib is genuinely insufficient, and already present:
   `serde`, `tokio` (no async runtime in stdlib; used by the registry/cache
   paths), `regex`, `semver`, `notify`, `minijinja`, `clap`, `redis` (the
@@ -120,5 +120,6 @@ rationale. Concrete guidance:
   linkable under musl with no system C libraries. Add an advisory ignore only
   with documented rationale and residual risk in `.cargo/audit.toml`.
 - Keep the pins shared with virtkit (`oci-client`, `reqwest`, `rustls`,
-  `jsonwebtoken`, `zstd`, `sha2`, `fastcdc`, `serde_yaml_ng`) in step with that
-  repo — `ocicas` is meant to merge back.
+  `jsonwebtoken`, `zstd`, `sha2`, `fastcdc`) in step with that repo — `ocicas`
+  is meant to merge back. `granit-parser` is required as `"2"`; `Cargo.lock`
+  holds it at the version virtkit's `serde-saphyr` resolves to.

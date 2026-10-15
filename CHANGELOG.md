@@ -14,6 +14,15 @@
   recovered from or ignored, and an enforced sandbox runs a command's `if` under
   the supervisor (without the supervisor, unsandboxed with a warning).
   `TASK_SANDBOX=audit` lists every undeclared access without failing.
+- **Taskfiles are parsed with a memory-safe YAML parser.** Checksums and the
+  positions of decode errors are unchanged; YAML syntax errors are worded and
+  sometimes positioned differently (an unclosed `[`, `{` or quote is reported
+  where it opens), and a Taskfile starting with a byte order mark now loads.
+  Unlike Go Task, a comment glued to the token before it (`'x'#c`, `|#c`,
+  `{b: 1}#c`, `[1,#c`) and `[-]` are refused, `[?x]` reads as the string `?x`,
+  `&a#c` names the anchor `a#c`, U+0085, U+2028 and U+2029 are not line
+  breaks, and a few inputs Go Task refuses (a tab-indented top-level key, an
+  empty key, a stream of only `...`, `%YAML 1.3`) are accepted.
 
 ## v4.7.1 - 2026-09-21
 

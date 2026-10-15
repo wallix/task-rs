@@ -38,11 +38,17 @@ arithmetic_side_effects = "deny"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# YAML has no stdlib equivalent; serde_yaml_ng is the maintained serde-yaml fork
-# (same choice as virtkit). indexmap gives the insertion-ordered maps the
-# Taskfile schema needs (vars, tasks) — the guidelines allow it for that reason.
-serde_yaml_ng = "0.10"
+# YAML has no stdlib equivalent. granit-parser is the safe-Rust event parser
+# used by virtkit's serde-saphyr. taskcore::yaml preserves serde_yaml_ng's value
+# model and typing rules because decoded values feed fingerprint checksums.
+# indexmap preserves Taskfile variable and task insertion order.
+granit-parser = { version = "2", default-features = false, features = ["std", "error_messages"] }
 indexmap = { version = "2", features = ["serde"] }
+# Shortest round-trip float and integer formatting for YAML numbers, as
+# serde_yaml_ng printed them (`1e20`, `1000.0`). Both are already in the tree
+# (itoa via serde_json, ryu via redis).
+ryu = "1"
+itoa = "1"
 # Template engine for Taskfile variable interpolation. Go's text/template has no
 # stdlib-equivalent semantics; minijinja is the chosen engine. `custom_syntax`
 # lets the Go-mode renderer use sentinel block/comment delimiters so raw Jinja

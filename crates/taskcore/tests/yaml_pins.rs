@@ -1,8 +1,11 @@
 //! Characterization pins for YAML decoding: how scalars resolve, how decoded
 //! values render in templates and through the emitter, and the wording of
-//! decode errors. Expectations are what serde_yaml_ng 0.10 produces today,
-//! odd cases included: decoded values feed fingerprint checksums and template
-//! output, so a YAML backend swap must reproduce them.
+//! decode errors. Expectations are what serde_yaml_ng 0.10 produced, odd
+//! cases included, which the granit-parser port reproduces: decoded values
+//! feed fingerprint checksums and template output. Only syntax errors changed
+//! with the port: they are worded and sometimes positioned differently (an
+//! unclosed bracket or quote is reported where it opens); decode errors keep
+//! their positions.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -498,12 +501,19 @@ const SYNTAX_ERROR: &str = "version: '3'\ntasks:\n  a: [1\n";
 #[test]
 fn syntax_error_position_is_pinned() {
     let cases = [
-        // An unclosed flow sequence is reported where the parser gives up
-        // (the next line), not at the opening bracket.
-        (SYNTAX_ERROR, (4, 1)),
+        // An unclosed flow sequence is reported at its opening bracket (libyaml
+        // gave the next line, where it gave up).
+        (SYNTAX_ERROR, (3, 6)),
         (
             "version: '3'\ntasks:\n  a:\n    cmds:\n      - echo\n    deps: x: y\n",
             (6, 12),
+        ),
+        // An unclosed quote is reported at its opening quote (libyaml gave the
+        // end of input, as the end of the scalar).
+        ("version: '3\ntasks: {}\n", (1, 10)),
+        (
+            "version: '3'\ntasks:\n  a:\n    desc: \"x\n    cmds: []\n",
+            (4, 11),
         ),
     ];
     for (src, (line, column)) in cases {
@@ -528,10 +538,14 @@ fn syntax_error_position_is_pinned() {
 
 // The wording comes from the YAML parser and is expected to change with it.
 #[test]
-fn syntax_error_wording_is_libyamls() {
+fn syntax_error_wording_is_granits() {
     assert_eq!(
         read_error(SYNTAX_ERROR),
-        "task: Failed to parse Taskfile.yml:\ntask: Failed to decode Taskfile: did not find expected ',' or ']' at line 4 column 1, while parsing a flow sequence at line 3 column 6"
+        "task: Failed to parse Taskfile.yml:\ntask: Failed to decode Taskfile: unclosed bracket '[' at line 3 column 6"
+    );
+    assert_eq!(
+        read_error("version: '3\ntasks: {}\n"),
+        "task: Failed to parse Taskfile.yml:\ntask: Failed to decode Taskfile: unclosed quote at line 1 column 10"
     );
 }
 
