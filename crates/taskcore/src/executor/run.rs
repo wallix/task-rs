@@ -1602,8 +1602,8 @@ impl Executor {
         (env, sandbox)
     }
 
-    /// Reports what a sandboxed command was denied; returns whether anything
-    /// was denied.
+    /// Reports what a sandboxed command was denied, or would have been when
+    /// auditing; returns whether anything was denied.
     ///
     /// `before` is [`Sandbox::denial_count`] from before the command ran: any
     /// denial since counts against it. A command running concurrently under
@@ -1620,9 +1620,10 @@ impl Executor {
         let Some(sandbox) = sandbox else {
             return false;
         };
+        let audit = sandbox.backend == (Backend::Seccomp { enforce: false });
         let logger = self.logger();
         let mut logger = logger.borrow_mut();
-        let color = Color::Red;
+        let color = if audit { Color::Yellow } else { Color::Red };
         if sandbox.unenforced() && !self.sandbox_unenforced_warned.replace(true) {
             let what = "this run's sandboxes are not enforced";
             logger.warnf(&format!(
@@ -1631,7 +1632,7 @@ impl Executor {
                 t.name()
             ));
         }
-        let denied = sandbox.denial_count() > before;
+        let denied = !audit && sandbox.denial_count() > before;
         let taken = sandbox.take_denials();
         // Each distinct denial is shown once per supervisor: a repeat only
         // counts.
@@ -1648,17 +1649,22 @@ impl Executor {
         for d in taken {
             let what = match d {
                 Denial::Refused { task, access, path } => {
+                    let verb = if audit { "would deny" } else { "denied" };
                     let place = match access {
                         "create" | "remove" | "rename" => "in",
                         _ => "of",
                     };
                     format!(
-                        "denied {access} {place} {} (not allowed by {task:?})",
+                        "{verb} {access} {place} {} (not allowed by {task:?})",
                         path.display()
                     )
                 }
                 Denial::Unchecked { syscall, why } => {
-                    format!("denied {syscall}: its paths cannot be checked ({why})")
+                    let verb = if audit { "did not check" } else { "denied" };
+                    format!("{verb} {syscall}: its paths cannot be checked ({why})")
+                }
+                Denial::Foreign { syscalls } if audit => {
+                    format!("let {syscalls} through unchecked (shown once)")
                 }
                 Denial::Foreign { syscalls } => format!(
                     "failed {syscalls} with \"Permission denied\": their paths cannot be \
@@ -1672,7 +1678,7 @@ impl Executor {
                 Color::Yellow,
                 &format!(
                     "task: [{}] ran sandboxed: a \"Permission denied\" above may be a file \
-                     missing from sources\n",
+                     missing from sources; TASK_SANDBOX=audit lists every one\n",
                     t.name()
                 ),
             );

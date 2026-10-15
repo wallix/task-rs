@@ -903,6 +903,7 @@ that fails on it fails the task as usual, but one that recovers from it, or
 whose errors are ignored, passes unnoticed. A command's `if`, like a
 task-level `if` and `preconditions`, runs outside the sandbox and is not
 checked.
+`TASK_SANDBOX=audit` reports instead of failing.
 
 The sandbox checks a build's declared inputs; it is not a security boundary.
 Both mechanisms set `PR_SET_NO_NEW_PRIVS` on the commands, so setuid and

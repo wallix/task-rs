@@ -8,7 +8,8 @@
 //!
 //! Two backends enforce the same rules: Landlock (`landlock`), cheap and
 //! kernel-enforced, and a seccomp user-notification supervisor (`seccomp`), a
-//! slower fallback. `TASK_SANDBOX` picks one; see [`Mode`].
+//! slower fallback that can report without denying accesses (`audit`).
+//! `TASK_SANDBOX` picks one; see [`Mode`].
 
 use std::io;
 use std::path::PathBuf;
@@ -59,6 +60,8 @@ pub enum Mode {
     Landlock,
     /// The seccomp supervisor, enforcing.
     Seccomp,
+    /// The seccomp supervisor, reporting what would be denied without denying it.
+    Audit,
     /// Ignore `sandbox:`.
     Off,
 }
@@ -70,6 +73,7 @@ impl Mode {
             "" | "auto" => Ok(Self::Auto),
             "landlock" => Ok(Self::Landlock),
             "seccomp" => Ok(Self::Seccomp),
+            "audit" => Ok(Self::Audit),
             "off" | "0" => Ok(Self::Off),
             other => Err(UnknownMode(other.to_string())),
         }
@@ -84,7 +88,7 @@ impl std::fmt::Display for UnknownMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "TASK_SANDBOX={:?}: expected auto, landlock, seccomp or off",
+            "TASK_SANDBOX={:?}: expected auto, landlock, seccomp, audit or off",
             self.0
         )
     }
@@ -124,6 +128,7 @@ impl Backend {
             )),
             Mode::Landlock => Err("TASK_SANDBOX=landlock needs Linux".to_string()),
             Mode::Seccomp => Err("TASK_SANDBOX=seccomp needs Linux".to_string()),
+            Mode::Audit => Err("TASK_SANDBOX=audit needs Linux".to_string()),
         }
     }
 }
@@ -160,10 +165,12 @@ impl Backend {
                     )),
                 )),
             },
-            (Mode::Seccomp, _) => {
+            (Mode::Seccomp | Mode::Audit, _) => {
+                let enforce = mode == Mode::Seccomp;
+                let name = if enforce { "seccomp" } else { "audit" };
                 seccomp()
-                    .map_err(|e| format!("TASK_SANDBOX=seccomp: seccomp is unavailable ({e})"))?;
-                Ok((Self::Seccomp { enforce: true }, None))
+                    .map_err(|e| format!("TASK_SANDBOX={name}: seccomp is unavailable ({e})"))?;
+                Ok((Self::Seccomp { enforce }, None))
             }
         }
     }
@@ -460,10 +467,11 @@ mod tests {
         assert_eq!(Mode::parse(""), Ok(Mode::Auto));
         assert_eq!(Mode::parse("landlock"), Ok(Mode::Landlock));
         assert_eq!(Mode::parse("seccomp"), Ok(Mode::Seccomp));
+        assert_eq!(Mode::parse("audit"), Ok(Mode::Audit));
         assert_eq!(Mode::parse("0"), Ok(Mode::Off));
         assert_eq!(
             Mode::parse("on").unwrap_err().to_string(),
-            "TASK_SANDBOX=\"on\": expected auto, landlock, seccomp or off"
+            "TASK_SANDBOX=\"on\": expected auto, landlock, seccomp, audit or off"
         );
     }
 
@@ -530,6 +538,10 @@ mod tests {
             assert_eq!(
                 Backend::pick(Mode::Seccomp, Ok(4), seccomp_ok),
                 Ok((Backend::Seccomp { enforce: true }, None))
+            );
+            assert_eq!(
+                Backend::pick(Mode::Audit, no_landlock(), seccomp_ok),
+                Ok((Backend::Seccomp { enforce: false }, None))
             );
             let err = Backend::pick(Mode::Seccomp, Ok(4), seccomp_fails).unwrap_err();
             assert!(

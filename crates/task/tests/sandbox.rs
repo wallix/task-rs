@@ -298,6 +298,27 @@ fn a_nested_task_process_under_seccomp_warns_its_sandbox_is_not_enforced() {
 }
 
 #[test]
+fn audit_reports_without_denying() {
+    if !available("audit") {
+        return;
+    }
+    let dir = stage("sandbox");
+    let r = run_with_env(
+        &dir,
+        &["read-outside-sources"],
+        &[("TASK_SANDBOX", "audit")],
+    );
+    assert!(r.ok(), "{}", r.combined());
+    let out = r.combined();
+    assert!(out.contains("s\n"), "the read must go through:\n{out}");
+    assert!(
+        out.contains("sandbox: would deny read of ") && out.contains("secret/key"),
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn off_ignores_the_sandbox() {
     let dir = stage("sandbox");
     let r = run_with_env(&dir, &["read-outside-sources"], &[("TASK_SANDBOX", "off")]);
@@ -481,6 +502,19 @@ fn a_denial_the_command_swallowed_still_fails_under_seccomp() {
         "{out}"
     );
     assert_not_recorded(&dir, "swallowed-denial", "seccomp");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn audit_reports_a_swallowed_denial_without_failing() {
+    if !available("audit") {
+        return;
+    }
+    let dir = stage("sandbox");
+    let r = run_with_env(&dir, &["swallowed-denial"], &[("TASK_SANDBOX", "audit")]);
+    let out = r.combined();
+    assert!(r.ok(), "{out}");
+    assert!(out.contains("sandbox: would deny read of "), "{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

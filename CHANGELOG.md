@@ -12,6 +12,7 @@
   unrestricted with a warning (`TASK_SANDBOX=landlock` or `seccomp` makes it an
   error). Any denial the supervisor sees fails the task, even one the command
   recovered from or ignored.
+  `TASK_SANDBOX=audit` lists every undeclared access without failing.
 
 ## v4.7.1 - 2026-09-21
 

@@ -257,7 +257,7 @@
           ]
         },
         "sandbox": {
-          "description": "Restricts the task's commands, and the tasks they call, to its sources inside the root directory: reading any other file there fails. Directories holding only readable files, the generates directories, the `.task` directory and `writes` stay writable; the root directory itself never is. Enforced with Landlock, or a slower seccomp supervisor; TASK_SANDBOX selects the mode (auto, landlock, seccomp, off). Linux only.",
+          "description": "Restricts the task's commands, and the tasks they call, to its sources inside the root directory: reading any other file there fails. Directories holding only readable files, the generates directories, the `.task` directory and `writes` stay writable; the root directory itself never is. Enforced with Landlock, or a slower seccomp supervisor; TASK_SANDBOX selects the mode (auto, landlock, seccomp, audit, off). Linux only.",
           "oneOf": [
             { "type": "boolean" },
             {
