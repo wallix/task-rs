@@ -910,3 +910,25 @@ fn check_without_update_is_rejected() {
         out.combined()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Taskfile parse errors
+// ---------------------------------------------------------------------------
+
+/// A positioned YAML error shows the source lines with a caret at the error.
+#[test]
+fn syntax_error_shows_source_snippet() {
+    let dir = scratch("version: '3'\n\ntasks:\n  a: [1\n");
+    let out = run(&dir, &["a"]);
+    assert_eq!(out.code, 100, "{}", out.combined());
+    assert_eq!(out.stdout, "");
+    assert_eq!(
+        out.stderr,
+        "task: Failed to parse Taskfile.yml:\n\
+         task: Failed to decode Taskfile: unclosed bracket '[' at line 4 column 6\n  \
+         2 | \n  \
+         3 | tasks:\n\
+         > 4 |   a: [1\n    \
+         |      ^\n"
+    );
+}

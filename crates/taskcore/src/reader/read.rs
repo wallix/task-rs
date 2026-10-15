@@ -163,30 +163,28 @@ impl Reader {
         let b = node.read()?;
         let location = node.location().to_string();
 
-        let mut tf: ast::Taskfile = match crate::yaml::from_slice(&b) {
+        let mut tf = match decode(&b) {
             Ok(tf) => tf,
-            Err(e) => {
-                if let Some(loc) = e.location() {
-                    let snippet = Snippet::new(
-                        &b,
-                        SnippetOptions {
-                            line: loc.line(),
-                            column: loc.column(),
-                            padding: 2,
-                            no_indicators: false,
-                        },
-                    );
-                    return Err(ReaderError::Invalid {
-                        uri: location,
-                        err: format!("{e}\n{}", snippet.render()),
-                    });
-                }
-                return Err(ReaderError::Invalid {
-                    uri: filepathext::try_abs_to_rel(&location)
-                        .to_string_lossy()
-                        .into_owned(),
-                    err: e.to_string(),
-                });
+            Err((err, loc)) => {
+                let uri = filepathext::try_abs_to_rel(&location)
+                    .to_string_lossy()
+                    .into_owned();
+                let err = match loc {
+                    Some(loc) => {
+                        let snippet = Snippet::new(
+                            &b,
+                            SnippetOptions {
+                                line: loc.line(),
+                                column: loc.column(),
+                                padding: 2,
+                                no_indicators: false,
+                            },
+                        );
+                        format!("{err}\n{}", snippet.render())
+                    }
+                    None => err,
+                };
+                return Err(ReaderError::Invalid { uri, err });
             }
         };
 
@@ -258,6 +256,19 @@ impl Reader {
     }
 }
 
+/// Decodes a Taskfile, returning error text and its source position when known.
+///
+/// Load the YAML into a [`crate::yaml::Value`] first: Taskfile's `Deserialize`
+/// impls rewrap errors through `serde::de::Error::custom`, losing the position.
+/// All positioned errors (syntax errors, rejected scalars, duplicate keys)
+/// arise while loading the `Value`. This preserves their positions and keeps
+/// the same error text as decoding the Taskfile in one step.
+fn decode(b: &[u8]) -> Result<ast::Taskfile, (String, Option<crate::yaml::Location>)> {
+    let value: crate::yaml::Value = crate::yaml::from_slice(b)
+        .map_err(|e| (ast::TaskfileDecodeError::wrap(&e).to_string(), e.location()))?;
+    crate::yaml::from_value(value).map_err(|e| (e.to_string(), None))
+}
+
 /// Scans the raw Taskfile source for each task key's 1-based line and column.
 ///
 /// Only lines inside the top-level `tasks:` block are considered, and a key is
@@ -323,7 +334,23 @@ fn scan_task_positions(
 
 #[cfg(test)]
 mod tests {
-    use super::scan_task_positions;
+    use super::{decode, scan_task_positions};
+
+    #[test]
+    fn decode_keeps_the_position_of_load_errors() {
+        let cases = [
+            ("version: '3'\ntasks:\n  a: [1\n", Some((3, 6))),
+            ("version: '3'\nvars:\n  V: 1\n  V: 2\n", Some((3, 3))),
+            ("version: '3'\ntasks: [a]\n", None),
+            ("- a\n", None),
+        ];
+        for (src, want) in cases {
+            let (err, loc) = decode(src.as_bytes()).unwrap_err();
+            assert_eq!(loc.map(|l| (l.line(), l.column())), want, "{src:?}");
+            let one_step = crate::yaml::from_str::<crate::ast::Taskfile>(src).unwrap_err();
+            assert_eq!(err, one_step.to_string(), "{src:?}");
+        }
+    }
 
     #[test]
     fn scans_task_line_and_column() {

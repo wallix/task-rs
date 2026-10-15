@@ -495,9 +495,7 @@ fn read_error(src: &'static str) -> String {
 
 const SYNTAX_ERROR: &str = "version: '3'\ntasks:\n  a: [1\n";
 
-// Every Taskfile decode error reaches the reader wrapped by the Taskfile's
-// Deserialize impl, which drops its location: the snippet branch in
-// `Reader::read_node` never runs, and the position shows only in the text.
+// Positioned errors are followed by a source snippet with a caret at the error.
 #[test]
 fn syntax_error_position_is_pinned() {
     let cases = [
@@ -532,7 +530,12 @@ fn syntax_error_position_is_pinned() {
             msg.contains(&format!(" at line {line} column {column}")),
             "{msg}"
         );
-        assert_eq!(msg.lines().count(), 2, "unexpected snippet: {msg}");
+        let caret = format!("\n{}|{}^", " ".repeat(4), " ".repeat(column));
+        assert!(msg.contains(&format!("\n> {line} | ")), "{msg}");
+        assert!(
+            msg.ends_with(&caret) || msg.contains(&format!("{caret}\n")),
+            "{msg}"
+        );
     }
 }
 
@@ -541,11 +544,11 @@ fn syntax_error_position_is_pinned() {
 fn syntax_error_wording_is_granits() {
     assert_eq!(
         read_error(SYNTAX_ERROR),
-        "task: Failed to parse Taskfile.yml:\ntask: Failed to decode Taskfile: unclosed bracket '[' at line 3 column 6"
+        "task: Failed to parse Taskfile.yml:\ntask: Failed to decode Taskfile: unclosed bracket '[' at line 3 column 6\n  1 | version: '3'\n  2 | tasks:\n> 3 |   a: [1\n    |      ^"
     );
     assert_eq!(
         read_error("version: '3\ntasks: {}\n"),
-        "task: Failed to parse Taskfile.yml:\ntask: Failed to decode Taskfile: unclosed quote at line 1 column 10"
+        "task: Failed to parse Taskfile.yml:\ntask: Failed to decode Taskfile: unclosed quote at line 1 column 10\n> 1 | version: '3\n    |          ^\n  2 | tasks: {}"
     );
 }
 
@@ -554,7 +557,7 @@ fn decode_errors_are_pinned() {
     // Decoded straight from the document: path and position included.
     assert_eq!(
         read_error("version: '3'\nvars:\n  V: 18446744073709551616\n"),
-        "task: Failed to parse Taskfile.yml:\ntask: Failed to decode Taskfile: vars.V: invalid type: integer `18446744073709551616` as u128, expected any YAML value at line 3 column 6"
+        "task: Failed to parse Taskfile.yml:\ntask: Failed to decode Taskfile: vars.V: invalid type: integer `18446744073709551616` as u128, expected any YAML value at line 3 column 6\n  1 | version: '3'\n  2 | vars:\n> 3 |   V: 18446744073709551616\n    |      ^"
     );
     // Decoded after a `from_value` hop: path and position are lost.
     assert_eq!(

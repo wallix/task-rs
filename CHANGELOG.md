@@ -21,6 +21,10 @@
   under `sandbox`. An unknown task name in a `task:` or `from:` entry now fails
   the run or `--status` with exit code 200, naming the referring task and
   field.
+- **A Taskfile error with a position now shows the offending lines,** with a
+  caret under the error, after the message. Unlike Go Task, YAML syntax errors
+  get one too; a type mismatch found while decoding still has no position, so
+  no snippet.
 - **Taskfiles are parsed with a memory-safe YAML parser.** Checksums and the
   positions of decode errors are unchanged; YAML syntax errors are worded and
   sometimes positioned differently (an unclosed `[`, `{` or quote is reported

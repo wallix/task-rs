@@ -325,6 +325,8 @@ v3 are intentional.
 - Dependency cycles fail with the cycle path instead of recursing until the
   process exhausts its stack. Self-calls with a different compiled body remain
   valid; recursion driven only by external state is rejected.
+- YAML syntax errors show the offending lines with a caret, as decode errors
+  do.
 - Ctrl-C is escalated through running commands. `SIGTERM` stops the run
   immediately and exits with status `1`.
 - Fingerprints include commands and variables as well as file contents, and
