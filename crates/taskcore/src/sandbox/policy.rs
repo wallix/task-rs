@@ -1,9 +1,9 @@
 //! The access rules a sandboxed task's commands run under.
 //!
-//! Rules follow Landlock's model, which enforces them: each rule grants a set
-//! of access rights to a path and everything beneath it, rights add up along a
-//! path, and anything without a rule is denied. A rule on a file grants only
-//! the rights that apply to files.
+//! Rules follow Landlock's model, so that both backends enforce the same thing:
+//! each rule grants a set of access rights to a path and everything beneath it,
+//! rights add up along a path, and anything without a rule is denied. A rule on
+//! a file grants only the rights that apply to files.
 //!
 //! Inside the root directory the rules are derived from the files the task may
 //! read (its sources, `sandbox.reads`, the Taskfiles):
@@ -25,6 +25,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// Landlock filesystem access rights (`include/uapi/linux/landlock.h`).
+/// Elsewhere only the policy is built, never enforced.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) mod access {
     pub(crate) const EXECUTE: u64 = 1 << 0;
@@ -81,8 +82,15 @@ pub struct Policy {
     pub warnings: Vec<String>,
     /// Every rule, root ones and outside ones alike, in the order built.
     pub(crate) rules: Vec<(PathBuf, u64)>,
-    /// The rules, by path, for checking an access in tests.
-    #[cfg(test)]
+    /// The rules, by path, for checking an access.
+    // Only the seccomp supervisor checks accesses itself.
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
     by_path: HashMap<PathBuf, u64>,
     /// The lock held on `tmpdir` while the policy lives, which keeps
     /// [`remove_stale_tmp`] off it.
@@ -228,14 +236,14 @@ impl Policy {
         let (Walk::Free(inside) | Walk::Restricted(inside)) = walker.walk(&root);
         rules.extend(inside);
         rules.push((root.clone(), access::READ_DIR));
+        let by_path = rules.iter().cloned().collect();
         Ok(Self {
-            #[cfg(test)]
-            by_path: rules.iter().cloned().collect(),
             task: input.task.to_string(),
             root,
             tmpdir,
             warnings,
             rules,
+            by_path,
             _tmp_lock: tmp_lock,
             #[cfg(target_os = "linux")]
             ruleset: std::sync::OnceLock::new(),
@@ -266,7 +274,14 @@ impl Policy {
     /// as Landlock has it: those of the rules on it and on its ancestors. So
     /// outside the root, an entry made in an ancestor of the root since the
     /// rules were built may only be listed, as the ancestor itself.
-    #[cfg(test)]
+    // Only the seccomp supervisor checks accesses itself.
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn granted(&self, path: &Path) -> u64 {
         path.ancestors()
             .filter_map(|dir| self.by_path.get(dir))
@@ -274,7 +289,14 @@ impl Policy {
     }
 
     /// Reports whether `path` is granted every right in `need`.
-    #[cfg(test)]
+    // Only the seccomp supervisor checks accesses itself.
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn allows(&self, path: &Path, need: u64) -> bool {
         self.granted(path) & need == need
     }
@@ -283,7 +305,14 @@ impl Policy {
     /// into directory `to`, as Landlock's `REFER` rule has it: across
     /// directories, both must grant `REFER` and the entry must gain no right
     /// it lacked — a file only its file rights, a directory every right.
-    #[cfg(test)]
+    // Only the seccomp supervisor checks accesses itself.
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn refers(&self, from: &Path, to: &Path, dir: bool) -> bool {
         if from == to {
             return true;
@@ -390,7 +419,7 @@ impl Drop for TmpLock {
 
 /// Removes the run's temporary directory `dir` and its lock file, once its
 /// commands are done; the lock itself stays held until the policy is dropped,
-/// which may outlive the run.
+/// which a supervisor thread may delay to the end of the process.
 pub fn remove_tmp(dir: &Path) {
     // The directory first: one is never left without its lock file but by a
     // crash, and `remove_stale_tmp` handles that. Best effort: what is left

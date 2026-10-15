@@ -69,6 +69,18 @@ tasks:
     cmds:
       - cat secret/key
 
+  outer-process:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - '"{{.TASK_EXE}}" inner-sandboxed'
+
+  inner-sandboxed:
+    sources: [src/a.txt]
+    sandbox: true
+    cmds:
+      - cat src/a.txt
+
   with-unsandboxed-dep:
     sources: [src/**]
     sandbox: true
@@ -125,6 +137,21 @@ tasks:
       - cmd: echo ran
         if: test -f src/missing
 
+  swallowed-denial:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - cat secret/key || true
+
+  # The deferred command runs after the first one failed on its denial, and
+  # is denied the same read again.
+  repeated-denial:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - defer: cat secret/key || true
+      - cat secret/key || true
+
   nofollow:
     sources: [src/**]
     sandbox:
@@ -143,6 +170,7 @@ tasks:
     cmds:
       - cmd: cat secret/key
         ignore_error: true
+      - echo second
 
   # A nested task process, sandboxed in turn: out/ exists, from the outer
   # task's generates, so the inner one needs to create nothing.

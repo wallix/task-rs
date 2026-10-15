@@ -99,6 +99,7 @@ bytes = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 tokio = { version = "1" }
-# Raw Linux syscalls the sandbox needs (Landlock, prctl) and their structs;
-# std has none of them. Already in the tree through brush-core and getrandom.
+# Raw Linux syscalls the sandbox needs (Landlock, seccomp user notification,
+# process_vm_readv) and their structs; std has none of them. Already in the
+# tree through brush-core and getrandom.
 libc = "0.2"

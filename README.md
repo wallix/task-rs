@@ -308,8 +308,8 @@ v3 are intentional.
 - Native Jinja templating and an automated migration path from Go templates.
 - Duplicate YAML task keys are errors instead of last-definition-wins.
 - `sandbox:` restricts a task's commands to its declared sources inside the
-  root directory (Linux only, with Landlock), to catch inputs missing from
-  `sources`.
+  root directory (Linux only: Landlock, or a seccomp fallback), to catch
+  inputs missing from `sources`.
 
 ### Changed
 

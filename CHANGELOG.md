@@ -7,9 +7,11 @@
   task's sources inside the root directory (the Taskfile's). A file missing
   from `sources` then fails the build instead of leaving a stale up-to-date
   result or cache entry. `sandbox.reads` and `sandbox.writes` widen it. The
-  restriction uses Landlock; without it, the default `TASK_SANDBOX=auto` runs
-  commands unrestricted with a warning (`TASK_SANDBOX=landlock` makes it an
-  error).
+  restriction uses Landlock, or a slower seccomp supervisor on kernels without
+  it; with neither available, the default `TASK_SANDBOX=auto` runs commands
+  unrestricted with a warning (`TASK_SANDBOX=landlock` or `seccomp` makes it an
+  error). Any denial the supervisor sees fails the task, even one the command
+  recovered from or ignored.
 
 ## v4.7.1 - 2026-09-21
 

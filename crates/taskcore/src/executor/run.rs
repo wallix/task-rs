@@ -19,13 +19,14 @@ use crate::logger::Color;
 use crate::output::{Output, SharedWriter};
 use crate::precondition;
 use crate::requires;
-use crate::sandbox::{Backend, Layers, Policy, PolicyInput, Sandbox, remove_stale_tmp};
+use crate::sandbox::{Backend, Denial, Layers, Policy, PolicyInput, Sandbox, remove_stale_tmp};
 use crate::slicesext;
 use crate::templater::Cache as TemplaterCache;
 use crate::variables::{self, CompileContext};
 
 use super::{
-    Executor, ExecutorError, MAXIMUM_TASK_CALL, RunOnceResult, should_run_on_current_platform,
+    Denied, Executor, ExecutorError, MAXIMUM_TASK_CALL, RunOnceResult,
+    should_run_on_current_platform,
 };
 
 /// A task matched by a call, with any wildcard captures.
@@ -1002,8 +1003,17 @@ impl Executor {
         }
 
         for &i in deferred.iter().rev() {
-            self.run_deferred(t, call, i, deferred_exit_code, &ancestors)
+            let denied = self
+                .run_deferred(t, call, i, deferred_exit_code, &ancestors)
                 .await;
+            if let Some(e) = denied
+                && run_err.is_none()
+            {
+                // As for a failed command: the error being reported matters
+                // more than a failure to mark the task out of date.
+                let _ = checker.on_error();
+                run_err = Some(e);
+            }
         }
         drop(sandbox_tmp);
 
@@ -1135,7 +1145,8 @@ impl Executor {
     /// Runs a single deferred command. Deferred commands are left un-templated
     /// during compilation so they can be rendered here against the task's
     /// variables plus `EXIT_CODE` (the failing command's exit status). Errors are
-    /// ignored. Ports Go `runDeferred`.
+    /// ignored, except a sandbox denial, returned to fail the task. Ports Go
+    /// `runDeferred`.
     async fn run_deferred(
         self: &Rc<Self>,
         t: &Task,
@@ -1143,10 +1154,8 @@ impl Executor {
         i: usize,
         exit_code: u8,
         ancestors: &Ancestors,
-    ) {
-        let Some(cmd) = t.cmds.get(i) else {
-            return;
-        };
+    ) -> Option<ExecutorError> {
+        let cmd = t.cmds.get(i)?;
         let mut cache = TemplaterCache::new(t.vars.clone().unwrap_or_default());
         cache.set_dialect(t.dialect);
         let mut extra: indexmap::IndexMap<String, serde_yaml_ng::Value> = indexmap::IndexMap::new();
@@ -1169,11 +1178,17 @@ impl Executor {
         if let Some(slot) = task.cmds.get_mut(i) {
             *slot = rendered;
         }
-        if let Err(e) = self.run_command(&task, call, i, ancestors).await {
-            self.logger().borrow_mut().verbose_errf(
-                Color::Yellow,
-                &format!("task: ignored error in deferred cmd: {e}\n"),
-            );
+        match self.run_command(&task, call, i, ancestors).await {
+            // Not ignored: the task's outputs may depend on an undeclared input.
+            Err(e) if e.is_sandbox_failure() => Some(e),
+            Err(e) => {
+                self.logger().borrow_mut().verbose_errf(
+                    Color::Yellow,
+                    &format!("task: ignored error in deferred cmd: {e}\n"),
+                );
+                None
+            }
+            Ok(()) => None,
         }
     }
 
@@ -1353,10 +1368,12 @@ impl Executor {
                 sandbox: sandbox.clone(),
             };
             let _permit = self.limiter.acquire().await;
+            let before = sandbox.as_ref().map_or(0, Sandbox::denial_count);
             let run_result = execext::run_command(opts).await;
             drop(_permit);
             let failed = !ignore_error && exited_nonzero(&run_result);
-            self.report_sandbox(t, sandbox.as_ref(), failed);
+            let denied = self.report_sandbox(t, sandbox.as_ref(), failed, before);
+            sandbox_verdict(t, denied)?;
             return run_result.map_err(ExecutorError::Exec);
         }
 
@@ -1385,6 +1402,7 @@ impl Executor {
 
         // Bound concurrent command execution by the configured limit.
         let _permit = self.limiter.acquire().await;
+        let before = sandbox.as_ref().map_or(0, Sandbox::denial_count);
         let run_result = execext::run_command(opts).await;
         drop(_permit);
 
@@ -1411,7 +1429,8 @@ impl Executor {
         }
         // After the command's own output, which `group` only now flushed.
         let failed = !ignore_error && exited_nonzero(&run_result);
-        self.report_sandbox(t, sandbox.as_ref(), failed);
+        let denied = self.report_sandbox(t, sandbox.as_ref(), failed, before);
+        sandbox_verdict(t, denied)?;
         run_result.map_err(ExecutorError::Exec)
     }
 
@@ -1421,7 +1440,11 @@ impl Executor {
         let resolved = self
             .sandbox_backend
             .get_or_init(|| async {
-                let resolved = Backend::resolve(self.sandbox_mode);
+                // Probing the seccomp supervisor blocks for a while.
+                let mode = self.sandbox_mode;
+                let resolved = tokio::task::spawn_blocking(move || Backend::resolve(mode))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("resolving TASK_SANDBOX: {e}")));
                 if let Ok((_, Some(warning))) = &resolved {
                     self.logger()
                         .borrow_mut()
@@ -1579,11 +1602,73 @@ impl Executor {
         (env, sandbox)
     }
 
-    /// Points a sandboxed command's failure at the sandbox: Landlock reports
-    /// a denial only as the command's own "Permission denied".
-    fn report_sandbox(&self, t: &Task, sandbox: Option<&Sandbox>, failed: bool) {
-        if failed && sandbox.is_some_and(|s| matches!(s.backend, Backend::Landlock(_))) {
-            self.logger().borrow_mut().errf(
+    /// Reports what a sandboxed command was denied; returns whether anything
+    /// was denied.
+    ///
+    /// `before` is [`Sandbox::denial_count`] from before the command ran: any
+    /// denial since counts against it. A command running concurrently under
+    /// the same layers (the parallel `deps` of a called task) may have made
+    /// it, and may be the one to print it: both fail, whichever made it, as
+    /// the supervisor cannot tell commands sharing its filter apart.
+    fn report_sandbox(
+        &self,
+        t: &Task,
+        sandbox: Option<&Sandbox>,
+        failed: bool,
+        before: u64,
+    ) -> bool {
+        let Some(sandbox) = sandbox else {
+            return false;
+        };
+        let logger = self.logger();
+        let mut logger = logger.borrow_mut();
+        let color = Color::Red;
+        if sandbox.unenforced() && !self.sandbox_unenforced_warned.replace(true) {
+            let what = "this run's sandboxes are not enforced";
+            logger.warnf(&format!(
+                "task: [{}] sandbox: this task runs under the seccomp supervisor of an enclosing \
+                 sandboxed command, which checks only the enclosing tasks' rules: {what}\n",
+                t.name()
+            ));
+        }
+        let denied = sandbox.denial_count() > before;
+        let taken = sandbox.take_denials();
+        // Each distinct denial is shown once per supervisor: a repeat only
+        // counts.
+        let new_denial = taken.iter().any(|d| !matches!(d, Denial::Foreign { .. }));
+        if denied && !new_denial {
+            logger.errf(
+                color,
+                &format!(
+                    "task: [{}] sandbox: denied again an access already reported above\n",
+                    t.name()
+                ),
+            );
+        }
+        for d in taken {
+            let what = match d {
+                Denial::Refused { task, access, path } => {
+                    let place = match access {
+                        "create" | "remove" | "rename" => "in",
+                        _ => "of",
+                    };
+                    format!(
+                        "denied {access} {place} {} (not allowed by {task:?})",
+                        path.display()
+                    )
+                }
+                Denial::Unchecked { syscall, why } => {
+                    format!("denied {syscall}: its paths cannot be checked ({why})")
+                }
+                Denial::Foreign { syscalls } => format!(
+                    "failed {syscalls} with \"Permission denied\": their paths cannot be \
+                     checked (shown once)"
+                ),
+            };
+            logger.errf(color, &format!("task: [{}] sandbox: {what}\n", t.name()));
+        }
+        if failed && matches!(sandbox.backend, Backend::Landlock(_)) {
+            logger.errf(
                 Color::Yellow,
                 &format!(
                     "task: [{}] ran sandboxed: a \"Permission denied\" above may be a file \
@@ -1592,6 +1677,7 @@ impl Executor {
                 ),
             );
         }
+        denied
     }
 
     /// Creates the task's working directory if it does not exist, serialized per
@@ -1874,6 +1960,20 @@ fn cache_enabled(t: &Task) -> bool {
         return !v.is_empty() && v != "false" && v != "0";
     }
     true
+}
+
+/// Fails a command the sandbox denied something, whatever its exit status:
+/// it may have worked around the denial (`cat secret || true`), and a failure
+/// must not be ignored (`ignore_error`), as its outputs cannot be trusted to
+/// depend only on the declared sources.
+fn sandbox_verdict(t: &Task, denied: bool) -> Result<(), ExecutorError> {
+    if denied {
+        return Err(ExecutorError::SandboxDenied {
+            task_name: t.name().to_string(),
+            denied: Denied::Command,
+        });
+    }
+    Ok(())
 }
 
 /// Whether a command ran and failed, the only failure a sandbox denial can

@@ -905,10 +905,12 @@ task build --force-all
 ```
 
 Only commands are checked: dynamic variables (`sh:`), `if` conditions (of the
-task or of a command) and `preconditions` run outside the sandbox. A denial is
-only the command's own "Permission denied": a command that recovers from it
-(`cat secret || true`), or whose errors are ignored (`ignore_error`, `defer`),
-passes unnoticed.
+task or of a command) and `preconditions` run outside the sandbox.
+
+Under the seccomp supervisor, any denial fails the task, even when the command
+went on to succeed (`cat secret || true`) or its errors are ignored
+(`ignore_error`, `defer`). Landlock cannot detect such a command: only a
+denial that makes the command fail shows.
 
 ### Using programmatic checks to indicate a task is up to date
 

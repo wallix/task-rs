@@ -895,14 +895,17 @@ the sandbox of whichever caller starts it first. `TASK_SANDBOX` selects how the
 sandbox is enforced; see the
 [environment reference](environment.md#task_sandbox).
 
-A denial is only the command's own "Permission denied": a command that fails
-on it fails the task as usual, but one that recovers from it
-(`cat secret || true`), or whose errors are ignored (`ignore_error`, `defer`),
-passes unnoticed. A command's `if`, like a task-level `if` and
-`preconditions`, runs outside the sandbox and is not checked.
+Under the seccomp supervisor, any access it denies fails the task and records
+no fingerprint or cache entry, even when the command recovered from it
+(`cat secret || true`) or ignores its errors (`ignore_error`, `defer`). Under
+Landlock, a denial is only the command's own "Permission denied": a command
+that fails on it fails the task as usual, but one that recovers from it, or
+whose errors are ignored, passes unnoticed. A command's `if`, like a
+task-level `if` and `preconditions`, runs outside the sandbox and is not
+checked.
 
 The sandbox checks a build's declared inputs; it is not a security boundary.
-Landlock sets `PR_SET_NO_NEW_PRIVS` on the commands, so setuid and
+Both mechanisms set `PR_SET_NO_NEW_PRIVS` on the commands, so setuid and
 file-capability programs (`sudo`, `ping` on some systems) do not gain their
 privileges and typically fail.
 

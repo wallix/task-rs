@@ -81,6 +81,15 @@ pub enum ExecutorError {
     },
     /// `TASK_SANDBOX` holds a value it does not know.
     SandboxMode(crate::sandbox::UnknownMode),
+    /// The sandbox denied a command an access. Unlike a failed
+    /// command, `ignore_error` and deferred commands never ignore it: what ran
+    /// may have depended on an undeclared input.
+    SandboxDenied {
+        /// The task whose command it was.
+        task_name: String,
+        /// What was denied.
+        denied: Denied,
+    },
     /// The run was cancelled by a signal.
     Cancelled,
     /// An I/O error occurred.
@@ -140,6 +149,14 @@ impl std::fmt::Display for ExecutorError {
                 write!(f, "task: Failed to run task {task_name:?}: {source}")
             }
             Self::SandboxMode(e) => write!(f, "task: {e}"),
+            Self::SandboxDenied {
+                task_name,
+                denied: Denied::Command,
+            } => write!(
+                f,
+                "task: a command of {task_name:?} was denied by the sandbox (or ran alongside one \
+                 that was, under the same sandbox): what it did may depend on an undeclared input"
+            ),
             Self::Cancelled => write!(f, "task: run cancelled"),
             Self::Io(e) => write!(f, "task: {e}"),
         }
@@ -147,6 +164,13 @@ impl std::fmt::Display for ExecutorError {
 }
 
 impl std::error::Error for ExecutorError {}
+
+/// What the sandbox denied an access, in [`ExecutorError::SandboxDenied`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Denied {
+    /// A command, or one running alongside it under the same sandbox.
+    Command,
+}
 
 impl ExecutorError {
     /// The process exit code for this error, mirroring the Go `errors` package
@@ -157,7 +181,7 @@ impl ExecutorError {
             Self::Merge(_) => 107,
             Self::VersionCheck { .. } => 105,
             Self::TaskNotFound { .. } => 200,
-            Self::TaskRun { .. } | Self::Exec(_) => 201,
+            Self::TaskRun { .. } | Self::Exec(_) | Self::SandboxDenied { .. } => 201,
             Self::TaskInternal { .. } => 202,
             Self::TaskNameConflict { .. } => 203,
             // Same class as the call counter it pre-empts, so Go's code for
@@ -181,6 +205,17 @@ impl ExecutorError {
             Self::Exec(crate::execext::Error::NonZeroExit(code)) => i32::from(*code),
             Self::TaskRun { source, .. } => source.task_exit_code(),
             _ => self.code(),
+        }
+    }
+
+    /// Reports whether this error is a sandbox denial, unwrapping a
+    /// [`ExecutorError::TaskRun`] wrapper: failures `ignore_error` and `defer`
+    /// do not ignore.
+    pub fn is_sandbox_failure(&self) -> bool {
+        match self {
+            Self::SandboxDenied { .. } => true,
+            Self::TaskRun { source, .. } => source.is_sandbox_failure(),
+            _ => false,
         }
     }
 

@@ -1,8 +1,8 @@
 //! `sandbox:` restricts a task's commands to its sources (fork addition, no Go
-//! counterpart). Landlock is exercised only where the host offers it: a kernel
-//! without it skips these tests rather than failing them. Any other probe
-//! failure fails, as does an unavailable Landlock with
-//! `TASK_TEST_SANDBOX_REQUIRED` set.
+//! counterpart). Each backend is exercised only where the host offers it: a
+//! kernel without Landlock, or a container that filters `seccomp`, skips that
+//! backend's tests rather than failing them. Any other probe failure fails, as
+//! does an unavailable backend with `TASK_TEST_SANDBOX_REQUIRED` set.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -24,9 +24,13 @@ fn available(mode: &str) -> bool {
         return true;
     }
     let out = probe.combined();
-    let unavailable = ["Landlock is unavailable", "is below"]
-        .iter()
-        .any(|m| out.contains(m));
+    let unavailable = [
+        "Landlock is unavailable",
+        "is below",
+        "seccomp is unavailable",
+    ]
+    .iter()
+    .any(|m| out.contains(m));
     assert!(
         unavailable && std::env::var_os("TASK_TEST_SANDBOX_REQUIRED").is_none(),
         "TASK_SANDBOX={mode} failed its probe: {out}"
@@ -35,7 +39,7 @@ fn available(mode: &str) -> bool {
     false
 }
 
-const ENFORCING: [&str; 1] = ["landlock"];
+const ENFORCING: [&str; 2] = ["landlock", "seccomp"];
 
 #[test]
 fn sources_and_outputs_are_allowed() {
@@ -78,7 +82,17 @@ fn reading_outside_sources_fails() {
             "{mode}: {}",
             r.combined()
         );
-        assert!(r.combined().contains(HINT), "{mode}: {}", r.combined());
+        if mode == "landlock" {
+            assert!(r.combined().contains(HINT), "{mode}: {}", r.combined());
+        }
+        if mode == "seccomp" {
+            assert!(
+                r.combined().contains("sandbox: denied read of ")
+                    && r.combined().contains("secret/key"),
+                "{}",
+                r.combined()
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -89,7 +103,9 @@ const HINT: &str = "task: [read-outside-sources] ran sandboxed: a \"Permission d
 
 #[test]
 fn an_ignored_denial_is_not_pointed_at_the_sandbox() {
-    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+    // Under seccomp a denial fails the task even when ignored: see
+    // `a_denial_never_passes_as_an_ignored_error_under_seccomp`.
+    for mode in ["landlock"].into_iter().filter(|m| available(m)) {
         // A command's and a task's `ignore_error`, a deferred command, and
         // the same for a `task:` call.
         for task in [
@@ -105,6 +121,9 @@ fn an_ignored_denial_is_not_pointed_at_the_sandbox() {
             assert!(r.ok(), "{mode} {task}: {out}");
             assert!(out.contains("Permission denied"), "{mode} {task}: {out}");
             assert!(!out.contains("ran sandboxed"), "{mode} {task}: {out}");
+            if task == "ignored-denial" {
+                assert!(r.stdout.contains("second\n"), "{mode}: {out}");
+            }
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -207,6 +226,14 @@ fn hard_linking_a_file_out_of_sources_fails() {
         let r = run_with_env(&dir, &["link-out-of-sources"], &[("TASK_SANDBOX", mode)]);
         assert!(!r.ok(), "{mode}: expected a failure: {}", r.combined());
         assert!(!dir.join("out/key").exists(), "{mode}");
+        if mode == "seccomp" {
+            assert!(
+                r.combined().contains("sandbox: denied link of ")
+                    && r.combined().contains("secret/key"),
+                "{}",
+                r.combined()
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -254,6 +281,23 @@ fn called_tasks_run_in_the_callers_sandbox_but_deps_do_not() {
 }
 
 #[test]
+fn a_nested_task_process_under_seccomp_warns_its_sandbox_is_not_enforced() {
+    if !available("seccomp") {
+        return;
+    }
+    let dir = stage("sandbox");
+    let r = run_with_env(&dir, &["outer-process"], &[("TASK_SANDBOX", "seccomp")]);
+    assert!(r.ok(), "{}", r.combined());
+    assert_eq!(
+        r.combined().matches("sandboxes are not enforced").count(),
+        1,
+        "{}",
+        r.combined()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn off_ignores_the_sandbox() {
     let dir = stage("sandbox");
     let r = run_with_env(&dir, &["read-outside-sources"], &[("TASK_SANDBOX", "off")]);
@@ -288,6 +332,13 @@ fn ancestors_of_the_root_can_be_listed_but_not_changed() {
         let leaked = escaped.exists();
         let _ = std::fs::remove_file(&escaped);
         assert!(!leaked, "{mode}: created {}", escaped.display());
+        if mode == "seccomp" {
+            assert!(
+                r.combined().contains("sandbox: denied create in "),
+                "{}",
+                r.combined()
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -390,6 +441,16 @@ fn a_declared_dotenv_file_is_readable() {
     }
 }
 
+/// Runs `task` again and checks the failed run left no up-to-date record.
+fn assert_not_recorded(dir: &std::path::Path, task: &str, mode: &str) {
+    let again = run_with_env(dir, &[task], &[("TASK_SANDBOX", mode)]);
+    assert!(
+        !again.combined().contains("up to date"),
+        "{mode}: {}",
+        again.combined()
+    );
+}
+
 #[test]
 fn a_false_condition_still_skips() {
     for mode in ENFORCING.into_iter().filter(|m| available(m)) {
@@ -402,6 +463,59 @@ fn a_false_condition_still_skips() {
             "{mode}: {}",
             r.combined()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn a_denial_the_command_swallowed_still_fails_under_seccomp() {
+    if !available("seccomp") {
+        return;
+    }
+    let dir = stage("sandbox");
+    let r = run_with_env(&dir, &["swallowed-denial"], &[("TASK_SANDBOX", "seccomp")]);
+    let out = r.combined();
+    assert!(!r.ok(), "{out}");
+    assert!(
+        out.contains("a command of \"swallowed-denial\" was denied by the sandbox"),
+        "{out}"
+    );
+    assert_not_recorded(&dir, "swallowed-denial", "seccomp");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_denial_never_passes_as_an_ignored_error_under_seccomp() {
+    if !available("seccomp") {
+        return;
+    }
+    for task in [
+        "ignored-denial",
+        "task-ignored-denial",
+        "call-ignored-denial",
+        "deferred-denial",
+        "deferred-call-denial",
+        // Denied twice: the repeat must count too.
+        "repeated-denial",
+    ] {
+        let dir = stage("sandbox");
+        let r = run_with_env(&dir, &[task], &[("TASK_SANDBOX", "seccomp")]);
+        let out = r.combined();
+        assert!(!r.ok(), "{task}: {out}");
+        assert!(out.contains("was denied by the sandbox"), "{task}: {out}");
+        // The denial stops the task like a failure that is not ignored.
+        if task == "ignored-denial" {
+            assert!(!r.stdout.contains("second"), "{out}");
+        }
+        // The deferred command's repeat is shown only as such.
+        if task == "repeated-denial" {
+            assert_eq!(out.matches("denied read of ").count(), 1, "{out}");
+            assert!(
+                out.contains("denied again an access already reported above"),
+                "{out}"
+            );
+        }
+        assert_not_recorded(&dir, task, "seccomp");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

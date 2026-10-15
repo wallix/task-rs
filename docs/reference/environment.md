@@ -103,21 +103,42 @@ directly.
 
 How tasks with [`sandbox:`](schema.md#sandbox) are restricted:
 
-| Value             | Effect                                                                            |
-| ----------------- | --------------------------------------------------------------------------------- |
-| `auto` (or unset) | Landlock when the kernel offers ABI 2 or later, else unrestricted, with a warning |
-| `landlock`        | Landlock, or an error when the kernel lacks it                                    |
-| `off` (or `0`)    | No restriction                                                                    |
+| Value             | Effect                                                                                                                                                |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auto` (or unset) | Landlock when the kernel offers ABI 2 or later, else `seccomp` when the supervisor works (Linux 5.5 or later), else unrestricted; warns on a fallback |
+| `landlock`        | Landlock, or an error when the kernel lacks it                                                                                                        |
+| `seccomp`         | A seccomp supervisor that checks each open, exec, truncate, and entry creation, removal, rename or link; slower; an error when unavailable            |
+| `off` (or `0`)    | No restriction                                                                                                                                        |
 
 Landlock reports a denial only as the command's own "Permission denied", so a
-command that recovers from one passes. It needs Linux. On other systems `auto`
+command that recovers from one passes. The seccomp supervisor names every
+denied path after the command, and fails the task on any of them. Both
+mechanisms need Linux. On other systems, or when neither is available, `auto`
 runs commands unrestricted, with a warning.
 
-A `task` started by a sandboxed command runs under the enclosing task's rules,
-with its own applied on top of them. Its sandbox is set up under the enclosing
-rules too: the `generates` and `writes` directories it would create when
-missing must already be writable there (for instance, in the enclosing task's
-`generates` or `writes`), or the inner task fails, naming the directory.
+The supervisor needs `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (Linux 5.5), and to
+read the memory of the commands' processes, which `kernel.yama.ptrace_scope`
+2 or more forbids. task checks both before using it: `auto` then falls back to
+no restriction with a warning, and `seccomp` fails with an error. It knows the
+syscalls of x86_64 and aarch64 only. Every syscall of another architecture (a
+32-bit binary on a 64-bit kernel) or of x32, whose paths it does not check,
+fails with "Permission denied", and is reported once per architecture without
+failing the task by itself.
+
+Reading a process's memory takes the same permission as tracing it, so the
+supervisor cannot check, and denies every checked syscall of, a process that
+is not dumpable (`PR_SET_DUMPABLE` 0, as `ssh-agent` sets it, or a
+program only executable, not readable), or, with `kernel.yama.ptrace_scope` 1,
+one no longer a descendant of task (a daemon that double-forked and was
+reparented). Its denials say so. Landlock has no such limit.
+
+A `task` started by a sandboxed command runs under the enclosing task's rules.
+Its sandbox is set up under them too: the `generates` and `writes` directories
+it would create when missing must already be writable there (for instance, in
+the enclosing task's `generates` or `writes`), or the inner task fails, naming
+the directory. Under Landlock its own rules apply on top of the enclosing ones.
+A process tree has one seccomp supervisor, though: under it, the inner task runs
+under the enclosing task's rules only, and warns that its own are not enforced.
 
 ### `TASK_CACHE_OCI_USER`, `TASK_CACHE_OCI_PASSWORD`
 

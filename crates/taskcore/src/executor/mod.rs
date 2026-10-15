@@ -46,7 +46,7 @@ mod signals;
 mod status;
 mod watch;
 
-pub use error::ExecutorError;
+pub use error::{Denied, ExecutorError};
 pub(crate) use prompter::asked_off_thread;
 pub use prompter::{PromptError, Prompter};
 pub use run::MatchingTask;
@@ -174,6 +174,9 @@ pub struct Executor {
     /// The sandbox backend, resolved on the first sandboxed task so that a run
     /// without one never probes the kernel or warns.
     pub(crate) sandbox_backend: tokio::sync::OnceCell<Result<crate::sandbox::Backend, String>>,
+    /// Whether the run already warned that an enclosing seccomp supervisor
+    /// leaves its sandboxes unenforced.
+    pub(crate) sandbox_unenforced_warned: std::cell::Cell<bool>,
     /// Every Taskfile read, which sandboxed commands may read (a nested `task`
     /// parses them).
     pub(crate) taskfile_paths: Vec<String>,
@@ -240,6 +243,7 @@ impl Default for Executor {
             env_precedence: false,
             sandbox_mode: crate::sandbox::Mode::default(),
             sandbox_backend: tokio::sync::OnceCell::new(),
+            sandbox_unenforced_warned: std::cell::Cell::new(false),
             taskfile_paths: Vec::new(),
             prompted_vars: RefCell::new(None),
             prompter: None,
