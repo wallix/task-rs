@@ -194,7 +194,7 @@ mod tests {
         let vars = Vars::from_elements([VarElement {
             key: "VAR1".to_string(),
             value: Var {
-                value: Some(serde_yaml_ng::Value::String("example-value".to_string())),
+                value: Some(crate::yaml::Value::String("example-value".to_string())),
                 ..Default::default()
             },
         }]);

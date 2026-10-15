@@ -70,9 +70,9 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 use minijinja::value::{Rest, Value as JinjaValue};
 use minijinja::{Environment, context, escape_formatter};
-use serde_yaml_ng::Value as YamlValue;
 
 use crate::ast::{Dialect, Glob, Var, Vars};
+use crate::yaml::Value as YamlValue;
 
 thread_local! {
     // The environments are immutable after construction and identical for every
@@ -467,7 +467,7 @@ impl Cache {
                     .collect(),
             ),
             YamlValue::Mapping(map) => {
-                let mut out = serde_yaml_ng::Mapping::new();
+                let mut out = crate::yaml::Mapping::new();
                 for (k, v) in map {
                     out.insert(k.clone(), self.replace_yaml_value(v, extra));
                 }
@@ -545,7 +545,7 @@ fn resolve(
     Ok(YamlValue::String(out))
 }
 
-/// Builds the minijinja context from the variable map. `serde_yaml_ng::Value`
+/// Builds the minijinja context from the variable map. `crate::yaml::Value`
 /// serializes into the shapes minijinja expects (maps, sequences, scalars).
 fn build_context(data: &IndexMap<String, YamlValue>) -> JinjaValue {
     let map: IndexMap<String, JinjaValue> = data
@@ -2169,7 +2169,7 @@ mod tests {
     #[test]
     fn nested_field_access() {
         let mut vars = Vars::new();
-        let mut inner = serde_yaml_ng::Mapping::new();
+        let mut inner = crate::yaml::Mapping::new();
         inner.insert(
             YamlValue::String("BAR".to_string()),
             YamlValue::String("deep".to_string()),
@@ -2801,7 +2801,7 @@ mod tests {
     // key `0`. Inserted back to front so insertion order cannot pass by luck.
     #[test]
     fn first_and_last_iterate_a_map() {
-        let mut m = serde_yaml_ng::Mapping::new();
+        let mut m = crate::yaml::Mapping::new();
         m.insert(YamlValue::String("B".into()), YamlValue::String("y".into()));
         m.insert(YamlValue::String("A".into()), YamlValue::String("x".into()));
         let mut vars = Vars::new();
@@ -3079,7 +3079,7 @@ mod tests {
     #[test]
     fn resolve_ref_preserves_map_type() {
         let mut vars = Vars::new();
-        let mut inner = serde_yaml_ng::Mapping::new();
+        let mut inner = crate::yaml::Mapping::new();
         inner.insert(
             YamlValue::String("K".to_string()),
             YamlValue::String("v".to_string()),

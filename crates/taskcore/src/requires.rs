@@ -8,9 +8,8 @@
 //! `input.Prompter`, so they are deferred to the executor port; only the pure
 //! validation is here.
 
-use serde_yaml_ng::Value;
-
 use crate::ast::{Task, VarsWithValidation};
+use crate::yaml::Value;
 
 /// A required variable that was not set, with its allowed values (if any).
 #[derive(Clone, Debug, PartialEq, Eq)]

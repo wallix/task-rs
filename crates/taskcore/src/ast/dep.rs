@@ -2,11 +2,11 @@
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::error::TaskfileDecodeError;
 use super::for_::For;
 use super::vars::Vars;
+use crate::yaml::Value;
 
 /// A dependency. Accepts a bare string (the task name) or a mapping with a
 /// task call and optional `for`, `vars`, `silent`, and `fingerprint`.
@@ -41,7 +41,7 @@ impl<'de> Deserialize<'de> for Dep {
                     #[serde(default)]
                     fingerprint: Option<bool>,
                 }
-                let raw: Raw = serde_yaml_ng::from_value(value)
+                let raw: Raw = crate::yaml::from_value(value)
                     .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                 Ok(Dep {
                     task: raw.task,
@@ -64,14 +64,14 @@ mod tests {
 
     #[test]
     fn scalar_task_name() {
-        let d: Dep = serde_yaml_ng::from_str("task-name").unwrap();
+        let d: Dep = crate::yaml::from_str("task-name").unwrap();
         assert_eq!(d.task, "task-name");
     }
 
     #[test]
     fn task_call_with_vars() {
         let input = "task: another-task\nvars:\n  PARAM1: VALUE1\n";
-        let d: Dep = serde_yaml_ng::from_str(input).unwrap();
+        let d: Dep = crate::yaml::from_str(input).unwrap();
         assert_eq!(d.task, "another-task");
         assert_eq!(d.vars.as_ref().unwrap().len(), 1);
     }

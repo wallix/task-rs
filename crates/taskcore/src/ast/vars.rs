@@ -3,12 +3,12 @@
 use indexmap::IndexMap;
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::dialect::Dialect;
 use super::error::TaskfileDecodeError;
 use super::include::Include;
 use super::var::Var;
+use crate::yaml::Value;
 
 /// An ordered map of variable names to values. Insertion order is preserved
 /// because Taskfiles rely on it for evaluation order.
@@ -152,7 +152,7 @@ impl<'de> Deserialize<'de> for Vars {
                     let key = k.as_str().map(str::to_string).ok_or_else(|| {
                         de::Error::custom(TaskfileDecodeError::type_message("vars"))
                     })?;
-                    let var: Var = serde_yaml_ng::from_value(v)
+                    let var: Var = crate::yaml::from_value(v)
                         .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                     vars.set(key, var);
                 }
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn preserves_insertion_order() {
         let input = "PARAM1: VALUE1\nPARAM2: VALUE2\n";
-        let vars: Vars = serde_yaml_ng::from_str(input).unwrap();
+        let vars: Vars = crate::yaml::from_str(input).unwrap();
         let keys: Vec<&String> = vars.keys().collect();
         assert_eq!(keys, vec!["PARAM1", "PARAM2"]);
         assert_eq!(
@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn to_cache_map_skips_dynamic() {
         let input = "A: 1\nB:\n  sh: echo hi\n";
-        let vars: Vars = serde_yaml_ng::from_str(input).unwrap();
+        let vars: Vars = crate::yaml::from_str(input).unwrap();
         let m = vars.to_cache_map();
         assert!(m.contains_key("A"));
         assert!(!m.contains_key("B"));

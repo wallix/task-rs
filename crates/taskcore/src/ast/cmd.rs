@@ -2,13 +2,13 @@
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::defer::Defer;
 use super::error::TaskfileDecodeError;
 use super::for_::For;
 use super::platforms::Platform;
 use super::vars::Vars;
+use crate::yaml::Value;
 
 /// A task command. It is polymorphic:
 ///
@@ -64,7 +64,7 @@ impl<'de> Deserialize<'de> for Cmd {
                     #[serde(default)]
                     platforms: Vec<Platform>,
                 }
-                let raw: Raw = serde_yaml_ng::from_value(value)
+                let raw: Raw = crate::yaml::from_value(value)
                     .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
 
                 let mut c = Cmd::default();

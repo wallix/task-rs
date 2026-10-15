@@ -2,10 +2,10 @@
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::error::TaskfileDecodeError;
 use super::glob::Glob;
+use crate::yaml::Value;
 
 /// The `sandbox:` block of a task.
 ///
@@ -40,7 +40,7 @@ impl Sandbox {
                     #[serde(default)]
                     writes: Vec<String>,
                 }
-                let raw: Raw = serde_yaml_ng::from_value(value)
+                let raw: Raw = crate::yaml::from_value(value)
                     .map_err(|e| E::custom(TaskfileDecodeError::wrap(e)))?;
                 // `from:` is resolved for sources and generates only: here it
                 // would silently grant nothing.
@@ -80,7 +80,7 @@ mod tests {
     }
 
     fn parse(yaml: &str) -> Option<Sandbox> {
-        serde_yaml_ng::from_str::<Holder>(yaml).unwrap().sandbox
+        crate::yaml::from_str::<Holder>(yaml).unwrap().sandbox
     }
 
     #[test]
@@ -104,10 +104,10 @@ mod tests {
 
     #[test]
     fn rejects_unknown_keys_and_scalars() {
-        assert!(serde_yaml_ng::from_str::<Holder>("sandbox:\n  write: [x]\n").is_err());
-        assert!(serde_yaml_ng::from_str::<Holder>("sandbox: yes-please\n").is_err());
-        assert!(serde_yaml_ng::from_str::<Holder>("sandbox: ~\n").is_err());
-        let from = serde_yaml_ng::from_str::<Holder>("sandbox:\n  reads: [{from: deps}]\n");
+        assert!(crate::yaml::from_str::<Holder>("sandbox:\n  write: [x]\n").is_err());
+        assert!(crate::yaml::from_str::<Holder>("sandbox: yes-please\n").is_err());
+        assert!(crate::yaml::from_str::<Holder>("sandbox: ~\n").is_err());
+        let from = crate::yaml::from_str::<Holder>("sandbox:\n  reads: [{from: deps}]\n");
         let err = from.err().unwrap().to_string();
         assert!(err.contains("does not support `from:`"), "{err}");
     }

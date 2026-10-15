@@ -3,9 +3,9 @@
 use indexmap::IndexMap;
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use crate::sort::Sorter;
+use crate::yaml::Value;
 
 use super::error::TaskfileDecodeError;
 use super::include::Include;
@@ -206,7 +206,7 @@ impl Tasks {
 
 impl<'de> Deserialize<'de> for Tasks {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // Deserializing through `serde_yaml_ng::Value` rejects duplicate mapping
+        // Deserializing through `crate::yaml::Value` rejects duplicate mapping
         // keys. This is a deliberate divergence from Go, whose decoder silently
         // lets a repeated task name overwrite the earlier one (last wins): a
         // duplicate task definition is almost always a copy-paste mistake, so it
@@ -220,11 +220,11 @@ impl<'de> Deserialize<'de> for Tasks {
                     let key = k.as_str().map(str::to_string).ok_or_else(|| {
                         de::Error::custom(TaskfileDecodeError::type_message("tasks"))
                     })?;
-                    let mut task: Task = serde_yaml_ng::from_value(v)
+                    let mut task: Task = crate::yaml::from_value(v)
                         .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                     task.task = key.clone();
                     // The YAML value nodes lose line/column information once
-                    // decoded through `serde_yaml_ng::Value`, so the location
+                    // decoded through `crate::yaml::Value`, so the location
                     // is recorded with only the taskfile carried later.
                     task.location = Some(Location::default());
                     tasks.set(key, task);
@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn preserves_insertion_order() {
         let input = "build:\n  cmds:\n    - echo build\ntest:\n  cmds:\n    - echo test\n";
-        let tasks: Tasks = serde_yaml_ng::from_str(input).unwrap();
+        let tasks: Tasks = crate::yaml::from_str(input).unwrap();
         assert_eq!(tasks.keys(Sorter::None), vec!["build", "test"]);
         assert_eq!(tasks.get("build").unwrap().task, "build");
     }
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn sorter_alpha_numeric() {
         let input = "z:\n  cmds: [echo z]\na:\n  cmds: [echo a]\n";
-        let tasks: Tasks = serde_yaml_ng::from_str(input).unwrap();
+        let tasks: Tasks = crate::yaml::from_str(input).unwrap();
         assert_eq!(tasks.keys(Sorter::AlphaNumeric), vec!["a", "z"]);
     }
 

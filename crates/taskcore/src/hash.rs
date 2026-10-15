@@ -413,7 +413,7 @@ fn encode_var(enc: &mut Encoder, var: &ast::Var) -> Result<(), HashError> {
 
 fn encode_opt_value(
     enc: &mut Encoder,
-    value: Option<&serde_yaml_ng::Value>,
+    value: Option<&crate::yaml::Value>,
 ) -> Result<(), HashError> {
     match value {
         None => enc.tag(0),
@@ -428,8 +428,8 @@ fn encode_opt_value(
 /// Encodes an arbitrary YAML value canonically. Mapping keys are visited in
 /// their existing order; a Taskfile preserves mapping order, so this remains
 /// stable for a given parsed value.
-fn encode_value(enc: &mut Encoder, value: &serde_yaml_ng::Value) -> Result<(), HashError> {
-    use serde_yaml_ng::Value;
+fn encode_value(enc: &mut Encoder, value: &crate::yaml::Value) -> Result<(), HashError> {
+    use crate::yaml::Value;
     match value {
         Value::Null => enc.tag(0),
         Value::Bool(b) => {
@@ -472,7 +472,7 @@ fn encode_value(enc: &mut Encoder, value: &serde_yaml_ng::Value) -> Result<(), H
 mod tests {
     use super::*;
     use crate::ast::{Cmd, Location, Task, Var, VarElement, Vars};
-    use serde_yaml_ng::Value;
+    use crate::yaml::Value;
 
     fn sample_task() -> Task {
         Task {
@@ -747,7 +747,7 @@ mod tests {
               - echo hi
 "#,
         );
-        let tf: crate::ast::Taskfile = serde_yaml_ng::from_str(&yaml).unwrap();
+        let tf: crate::ast::Taskfile = crate::yaml::from_str(&yaml).unwrap();
         let t = tf.tasks.get("build").unwrap();
         assert_eq!(cache_checksum(t, "abc").unwrap(), "abc-951c3ac90fa3d487");
         assert_eq!(fingerprint(t).unwrap(), "fc60ade48e794989");
@@ -843,7 +843,7 @@ mod tests {
               - echo hi
 "#,
         );
-        let tf: crate::ast::Taskfile = serde_yaml_ng::from_str(&yaml).unwrap();
+        let tf: crate::ast::Taskfile = crate::yaml::from_str(&yaml).unwrap();
         assert_eq!(tf.version.as_deref(), Some("3.1"));
         let t = tf.tasks.get("build").unwrap();
         assert_eq!(cache_checksum(t, "abc").unwrap(), "abc-14ea9dbc1e2459b7");

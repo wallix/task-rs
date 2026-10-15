@@ -5,7 +5,6 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use serde_yaml_ng::Value;
 use tokio::sync::OnceCell;
 
 use crate::ast::{Task, Var};
@@ -25,6 +24,7 @@ use crate::sandbox::{
 use crate::slicesext;
 use crate::templater::Cache as TemplaterCache;
 use crate::variables::{self, CompileContext};
+use crate::yaml::Value;
 
 use super::{
     Denied, Executor, ExecutorError, MAXIMUM_TASK_CALL, RunOnceResult,
@@ -1160,11 +1160,11 @@ impl Executor {
         let cmd = t.cmds.get(i)?;
         let mut cache = TemplaterCache::new(t.vars.clone().unwrap_or_default());
         cache.set_dialect(t.dialect);
-        let mut extra: indexmap::IndexMap<String, serde_yaml_ng::Value> = indexmap::IndexMap::new();
+        let mut extra: indexmap::IndexMap<String, crate::yaml::Value> = indexmap::IndexMap::new();
         if exit_code > 0 {
             extra.insert(
                 "EXIT_CODE".to_string(),
-                serde_yaml_ng::Value::String(exit_code.to_string()),
+                crate::yaml::Value::String(exit_code.to_string()),
             );
         }
         let mut rendered = cmd.clone();

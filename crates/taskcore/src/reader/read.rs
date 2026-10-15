@@ -163,7 +163,7 @@ impl Reader {
         let b = node.read()?;
         let location = node.location().to_string();
 
-        let mut tf: ast::Taskfile = match serde_yaml_ng::from_slice(&b) {
+        let mut tf: ast::Taskfile = match crate::yaml::from_slice(&b) {
             Ok(tf) => tf,
             Err(e) => {
                 if let Some(loc) = e.location() {
@@ -214,7 +214,7 @@ impl Reader {
         tf.caches.set_dialect(dialect);
         tf.includes.set_dialect(dialect);
         // Recover each task's line/column by scanning the source: decoding
-        // through `serde_yaml_ng::Value` loses YAML node positions, which editor
+        // through `crate::yaml::Value` loses YAML node positions, which editor
         // integrations need to jump to a task definition.
         let keys: Vec<String> = tf.tasks.iter().map(|(k, _)| k.clone()).collect();
         let positions = scan_task_positions(&b, &keys);

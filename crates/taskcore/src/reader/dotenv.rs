@@ -46,7 +46,7 @@ pub fn dotenv(vars: &ast::Vars, tf: &ast::Taskfile, dir: &str) -> Result<ast::Va
                 env.set(
                     key,
                     ast::Var {
-                        value: Some(serde_yaml_ng::Value::String(value)),
+                        value: Some(crate::yaml::Value::String(value)),
                         ..Default::default()
                     },
                 );

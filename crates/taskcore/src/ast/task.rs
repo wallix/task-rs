@@ -2,9 +2,9 @@
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use crate::filepathext;
+use crate::yaml::Value;
 
 use super::cache::Cache;
 use super::cmd::Cmd;
@@ -224,7 +224,7 @@ impl<'de> Deserialize<'de> for Task {
             Value::Null => Ok(Task::default()),
             // Shortcut for a simple task with a list of commands.
             Value::Sequence(_) => {
-                let cmds: Vec<Cmd> = serde_yaml_ng::from_value(node)
+                let cmds: Vec<Cmd> = crate::yaml::from_value(node)
                     .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                 Ok(Task {
                     cmds,
@@ -292,7 +292,7 @@ impl<'de> Deserialize<'de> for Task {
                     #[serde(default)]
                     failfast: bool,
                 }
-                let raw: Raw = serde_yaml_ng::from_value(node)
+                let raw: Raw = crate::yaml::from_value(node)
                     .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
 
                 let cmds = match (raw.cmd, raw.cmds) {
@@ -347,7 +347,7 @@ impl<'de> Deserialize<'de> for Task {
             }
             // Any scalar is the shortcut syntax for a single-command task.
             other => {
-                let cmd: Cmd = serde_yaml_ng::from_value(other)
+                let cmd: Cmd = crate::yaml::from_value(other)
                     .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                 Ok(Task {
                     cmds: vec![cmd],
@@ -365,34 +365,34 @@ mod tests {
     #[test]
     fn null_task_body_is_empty_noop() {
         // `taskname:` with no value is a valid no-op task (matches Go).
-        let t: Task = serde_yaml_ng::from_str("~").unwrap();
+        let t: Task = crate::yaml::from_str("~").unwrap();
         assert!(t.cmds.is_empty());
         assert!(t.deps.is_empty());
     }
 
     #[test]
     fn scalar_task_is_single_command() {
-        let t: Task = serde_yaml_ng::from_str("echo hi").unwrap();
+        let t: Task = crate::yaml::from_str("echo hi").unwrap();
         assert_eq!(t.cmds.len(), 1);
         assert_eq!(t.cmds[0].cmd, "echo hi");
     }
 
     #[test]
     fn sequence_task_is_command_list() {
-        let t: Task = serde_yaml_ng::from_str("- echo a\n- echo b\n").unwrap();
+        let t: Task = crate::yaml::from_str("- echo a\n- echo b\n").unwrap();
         assert_eq!(t.cmds.len(), 2);
     }
 
     #[test]
     fn both_cmd_and_cmds_errors() {
         let input = "cmd: echo a\ncmds:\n  - echo b\n";
-        let err = serde_yaml_ng::from_str::<Task>(input).unwrap_err();
+        let err = crate::yaml::from_str::<Task>(input).unwrap_err();
         assert!(err.to_string().contains("both cmd and cmds"));
     }
 
     #[test]
     fn dir_becomes_dirs_stack() {
-        let t: Task = serde_yaml_ng::from_str("dir: ./sub\ncmds:\n  - echo hi\n").unwrap();
+        let t: Task = crate::yaml::from_str("dir: ./sub\ncmds:\n  - echo hi\n").unwrap();
         assert_eq!(t.dirs, vec!["./sub".to_string()]);
     }
 
@@ -503,7 +503,7 @@ mod tests {
     #[test]
     fn generates_fingerprint() {
         let input = "\ncmds:\n  - yarn install --immutable\nsources:\n  - package.json\n  - yarn.lock\ngenerates:\n  - glob: \"node_modules/**/*\"\n    fingerprint: \"node_modules/.yarn-state.yml\"\n";
-        let task: Task = serde_yaml_ng::from_str(input).unwrap();
+        let task: Task = crate::yaml::from_str(input).unwrap();
         assert_eq!(task.generates.len(), 1);
         assert_eq!(task.generates[0].glob, "node_modules/**/*");
         assert_eq!(
@@ -519,7 +519,7 @@ mod tests {
     #[test]
     fn generates_mixed() {
         let input = "\ncmds:\n  - make build\ngenerates:\n  - \"build/**/*\"\n  - glob: \"node_modules/**/*\"\n    fingerprint: \"node_modules/.yarn-state.yml\"\n  - exclude: \"build/tmp/**\"\n";
-        let task: Task = serde_yaml_ng::from_str(input).unwrap();
+        let task: Task = crate::yaml::from_str(input).unwrap();
         assert_eq!(task.generates.len(), 3);
         assert_eq!(task.generates[0].glob, "build/**/*");
         assert!(task.generates[0].fingerprint.is_empty());

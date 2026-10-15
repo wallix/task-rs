@@ -4,10 +4,10 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::dialect::Dialect;
 use super::error::TaskfileDecodeError;
+use crate::yaml::Value;
 
 /// Remote cache and distributed-lock settings.
 ///
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn bare_string_sets_inherit() {
-        let c: Cache = serde_yaml_ng::from_str("default").unwrap();
+        let c: Cache = crate::yaml::from_str("default").unwrap();
         assert_eq!(c.inherit, "default");
         assert!(c.enabled.is_none());
         assert!(c.ttl.is_empty());
@@ -150,14 +150,14 @@ mod tests {
 
     #[test]
     fn mapping_with_bool_enabled() {
-        let c: Cache = serde_yaml_ng::from_str("enabled: true\nurl: redis://host/key").unwrap();
+        let c: Cache = crate::yaml::from_str("enabled: true\nurl: redis://host/key").unwrap();
         assert_eq!(c.enabled, Some(true));
         assert_eq!(c.url, "redis://host/key");
     }
 
     #[test]
     fn mapping_with_string_enabled_becomes_if() {
-        let c: Cache = serde_yaml_ng::from_str(r#"enabled: '{{ne .FOO ""}}'"#).unwrap();
+        let c: Cache = crate::yaml::from_str(r#"enabled: '{{ne .FOO ""}}'"#).unwrap();
         assert!(c.enabled.is_none());
         assert_eq!(c.if_, r#"{{ne .FOO ""}}"#);
     }
@@ -165,21 +165,21 @@ mod tests {
     #[test]
     fn mapping_with_url_and_lock() {
         let c: Cache =
-            serde_yaml_ng::from_str("url: file:///tmp/x.zip\nlock: redis://host/lock").unwrap();
+            crate::yaml::from_str("url: file:///tmp/x.zip\nlock: redis://host/lock").unwrap();
         assert_eq!(c.url, "file:///tmp/x.zip");
         assert_eq!(c.lock, "redis://host/lock");
     }
 
     #[test]
     fn mapping_with_inherit_and_url_override() {
-        let c: Cache = serde_yaml_ng::from_str("inherit: doc\nurl: file:///override").unwrap();
+        let c: Cache = crate::yaml::from_str("inherit: doc\nurl: file:///override").unwrap();
         assert_eq!(c.inherit, "doc");
         assert_eq!(c.url, "file:///override");
     }
 
     #[test]
     fn mapping_with_vk() {
-        let c: Cache = serde_yaml_ng::from_str(
+        let c: Cache = crate::yaml::from_str(
             "vk: '{{ REGISTRY }}/task-cache'\napi_key: '{{ KEY }}'\nnamespace: gcc-13",
         )
         .unwrap();
@@ -192,14 +192,14 @@ mod tests {
 
     #[test]
     fn mapping_with_ttl() {
-        let c: Cache = serde_yaml_ng::from_str("url: redis://host/key\nttl: 48h").unwrap();
+        let c: Cache = crate::yaml::from_str("url: redis://host/key\nttl: 48h").unwrap();
         assert_eq!(c.url, "redis://host/key");
         assert_eq!(c.ttl, "48h");
     }
 
     #[test]
     fn ttl_in_mapping_with_other_fields() {
-        let c: Cache = serde_yaml_ng::from_str(
+        let c: Cache = crate::yaml::from_str(
             "inherit: doc\nurl: file:///tmp/x.zip\nlock: redis://host/lock\nttl: 7d",
         )
         .unwrap();
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn ttl_absent_defaults_empty() {
-        let c: Cache = serde_yaml_ng::from_str("url: redis://host/key").unwrap();
+        let c: Cache = crate::yaml::from_str("url: redis://host/key").unwrap();
         assert!(c.ttl.is_empty());
     }
 }

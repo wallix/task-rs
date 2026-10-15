@@ -2,10 +2,10 @@
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::error::TaskfileDecodeError;
 use super::vars::Vars;
+use crate::yaml::Value;
 
 /// A deferred action: either a shell command or a task call.
 ///
@@ -39,7 +39,7 @@ impl<'de> Deserialize<'de> for Defer {
                     #[serde(default)]
                     silent: bool,
                 }
-                let raw: Raw = serde_yaml_ng::from_value(value)
+                let raw: Raw = crate::yaml::from_value(value)
                     .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                 Ok(Defer {
                     cmd: raw.defer,

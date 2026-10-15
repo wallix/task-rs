@@ -15,7 +15,6 @@ use std::future::Future;
 use std::pin::Pin;
 
 use indexmap::IndexMap;
-use serde_yaml_ng::Value;
 
 use crate::ast::{Caches, Dep, For, Glob, Location, Matrix, Precondition, Task, Var, Vars};
 use crate::compiler::{Compiler, CompilerError};
@@ -25,6 +24,7 @@ use crate::filepathext;
 use crate::fingerprint::{self, ChecksumChecker};
 use crate::logger::Logger;
 use crate::templater::{Cache, TemplaterError};
+use crate::yaml::Value;
 
 /// Resolves `from:` entries in `sources`/`generates` by compiling the tasks
 /// they reference. The executor's `GlobResolver` implements this;
@@ -842,7 +842,7 @@ fn split_for_var(v: &Var, f: &For) -> Result<(Vec<Value>, Vec<String>), CompileE
             for (k, val) in map {
                 let key = match k {
                     Value::String(s) => s.clone(),
-                    other => serde_yaml_ng::to_string(other)
+                    other => crate::yaml::to_string(other)
                         .unwrap_or_default()
                         .trim()
                         .to_string(),
@@ -892,11 +892,11 @@ fn resolve_matrix_refs(matrix: &mut Matrix, cache: &mut Cache) -> Result<(), Com
 
 /// Produces the cartesian product of a matrix's rows as a list of maps. Ports
 /// Go `product`.
-fn product(matrix: &Matrix) -> Vec<serde_yaml_ng::Mapping> {
+fn product(matrix: &Matrix) -> Vec<crate::yaml::Mapping> {
     if matrix.is_empty() {
         return Vec::new();
     }
-    let mut result: Vec<serde_yaml_ng::Mapping> = vec![serde_yaml_ng::Mapping::new()];
+    let mut result: Vec<crate::yaml::Mapping> = vec![crate::yaml::Mapping::new()];
     for (key, row) in matrix.all() {
         let mut new_result = Vec::new();
         for combination in &result {

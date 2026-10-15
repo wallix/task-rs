@@ -40,3 +40,4 @@ pub mod templater;
 pub mod term;
 pub mod variables;
 pub mod version;
+pub mod yaml;

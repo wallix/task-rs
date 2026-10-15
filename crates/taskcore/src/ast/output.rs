@@ -2,9 +2,9 @@
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::error::TaskfileDecodeError;
+use crate::yaml::Value;
 
 /// The output style. Accepts a bare style name, or a mapping that must carry a
 /// `group` key (setting the style to `group`).
@@ -35,7 +35,7 @@ impl<'de> Deserialize<'de> for Output {
                 struct Raw {
                     group: Option<OutputGroup>,
                 }
-                let raw: Raw = serde_yaml_ng::from_value(value)
+                let raw: Raw = crate::yaml::from_value(value)
                     .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                 match raw.group {
                     Some(group) => Ok(Output {
@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn scalar_name() {
-        let o: Output = serde_yaml_ng::from_str("prefixed").unwrap();
+        let o: Output = crate::yaml::from_str("prefixed").unwrap();
         assert_eq!(o.name, "prefixed");
         assert!(o.is_set());
     }
@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn group_mapping() {
         let input = "group:\n  begin: START\n  end: END\n  error_only: true\n";
-        let o: Output = serde_yaml_ng::from_str(input).unwrap();
+        let o: Output = crate::yaml::from_str(input).unwrap();
         assert_eq!(o.name, "group");
         assert_eq!(o.group.begin, "START");
         assert!(o.group.error_only);
@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn mapping_without_group_errors() {
-        let err = serde_yaml_ng::from_str::<Output>("other: 1\n").unwrap_err();
+        let err = crate::yaml::from_str::<Output>("other: 1\n").unwrap_err();
         assert!(err.to_string().contains("must have the \"group\" key"));
     }
 }

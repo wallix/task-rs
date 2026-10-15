@@ -2,9 +2,9 @@
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::error::TaskfileDecodeError;
+use crate::yaml::Value;
 
 /// A file pattern. It accepts four YAML shapes:
 ///
@@ -44,7 +44,7 @@ impl<'de> Deserialize<'de> for Glob {
                     #[serde(default)]
                     from: String,
                 }
-                let raw: Raw = serde_yaml_ng::from_value(value)
+                let raw: Raw = crate::yaml::from_value(value)
                     .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                 let mut g = Glob::default();
                 if !raw.from.is_empty() {
@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn scalar() {
-        let g: Glob = serde_yaml_ng::from_str(r#""src/**/*.go""#).unwrap();
+        let g: Glob = crate::yaml::from_str(r#""src/**/*.go""#).unwrap();
         assert_eq!(g.glob, "src/**/*.go");
         assert!(!g.negate);
         assert!(g.fingerprint.is_empty());
@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn exclude() {
-        let g: Glob = serde_yaml_ng::from_str(r#"exclude: "vendor/**""#).unwrap();
+        let g: Glob = crate::yaml::from_str(r#"exclude: "vendor/**""#).unwrap();
         assert_eq!(g.glob, "vendor/**");
         assert!(g.negate);
         assert!(g.fingerprint.is_empty());
@@ -89,7 +89,7 @@ mod tests {
     fn glob_with_fingerprint() {
         let input =
             "\nglob: \"node_modules/**/*\"\nfingerprint: \"node_modules/.yarn-state.yml\"\n";
-        let g: Glob = serde_yaml_ng::from_str(input).unwrap();
+        let g: Glob = crate::yaml::from_str(input).unwrap();
         assert_eq!(g.glob, "node_modules/**/*");
         assert!(!g.negate);
         assert_eq!(g.fingerprint, "node_modules/.yarn-state.yml");
@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn glob_without_fingerprint() {
-        let g: Glob = serde_yaml_ng::from_str(r#"glob: "build/**/*""#).unwrap();
+        let g: Glob = crate::yaml::from_str(r#"glob: "build/**/*""#).unwrap();
         assert_eq!(g.glob, "build/**/*");
         assert!(!g.negate);
         assert!(g.fingerprint.is_empty());
@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn in_generates_list() {
         let input = "\n- \"build/**/*\"\n- exclude: \"build/tmp/**\"\n- glob: \"node_modules/**/*\"\n  fingerprint: \"node_modules/.yarn-state.yml\"\n";
-        let globs: Vec<Glob> = serde_yaml_ng::from_str(input).unwrap();
+        let globs: Vec<Glob> = crate::yaml::from_str(input).unwrap();
         assert_eq!(globs.len(), 3);
         assert_eq!(globs[0].glob, "build/**/*");
         assert!(!globs[0].negate);
@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn from_deps() {
-        let g: Glob = serde_yaml_ng::from_str("from: deps").unwrap();
+        let g: Glob = crate::yaml::from_str("from: deps").unwrap();
         assert!(g.glob.is_empty());
         assert!(!g.negate);
         assert!(g.fingerprint.is_empty());
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn from_cmds() {
-        let g: Glob = serde_yaml_ng::from_str("from: cmds").unwrap();
+        let g: Glob = crate::yaml::from_str("from: cmds").unwrap();
         assert!(g.glob.is_empty());
         assert_eq!(g.from, "cmds");
     }
@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn list_with_from() {
         let input = "\n- \"src/**/*.go\"\n- from: deps\n- exclude: \"vendor/**\"\n";
-        let globs: Vec<Glob> = serde_yaml_ng::from_str(input).unwrap();
+        let globs: Vec<Glob> = crate::yaml::from_str(input).unwrap();
         assert_eq!(globs.len(), 3);
         assert_eq!(globs[0].glob, "src/**/*.go");
         assert!(globs[0].from.is_empty());

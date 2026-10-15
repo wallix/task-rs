@@ -2,9 +2,9 @@
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::error::TaskfileDecodeError;
+use crate::yaml::Value;
 
 /// One or more prompt strings. Accepts a bare string or a list of strings.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -17,7 +17,7 @@ impl<'de> Deserialize<'de> for Prompt {
         match value {
             Value::String(s) => Ok(Prompt(vec![s])),
             Value::Sequence(_) => {
-                let list: Vec<String> = serde_yaml_ng::from_value(value)
+                let list: Vec<String> = crate::yaml::from_value(value)
                     .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                 Ok(Prompt(list))
             }
@@ -34,13 +34,13 @@ mod tests {
 
     #[test]
     fn scalar() {
-        let p: Prompt = serde_yaml_ng::from_str("are you sure?").unwrap();
+        let p: Prompt = crate::yaml::from_str("are you sure?").unwrap();
         assert_eq!(p.0, vec!["are you sure?"]);
     }
 
     #[test]
     fn sequence() {
-        let p: Prompt = serde_yaml_ng::from_str("[a, b]").unwrap();
+        let p: Prompt = crate::yaml::from_str("[a, b]").unwrap();
         assert_eq!(p.0, vec!["a", "b"]);
     }
 }

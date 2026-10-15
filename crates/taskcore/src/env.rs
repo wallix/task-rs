@@ -5,9 +5,8 @@
 //! present in the process environment; `TASK_X_ENV_PRECEDENCE=0` restores the
 //! old behaviour, where the existing process value wins.
 
-use serde_yaml_ng::Value;
-
 use crate::ast;
+use crate::yaml::Value;
 
 const TASK_VAR_PREFIX: &str = "TASK_";
 

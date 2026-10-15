@@ -3,11 +3,11 @@
 use indexmap::IndexMap;
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::dialect::Dialect;
 use super::error::TaskfileDecodeError;
 use super::vars::Vars;
+use crate::yaml::Value;
 
 /// Information about an included Taskfile.
 ///
@@ -55,7 +55,7 @@ impl<'de> Deserialize<'de> for Include {
                     excludes: Vec<String>,
                     vars: Option<Vars>,
                 }
-                let raw: Raw = serde_yaml_ng::from_value(value)
+                let raw: Raw = crate::yaml::from_value(value)
                     .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                 Ok(Include {
                     taskfile: raw.taskfile,
@@ -162,7 +162,7 @@ impl<'de> Deserialize<'de> for Includes {
                     let key = k.as_str().map(str::to_string).ok_or_else(|| {
                         de::Error::custom(TaskfileDecodeError::type_message("includes"))
                     })?;
-                    let mut include: Include = serde_yaml_ng::from_value(v)
+                    let mut include: Include = crate::yaml::from_value(v)
                         .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                     include.namespace = key.clone();
                     includes.set(key, include);
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn scalar_include() {
-        let i: Include = serde_yaml_ng::from_str("./other/Taskfile.yml").unwrap();
+        let i: Include = crate::yaml::from_str("./other/Taskfile.yml").unwrap();
         assert_eq!(i.taskfile, "./other/Taskfile.yml");
         assert!(!i.advanced_import);
     }
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn advanced_include() {
         let input = "taskfile: ./sub/Taskfile.yml\ndir: ./sub\ninternal: true\n";
-        let i: Include = serde_yaml_ng::from_str(input).unwrap();
+        let i: Include = crate::yaml::from_str(input).unwrap();
         assert_eq!(i.taskfile, "./sub/Taskfile.yml");
         assert_eq!(i.dir, "./sub");
         assert!(i.internal);
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn includes_map_sets_namespace_and_order() {
         let input = "docs: ./docs/Taskfile.yml\nlib:\n  taskfile: ./lib/Taskfile.yml\n";
-        let includes: Includes = serde_yaml_ng::from_str(input).unwrap();
+        let includes: Includes = crate::yaml::from_str(input).unwrap();
         let keys: Vec<&String> = includes.keys().collect();
         assert_eq!(keys, vec!["docs", "lib"]);
         assert_eq!(includes.get("docs").unwrap().namespace, "docs");

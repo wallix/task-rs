@@ -3,9 +3,9 @@
 use indexmap::IndexMap;
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::error::TaskfileDecodeError;
+use crate::yaml::Value;
 
 /// A list of values for a matrix key, or a reference to another variable.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -105,7 +105,7 @@ impl<'de> Deserialize<'de> for Matrix {
                                 #[serde(rename = "ref", default)]
                                 r: String,
                             }
-                            let refs: Ref = serde_yaml_ng::from_value(v)
+                            let refs: Ref = crate::yaml::from_value(v)
                                 .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                             matrix.set(
                                 key,
@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn sequence_rows() {
         let input = "OS: [linux, windows]\nARCH: [amd64, arm64]\n";
-        let m: Matrix = serde_yaml_ng::from_str(input).unwrap();
+        let m: Matrix = crate::yaml::from_str(input).unwrap();
         assert_eq!(m.len(), 2);
         assert_eq!(m.get("OS").unwrap().value.len(), 2);
         let keys: Vec<&String> = m.keys().collect();
@@ -148,14 +148,14 @@ mod tests {
     #[test]
     fn ref_row() {
         let input = "OS:\n  ref: SOME_VAR\n";
-        let m: Matrix = serde_yaml_ng::from_str(input).unwrap();
+        let m: Matrix = crate::yaml::from_str(input).unwrap();
         assert_eq!(m.get("OS").unwrap().ref_, "SOME_VAR");
         assert!(m.get("OS").unwrap().value.is_empty());
     }
 
     #[test]
     fn invalid_row() {
-        let err = serde_yaml_ng::from_str::<Matrix>("OS: linux").unwrap_err();
+        let err = crate::yaml::from_str::<Matrix>("OS: linux").unwrap_err();
         assert!(err.to_string().contains("array or a reference"));
     }
 }

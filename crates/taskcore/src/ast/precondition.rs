@@ -2,9 +2,9 @@
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::error::TaskfileDecodeError;
+use crate::yaml::Value;
 
 /// A precondition: a shell command plus the message shown when it fails.
 ///
@@ -33,7 +33,7 @@ impl<'de> Deserialize<'de> for Precondition {
                     #[serde(default)]
                     msg: String,
                 }
-                let raw: Raw = serde_yaml_ng::from_value(value)
+                let raw: Raw = crate::yaml::from_value(value)
                     .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                 let msg = if raw.msg.is_empty() {
                     format!("{} failed", raw.sh)
@@ -83,7 +83,7 @@ mod tests {
             },
         ];
         for case in cases {
-            let p: Precondition = serde_yaml_ng::from_str(case.content).unwrap();
+            let p: Precondition = crate::yaml::from_str(case.content).unwrap();
             assert_eq!(p, case.expected);
         }
     }

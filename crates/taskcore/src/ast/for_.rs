@@ -2,10 +2,10 @@
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::error::TaskfileDecodeError;
 use super::matrix::Matrix;
+use crate::yaml::Value;
 
 /// A loop source. Accepts a scalar (`from`), a list of literal values, or a
 /// mapping with either `var` or `matrix` (never both).
@@ -43,7 +43,7 @@ impl<'de> Deserialize<'de> for For {
                     #[serde(default, rename = "as")]
                     as_: String,
                 }
-                let raw: Raw = serde_yaml_ng::from_value(value)
+                let raw: Raw = crate::yaml::from_value(value)
                     .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                 let matrix_len = raw.matrix.as_ref().map_or(0, Matrix::len);
                 if raw.var.is_empty() && matrix_len == 0 {
@@ -75,38 +75,38 @@ mod tests {
 
     #[test]
     fn scalar_from() {
-        let f: For = serde_yaml_ng::from_str("sources").unwrap();
+        let f: For = crate::yaml::from_str("sources").unwrap();
         assert_eq!(f.from, "sources");
     }
 
     #[test]
     fn list_literal() {
-        let f: For = serde_yaml_ng::from_str("[a, b, c]").unwrap();
+        let f: For = crate::yaml::from_str("[a, b, c]").unwrap();
         assert_eq!(f.list.len(), 3);
     }
 
     #[test]
     fn var_form() {
-        let f: For = serde_yaml_ng::from_str("var: MY_VAR\nas: item\n").unwrap();
+        let f: For = crate::yaml::from_str("var: MY_VAR\nas: item\n").unwrap();
         assert_eq!(f.var, "MY_VAR");
         assert_eq!(f.as_, "item");
     }
 
     #[test]
     fn matrix_form() {
-        let f: For = serde_yaml_ng::from_str("matrix:\n  OS: [linux]\n").unwrap();
+        let f: For = crate::yaml::from_str("matrix:\n  OS: [linux]\n").unwrap();
         assert_eq!(f.matrix.unwrap().len(), 1);
     }
 
     #[test]
     fn both_var_and_matrix_errors() {
-        let err = serde_yaml_ng::from_str::<For>("var: X\nmatrix:\n  OS: [linux]\n").unwrap_err();
+        let err = crate::yaml::from_str::<For>("var: X\nmatrix:\n  OS: [linux]\n").unwrap_err();
         assert!(err.to_string().contains("both var and matrix"));
     }
 
     #[test]
     fn empty_mapping_errors() {
-        let err = serde_yaml_ng::from_str::<For>("split: ','\n").unwrap_err();
+        let err = crate::yaml::from_str::<For>("split: ','\n").unwrap_err();
         assert!(err.to_string().contains("invalid keys in for"));
     }
 }

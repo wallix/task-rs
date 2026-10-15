@@ -13,11 +13,10 @@
 
 use std::collections::HashSet;
 
-use serde_yaml_ng::value::{Tag, TaggedValue};
-use serde_yaml_ng::{Mapping, Number, Value, from_str, to_string};
 use taskcore::ast::{Dialect, Taskfile};
 use taskcore::reader::{Node, Reader, ReaderError};
 use taskcore::templater::Cache;
+use taskcore::yaml::{Mapping, Number, Tag, TaggedValue, Value, from_str, to_string};
 
 /// A backend-independent rendering of a value: the variant, then the number's
 /// `Display`, the tag, or the string's `Debug` form.

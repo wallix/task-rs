@@ -2,7 +2,6 @@
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::cache::Caches;
 use super::dialect::Dialect;
@@ -11,6 +10,7 @@ use super::include::{Include, Includes};
 use super::output::Output;
 use super::tasks::Tasks;
 use super::vars::Vars;
+use crate::yaml::Value;
 
 /// The character that separates namespaces in task names.
 pub const NAMESPACE_SEPARATOR: &str = ":";
@@ -133,7 +133,7 @@ impl<'de> Deserialize<'de> for Taskfile {
                     caches: Caches,
                     templater: Option<Dialect>,
                 }
-                let raw: Raw = serde_yaml_ng::from_value(value)
+                let raw: Raw = crate::yaml::from_value(value)
                     .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                 Ok(Taskfile {
                     location: String::new(),
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn parses_basic_taskfile() {
         let input = "version: '3'\ntasks:\n  build:\n    cmds:\n      - echo hi\n";
-        let tf: Taskfile = serde_yaml_ng::from_str(input).unwrap();
+        let tf: Taskfile = crate::yaml::from_str(input).unwrap();
         assert_eq!(tf.version.as_deref(), Some("3"));
         assert_eq!(tf.tasks.len(), 1);
         assert!(tf.tasks.get("build").is_some());
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn duplicate_task_keys_are_errors() {
         let input = "version: '3'\ntasks:\n  a:\n    cmds: [echo a]\n  a:\n    cmds: [echo b]\n";
-        let err = serde_yaml_ng::from_str::<Taskfile>(input).unwrap_err();
+        let err = crate::yaml::from_str::<Taskfile>(input).unwrap_err();
         assert_eq!(
             err.to_string(),
             "task: Failed to decode Taskfile: tasks: duplicate entry with key \"a\" at line 3 column 3"
@@ -188,16 +188,16 @@ mod tests {
     #[test]
     fn accepts_bare_integer_and_float_version() {
         // Go accepts an unquoted `version: 3`; both scalar forms map to "3"/"3.1".
-        let tf: Taskfile = serde_yaml_ng::from_str("version: 3\ntasks: {}\n").unwrap();
+        let tf: Taskfile = crate::yaml::from_str("version: 3\ntasks: {}\n").unwrap();
         assert_eq!(tf.version.as_deref(), Some("3"));
-        let tf: Taskfile = serde_yaml_ng::from_str("version: 3.1\ntasks: {}\n").unwrap();
+        let tf: Taskfile = crate::yaml::from_str("version: 3.1\ntasks: {}\n").unwrap();
         assert_eq!(tf.version.as_deref(), Some("3.1"));
     }
 
     #[test]
     fn empty_maps_default_to_empty() {
         let input = "version: '3'\n";
-        let tf: Taskfile = serde_yaml_ng::from_str(input).unwrap();
+        let tf: Taskfile = crate::yaml::from_str(input).unwrap();
         assert!(tf.includes.is_empty());
         assert!(tf.vars.is_empty());
         assert!(tf.env.is_empty());
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn caches_map() {
         let input = "\nversion: '3'\ncaches:\n  default:\n    url: 'redis://host/{{.CHECKSUM}}'\n  doc:\n    enabled: false\n    url: 'file:///tmp/doc.zip'\ntasks:\n  build:\n    cmds:\n      - echo hi\n";
-        let tf: Taskfile = serde_yaml_ng::from_str(input).unwrap();
+        let tf: Taskfile = crate::yaml::from_str(input).unwrap();
         assert_eq!(tf.caches.len(), 2);
         assert_eq!(
             tf.caches.get("default").unwrap().url,
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn ttl_inherited_from_caches_map() {
         let input = "\nversion: '3'\ncaches:\n  default:\n    url: 'redis://host/{{.CHECKSUM}}'\n    ttl: 72h\ntasks:\n  build:\n    cmds:\n      - echo hi\n";
-        let tf: Taskfile = serde_yaml_ng::from_str(input).unwrap();
+        let tf: Taskfile = crate::yaml::from_str(input).unwrap();
         assert_eq!(tf.caches.get("default").unwrap().ttl, "72h");
     }
 

@@ -4,10 +4,9 @@
 
 use std::collections::HashSet;
 
-use serde_yaml_ng::Value;
-
 use crate::ast::{Task, Taskfile, Var};
 use crate::logger::{Color, Logger};
+use crate::yaml::Value;
 
 /// Prints a summary for each of the named tasks, separated by blank lines.
 pub fn print_tasks(l: &mut Logger, t: &Taskfile, calls: &[String]) {
@@ -181,7 +180,7 @@ fn format_var_value(v: &Var) -> String {
 }
 
 /// Formats a mapping value with YAML-style indentation.
-fn format_map(m: &serde_yaml_ng::Mapping, indent: usize) -> String {
+fn format_map(m: &crate::yaml::Mapping, indent: usize) -> String {
     if m.is_empty() {
         return "{}".to_string();
     }
@@ -203,7 +202,7 @@ fn scalar_to_string(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
         Value::String(s) => s.clone(),
-        other => serde_yaml_ng::to_string(other)
+        other => crate::yaml::to_string(other)
             .unwrap_or_default()
             .trim_end()
             .to_string(),

@@ -12,8 +12,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use serde_yaml_ng::Value;
-
 use crate::ast::{Task, Var, Vars};
 use crate::call::Call;
 use crate::env;
@@ -22,6 +20,7 @@ use crate::filepathext;
 use crate::logger::{Color, Logger};
 use crate::templater::Cache;
 use crate::version;
+use crate::yaml::Value;
 
 /// An error raised while compiling a task's variables.
 #[derive(Debug)]

@@ -2,10 +2,10 @@
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use serde_yaml_ng::Value;
 
 use super::dialect::Dialect;
 use super::error::TaskfileDecodeError;
+use crate::yaml::Value;
 
 /// A variable value. It is either a static value (any scalar, list, or map),
 /// a shell command (`sh`), a reference to another variable (`ref`), or a `map`
@@ -76,7 +76,7 @@ impl<'de> Deserialize<'de> for Var {
                         r: Option<String>,
                         map: Option<Value>,
                     }
-                    let raw: RawKeys = serde_yaml_ng::from_value(node)
+                    let raw: RawKeys = crate::yaml::from_value(node)
                         .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                     Ok(Var {
                         sh: raw.sh,
@@ -104,26 +104,26 @@ mod tests {
 
     #[test]
     fn scalar_value() {
-        let v: Var = serde_yaml_ng::from_str("hello").unwrap();
+        let v: Var = crate::yaml::from_str("hello").unwrap();
         assert_eq!(v.value, Some(Value::String("hello".to_string())));
         assert!(v.sh.is_none());
     }
 
     #[test]
     fn sh_form() {
-        let v: Var = serde_yaml_ng::from_str("sh: echo hi").unwrap();
+        let v: Var = crate::yaml::from_str("sh: echo hi").unwrap();
         assert_eq!(v.sh.as_deref(), Some("echo hi"));
     }
 
     #[test]
     fn ref_form() {
-        let v: Var = serde_yaml_ng::from_str("ref: OTHER").unwrap();
+        let v: Var = crate::yaml::from_str("ref: OTHER").unwrap();
         assert_eq!(v.ref_, "OTHER");
     }
 
     #[test]
     fn invalid_type() {
-        let err = serde_yaml_ng::from_str::<Var>("bogus: 1").unwrap_err();
+        let err = crate::yaml::from_str::<Var>("bogus: 1").unwrap_err();
         assert!(err.to_string().contains("not a valid variable type"));
     }
 
