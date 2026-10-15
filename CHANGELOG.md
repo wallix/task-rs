@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.8.0 - 2026-10-16
+
 - **`sandbox.writes` can name a task.** A `{task: <name>}` entry, with
   optional `vars`, makes the directories that task's `generates` write in
   writable, so a sandboxed task can call it, with `task:` or as a nested
