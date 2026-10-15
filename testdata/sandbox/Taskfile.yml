@@ -198,6 +198,24 @@ tasks:
       # Not replacing an existing entry: EEXIST, whatever mv makes of it.
       - cp src/a.txt scratch/b && mv -n scratch/b mixed/keep; echo moved
 
+  # Process substitution opens a pipe through /dev/fd: no path, no denial.
+  process-substitution:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - bash -c 'mapfile -t x < <(echo one); echo "${x[0]}"'
+      - bash -c 'cat <(echo two)'
+      - bash -c 'exec 3< <(echo three); cat /dev/fd/3'
+      - cat <(echo four)
+
+  # Reopening, through /proc/self/fd, a file found through another mount
+  # namespace: still checked.
+  other-namespace:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - bash src/other-namespace.sh
+
   ignored-denial:
     sources: [src/**]
     sandbox: true

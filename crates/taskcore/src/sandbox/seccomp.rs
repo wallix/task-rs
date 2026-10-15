@@ -999,6 +999,10 @@ enum Found {
     Missing(OwnedFd),
     /// Nothing: the kernel fails the lookup before checking any permission.
     Fails,
+    /// An object no path names, reached through a `/proc/<pid>/fd` link: a
+    /// pipe, socket, memfd, ... on a kernel-internal filesystem, on which
+    /// Landlock checks no right either.
+    Unnamed,
 }
 
 /// How to look a path argument up.
@@ -1156,7 +1160,7 @@ fn accesses(c: &Caller<'_>, args: &[u64; 6], op: Op) -> Result<Vec<Check>, Unche
                     }
                 }
                 Found::Missing(dir) if create => need(path_of(&dir)?, access::MAKE_REG, "create"),
-                Found::Missing(_) | Found::Fails => {}
+                Found::Missing(_) | Found::Fails | Found::Unnamed => {}
             }
         }
         Op::Exec { at, flags } => {
@@ -1240,7 +1244,7 @@ fn accesses(c: &Caller<'_>, args: &[u64; 6], op: Op) -> Result<Vec<Check>, Unche
                     (Some(fd), to)
                 }
                 Found::Missing(dir) => (None, path_of(&dir)?),
-                Found::Fails => return Ok(out),
+                Found::Fails | Found::Unnamed => return Ok(out),
             };
             let entry = path_of(&src)?;
             let from = parent(&entry);
@@ -1360,6 +1364,7 @@ fn find(c: &Caller<'_>, args: &[u64; 6], at: At, how: Lookup) -> Result<Found, U
     };
     if path.is_empty() {
         return Ok(match base {
+            Some(fd) if how.empty && unnamed(&fd)? => Found::Unnamed,
             Some(fd) if how.empty => Found::Entry(fd),
             _ => Found::Fails,
         });
@@ -1391,6 +1396,32 @@ fn mount_id(fd: &OwnedFd) -> io::Result<u64> {
         .find_map(|l| l.strip_prefix("mnt_id:"))
         .and_then(|v| v.trim().parse().ok())
         .ok_or_else(|| io::Error::other("no mnt_id in /proc/self/fdinfo"))
+}
+
+/// Whether `fd` is an object no path names, on which Landlock checks no
+/// right: one whose `/proc` name is no path (`pipe:[N]`, `socket:[N]`,
+/// `anon_inode:[eventfd]`), or a memfd (`/memfd:x (deleted)`), on the
+/// kernel's internal shmem mount. Anything else, a file on a mount of another
+/// namespace or a detached one included, is checked by its path.
+fn unnamed(fd: &OwnedFd) -> io::Result<bool> {
+    if !path_of(fd)?.is_absolute() {
+        return Ok(true);
+    }
+    Ok(match memfd_dev() {
+        Some(dev) => stat(fd)?.st_dev == dev,
+        None => false,
+    })
+}
+
+/// The device every memfd is on, from one made here once. `None` where none
+/// can be made: memfds are then checked by their `/proc` name, and denied.
+fn memfd_dev() -> Option<u64> {
+    static DEV: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *DEV.get_or_init(|| {
+        // SAFETY: the name is NUL-terminated and static.
+        let fd = owned(unsafe { libc::memfd_create(c"task-sandbox".as_ptr(), libc::MFD_CLOEXEC) });
+        fd.and_then(|fd| stat(&fd)).ok().map(|st| st.st_dev)
+    })
 }
 
 /// Resolves `path` from `start` one component at a time, with `root` as `/`
@@ -1475,6 +1506,9 @@ fn walk(
                 };
                 if crosses(&cur)? {
                     return Ok(Found::Fails);
+                }
+                if todo.is_empty() && unnamed(&cur)? {
+                    return Ok(Found::Unnamed);
                 }
                 continue;
             }
@@ -1664,7 +1698,7 @@ fn read_exact(mem: &dyn Memory, addr: u64, buf: &mut [u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{OpenOptionsExt, symlink};
 
     #[test]
     fn program_jumps_land_on_the_notify() {
@@ -1947,6 +1981,123 @@ mod tests {
         assert!(!open_how(trunc, 0).unwrap().is_empty());
         // A flag neither this code nor the kernel knows: `EINVAL`.
         assert_eq!(open_how(libc::O_RDONLY, 1 << 40).unwrap(), []);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_proc_fd_link_to_an_unnamed_object_checks_nothing() {
+        let root = tree("unnamed");
+        let mem = me();
+        let caller = Caller {
+            pid: std::process::id(),
+            mem: &mem,
+        };
+        let open = |path: &str, flags: i32| {
+            let path = CString::new(path).unwrap();
+            let (op, args) = openat(&path, flags);
+            accesses(&caller, &args, op).unwrap()
+        };
+        let (r, w) = std::io::pipe().unwrap();
+        let (sock, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        // SAFETY: the name is NUL-terminated and static.
+        let memfd = owned(unsafe { libc::memfd_create(c"x".as_ptr(), libc::MFD_CLOEXEC) }).unwrap();
+        let key = std::fs::File::open(root.join("secret/key")).unwrap();
+        for fd in [r.as_raw_fd(), sock.as_raw_fd(), memfd.as_raw_fd()] {
+            for dir in ["/dev/fd", "/proc/self/fd", "/proc/thread-self/fd"] {
+                assert_eq!(
+                    open(&format!("{dir}/{fd}"), libc::O_RDONLY),
+                    [],
+                    "{dir}/{fd}"
+                );
+            }
+        }
+        assert_eq!(
+            open(&format!("/dev/fd/{}", w.as_raw_fd()), libc::O_WRONLY),
+            []
+        );
+        // A named file is checked where it is.
+        let fd = key.as_raw_fd();
+        for dir in ["/dev/fd", "/proc/self/fd", "/proc/thread-self/fd"] {
+            assert_eq!(
+                open(&format!("{dir}/{fd}"), libc::O_RDONLY),
+                [read_of(root.join("secret/key"))]
+            );
+        }
+        // Executing a memfd by its descriptor (`fexecve`).
+        let empty = CString::new("").unwrap();
+        let exec = |fd: i32| {
+            let args = [
+                fd as u64,
+                empty.as_ptr() as u64,
+                0,
+                0,
+                libc::AT_EMPTY_PATH as u64,
+                0,
+            ];
+            accesses(&caller, &args, by_name("execveat")).unwrap()
+        };
+        assert_eq!(exec(memfd.as_raw_fd()), []);
+        assert_eq!(exec(fd).len(), 1);
+        // A file on a tmpfs is no memfd.
+        if let Ok(shm) = tempfile_in("/dev/shm") {
+            let fd = shm.as_raw_fd();
+            assert_eq!(open(&format!("/dev/fd/{fd}"), libc::O_RDONLY).len(), 1);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An unlinked file in `dir`, opened.
+    fn tempfile_in(dir: &str) -> io::Result<std::fs::File> {
+        let path = Path::new(dir).join(format!("task-seccomp-{}", std::process::id()));
+        let file = std::fs::File::create(&path)?;
+        std::fs::remove_file(&path)?;
+        Ok(file)
+    }
+
+    #[test]
+    fn a_proc_fd_link_into_another_mount_namespace_is_checked() {
+        use std::os::unix::process::CommandExt;
+        let root = tree("otherns");
+        let mut sleep = std::process::Command::new("sleep");
+        sleep.arg("30");
+        // SAFETY: `unshare` is async-signal-safe.
+        unsafe {
+            sleep.pre_exec(|| {
+                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = match sleep.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                eprintln!("skipping: no user namespace here: {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        let mem = me();
+        let caller = Caller {
+            pid: std::process::id(),
+            mem: &mem,
+        };
+        // The key, as the child's mount namespace has it: on mounts in no
+        // mount table of this one.
+        let key = Path::new(&format!("/proc/{}/root", child.id()))
+            .join(root.join("secret/key").strip_prefix("/").unwrap());
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(key)
+            .unwrap();
+        let path = CString::new(format!("/proc/self/fd/{}", opened.as_raw_fd())).unwrap();
+        for flags in [libc::O_RDONLY, libc::O_WRONLY] {
+            let (op, args) = openat(&path, flags);
+            assert_eq!(accesses(&caller, &args, op).unwrap().len(), 1, "{flags}");
+        }
+        let _ = child.kill();
+        let _ = child.wait();
         let _ = std::fs::remove_dir_all(&root);
     }
 

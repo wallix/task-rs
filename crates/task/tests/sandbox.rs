@@ -687,6 +687,80 @@ fn what_the_kernel_refuses_first_is_no_denial() {
 }
 
 #[test]
+fn a_pipe_opened_through_dev_fd_is_no_denial() {
+    for mode in ["landlock", "seccomp", "audit"]
+        .into_iter()
+        .filter(|m| available(m))
+    {
+        let dir = stage("sandbox");
+        let r = run_with_env(&dir, &["process-substitution"], &[("TASK_SANDBOX", mode)]);
+        let out = r.combined();
+        assert!(r.ok(), "{mode}: {out}");
+        assert!(
+            r.stdout.contains("one\ntwo\nthree\nfour\n"),
+            "{mode}: {out}"
+        );
+        assert!(!out.contains("sandbox:"), "{mode}: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A command making a user and mount namespace, with `python3` to open a file
+/// `O_PATH`, or `None` (saying so) where either is missing.
+fn unshare() -> Option<&'static str> {
+    let works = |cmd: &str, args: &[&str]| {
+        std::process::Command::new(cmd)
+            .args(args)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    let found = ["unshare", "busybox unshare"].into_iter().find(|u| {
+        let mut words = u.split(' ');
+        let cmd = words.next().unwrap();
+        let args: Vec<&str> = words.chain(["-Urm", "true"]).collect();
+        works(cmd, &args)
+    });
+    if found.is_none() || !works("python3", &["-c", ""]) {
+        eprintln!("skipping: no unprivileged user namespace or no python3 here");
+        return None;
+    }
+    found
+}
+
+#[test]
+fn a_file_reopened_from_another_mount_namespace_is_checked() {
+    let Some(unshare) = unshare() else {
+        return;
+    };
+    for mode in ["landlock", "seccomp", "audit"]
+        .into_iter()
+        .filter(|m| available(m))
+    {
+        let dir = stage("sandbox");
+        let env = [("TASK_SANDBOX", mode), ("UNSHARE", unshare)];
+        let r = run_with_env(&dir, &["other-namespace"], &env);
+        let out = r.combined();
+        if mode == "audit" {
+            assert!(r.ok(), "{mode}: {out}");
+            assert!(
+                out.contains("sandbox: would deny read of ") && out.contains("secret/key"),
+                "{mode}: {out}"
+            );
+        } else {
+            assert!(!r.ok(), "{mode}: expected a failure: {out}");
+            assert!(!r.stdout.contains("read:"), "{mode}: {out}");
+        }
+        if mode == "seccomp" {
+            assert!(
+                out.contains("sandbox: denied read of ") && out.contains("secret/key"),
+                "{mode}: {out}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
 fn a_called_sandboxed_task_runs_within_both_sandboxes() {
     for mode in ENFORCING.into_iter().filter(|m| available(m)) {
         let dir = stage("sandbox");
