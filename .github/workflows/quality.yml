@@ -31,6 +31,8 @@ jobs:
             timeout: 45
           - name: test
             cmd: cargo test --workspace --locked
+            # The sandbox tests fail, rather than skip, without Landlock.
+            docker_env: -e TASK_TEST_SANDBOX_REQUIRED=1
             timeout: 45
           # cargo-audit comes from the image's closure, so its version moves with the
           # flake lock. --deny warnings fails the job on any advisory. It picks up
@@ -90,7 +92,7 @@ jobs:
       - name: ${{ matrix.name }}
         run: |
           set -euo pipefail
-          docker run --rm --init \
+          docker run --rm --init ${{ matrix.docker_env }} \
             --user "$(id -u):$(id -g)" \
             -e HOME=/tmp \
             -e CARGO_HOME=/work/target/.cargo-home \
