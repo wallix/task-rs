@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **A sandboxed task's `generates` outside the root directory no longer fail
+  its setup.** One under an existing directory such as `/opt` is left to the
+  commands instead of being created beforehand.
 - **Tasks can check that their sources are complete (Linux only).** With
   `sandbox: true`, a task's commands and the tasks they call can read only the
   task's sources inside the root directory (the Taskfile's). A file missing

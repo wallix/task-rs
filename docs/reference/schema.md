@@ -916,18 +916,22 @@ The root directory itself is never writable, even when every file in it is
 readable: nothing can be created, removed or renamed directly in it, and its
 own files can only be read. A file generated directly in it
 (`generates: [app]`) cannot be created, and task warns to put it in a
-subdirectory (`generates: [bin/app]`). A `writes` entry that is the root
-directory or above it is ignored, with a warning.
+subdirectory (`generates: [bin/app]`). A `generates` directory or `writes`
+entry that is the root directory or above it (`generates: [../app.deb]`) is
+ignored, with a warning.
 
 The directories above the root directory can be listed, but no entry can be
-created, removed or renamed directly in them: Landlock cannot grant that
-without granting it throughout the root directory. A root directory placed
-directly in `$HOME` or `/tmp` therefore cannot create files there, nor use an
-entry made there after the task started; deeper directories are not affected.
-When the system temporary directory contains the root directory, or is inside
-it, commands get `TMPDIR` set to a directory of their own under `.task/tmp`,
-replacing any `TMPDIR` the task sets. The directory is removed after the
-commands finish, or by a later sandboxed run if task was killed.
+created, removed or renamed directly in them: Landlock cannot grant that without
+granting it throughout the root directory. A root directory placed directly in
+`$HOME` or `/tmp` therefore cannot create files there, nor use an entry made
+there after the task started; deeper directories are not affected. A `generates`
+directory outside the root directory is created beforehand only when it is
+missing directly in one of them; elsewhere (`/opt/app/*`) the commands create it
+themselves, if they can. When the system temporary directory contains the root
+directory, or is inside it, commands get `TMPDIR` set to a directory of their
+own under `.task/tmp`, replacing any `TMPDIR` the task sets. The directory is
+removed after the commands finish, or by a later sandboxed run if task was
+killed.
 
 The sandboxed task's own `deps` run outside its sandbox, because they run
 whether the task is up to date or not; a task it calls still runs its `deps`

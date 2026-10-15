@@ -278,3 +278,12 @@ tasks:
     cmds:
       - defer: {task: inner}
       - echo ran
+
+  # Generates outside the root, under an existing entry of its ancestors
+  # (`/proc`): left alone, rather than created before the run.
+  generates-outside-the-root:
+    sources: [src/**]
+    generates: ['/proc/sys/task-sandbox-test/*']
+    sandbox: true
+    cmds:
+      - echo ran

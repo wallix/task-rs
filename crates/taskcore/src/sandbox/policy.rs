@@ -114,8 +114,8 @@ pub struct PolicyInput<'a> {
     /// The task temp directory (`TASK_TEMP_DIR`), made writable like
     /// `writable`.
     pub temp_dir: PathBuf,
-    /// The directories `generates` patterns write in, with the pattern: made
-    /// writable like `writable`, unless one would cover the whole root.
+    /// Output directories paired with warning labels (`generates "bin/*"`).
+    /// Made writable like `writable`, unless they would cover the whole root.
     pub generated: Vec<(String, PathBuf)>,
     /// The system temporary directory, which commands use unless it contains
     /// the root or is inside it.
@@ -193,10 +193,13 @@ impl Policy {
             .collect();
 
         let mut warned = HashSet::new();
-        for (pattern, dir) in &input.generated {
+        for (what, dir) in &input.generated {
+            if unrestricted(&root, dir) {
+                continue;
+            }
             let Some(dir) = beneath(&root, dir)? else {
                 warnings.push(format!(
-                    "generates {pattern:?} writes directly in the root directory, which is not \
+                    "{what} writes in the root directory or above it, which is not \
                      made writable; put the outputs in a subdirectory (e.g. bin/app)"
                 ));
                 continue;
@@ -206,7 +209,7 @@ impl Policy {
                 && warned.insert(dir.clone())
             {
                 warnings.push(format!(
-                    "generates {pattern:?} makes {} writable, which holds sources too: \
+                    "{what} makes {} writable, which holds sources too: \
                      every file in it is readable; give the outputs a directory of their own, \
                      or list it in sandbox.writes",
                     dir.display()
@@ -539,6 +542,37 @@ fn beneath(root: &Path, dir: &Path) -> io::Result<Option<PathBuf>> {
     Ok((!root.starts_with(&real)).then_some(real))
 }
 
+/// Whether `dir`, outside the root, is under an entry of one of the root's
+/// ancestors that exists: everything there is allowed (see [`outside_rules`]),
+/// so the commands can create it themselves. Only one whose entry is missing
+/// needs creating beforehand; one under, say, `/opt` or `/proc` is left alone
+/// rather than failing the setup.
+fn unrestricted(root: &Path, dir: &Path) -> bool {
+    let real = resolved(dir);
+    // A `..` left in the missing part may lead anywhere, the root included:
+    // not judged lexically, but created and resolved like any other.
+    if real.starts_with(root)
+        || root.starts_with(&real)
+        || real
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    {
+        return false;
+    }
+    // The entry of the deepest ancestor of the root that holds `real`.
+    let Some(ancestor) = root.ancestors().find(|a| real.starts_with(a)) else {
+        return false;
+    };
+    let Some(first) = real
+        .strip_prefix(ancestor)
+        .ok()
+        .and_then(|rest| rest.components().next())
+    else {
+        return false;
+    };
+    ancestor.join(first).symlink_metadata().is_ok()
+}
+
 /// Adds the operation and path missing from the OS error.
 fn at(e: io::Error, doing: &str, path: &Path) -> io::Error {
     io::Error::new(e.kind(), format!("{doing} {}: {e}", path.display()))
@@ -612,7 +646,7 @@ mod tests {
             temp_dir: root.join(".task"),
             generated: generated
                 .iter()
-                .map(|p| (p.to_string(), root.join(p)))
+                .map(|p| (format!("generates {p:?}"), root.join(p)))
                 .collect(),
             system_tmp: std::env::temp_dir(),
             private_tmp: root.join(".task/tmp"),
@@ -629,6 +663,67 @@ mod tests {
         assert!(!p.allows(&root.join("secret"), READ_FILE));
         assert_eq!(p.warnings.len(), 2, "{:?}", p.warnings);
         assert!(p.warnings[0].contains("put the outputs in a subdirectory"));
+    }
+
+    #[test]
+    fn generated_directories_outside_the_root() {
+        let (_d, root) = tree(&["src/a.c"]);
+        let name = root.file_name().unwrap().to_string_lossy().into_owned();
+        // Directly in an ancestor of the root, where the commands cannot
+        // create it: created.
+        let sibling = root.parent().unwrap().join(format!("{name}-out"));
+        let p = Policy::build(PolicyInput {
+            task: "t",
+            root: &root,
+            readable: vec![root.join("src/a.c")],
+            writable: Vec::new(),
+            temp_dir: root.join(".task"),
+            generated: vec![
+                ("sibling".to_string(), sibling.join("bin")),
+                // Under an existing entry (`/proc`): left alone, though it
+                // cannot be created.
+                ("proc".to_string(), PathBuf::from("/proc/sys/task-test/x")),
+                // In the root's parent: reported.
+                ("parent".to_string(), root.join("..")),
+            ],
+            system_tmp: std::env::temp_dir(),
+            private_tmp: root.join(".task/tmp"),
+        })
+        .unwrap();
+        assert!(sibling.join("bin").is_dir());
+        std::fs::remove_dir_all(&sibling).unwrap();
+        assert!(!Path::new("/proc/sys/task-test").exists());
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        assert!(
+            p.warnings[0].starts_with("parent writes in the root directory or above it"),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn a_generated_directory_back_into_the_root_through_a_missing_one() {
+        let (_d, root) = tree(&["src/a.c"]);
+        let name = root.file_name().unwrap().to_string_lossy().into_owned();
+        // Under an existing directory outside the root, but `..` past a
+        // missing one leads back into it.
+        let outside = root.parent().unwrap().join(format!("{name}-outside"));
+        std::fs::create_dir(&outside).unwrap();
+        let dir = outside.join("missing/../..").join(&name).join("out");
+        let p = Policy::build(PolicyInput {
+            task: "t",
+            root: &root,
+            readable: vec![root.join("src/a.c")],
+            writable: Vec::new(),
+            temp_dir: root.join(".task"),
+            generated: vec![("out".to_string(), dir)],
+            system_tmp: std::env::temp_dir(),
+            private_tmp: root.join(".task/tmp"),
+        })
+        .unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+        assert!(p.allows(&root.join("out/app"), MAKE_REG | WRITE_FILE));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     }
 
     #[test]

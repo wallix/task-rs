@@ -643,3 +643,24 @@ fn a_called_sandboxed_task_runs_within_both_sandboxes() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[test]
+fn generates_outside_the_root_are_left_alone() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        let dir = stage("sandbox");
+        let r = run_with_env(
+            &dir,
+            &["generates-outside-the-root"],
+            &[("TASK_SANDBOX", mode)],
+        );
+        assert!(r.ok(), "{mode}: {}", r.combined());
+        assert!(r.stdout.contains("ran\n"), "{mode}: {}", r.combined());
+        assert!(
+            !r.combined().contains("sandbox:"),
+            "{mode}: {}",
+            r.combined()
+        );
+        assert!(!std::path::Path::new("/proc/sys/task-sandbox-test").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

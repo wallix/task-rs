@@ -1528,7 +1528,7 @@ impl Executor {
             .filter(|g| !g.negate && !g.glob.is_empty())
             .map(|g| {
                 let dir = generated_dir(&filepathext::smart_join(&dir_str, &g.glob));
-                (g.glob.clone(), dir)
+                (format!("generates {:?}", g.glob), dir)
             })
             .collect();
 
