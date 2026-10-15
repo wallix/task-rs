@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`sandbox.writes` can name a task.** A `{task: <name>}` entry, with
+  optional `vars`, makes the directories that task's `generates` write in
+  writable, so a sandboxed task can call it, with `task:` or as a nested
+  `task` process, on a fresh checkout. The entry changes neither the task's
+  fingerprint nor its cache key; an unknown name fails with exit code 200.
 - **A sandboxed task's `generates` outside the root directory no longer fail
   its setup.** One under an existing directory such as `/opt` is left to the
   commands instead of being created beforehand.

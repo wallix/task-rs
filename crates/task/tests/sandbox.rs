@@ -644,6 +644,212 @@ fn a_called_sandboxed_task_runs_within_both_sandboxes() {
     }
 }
 
+/// Asserts `task`'s `mkdir` was denied creating an entry in `parent`. Whether
+/// `mkdir` names the path depends on which one runs (the shell's builtin or
+/// coreutils); the seccomp supervisor names the directory.
+fn assert_denied_create(r: &Run, mode: &str, task: &str, parent: &std::path::Path) {
+    let out = r.combined();
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("mkdir: ") && l.ends_with("Permission denied")),
+        "{mode}: {out}"
+    );
+    if mode == "seccomp" {
+        let want = format!(
+            "task: [{task}] sandbox: denied create in {} (not allowed",
+            parent.display()
+        );
+        assert!(out.contains(&want), "{mode}: {out}");
+    } else {
+        let want = format!("task: [{task}] ran sandboxed");
+        assert!(out.contains(&want), "{mode}: {out}");
+    }
+}
+
+#[test]
+fn writes_naming_a_task_make_its_outputs_writable() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        // Denied without the entry: the callee cannot create gen/.
+        let dir = stage("sandbox");
+        let r = run_with_env(&dir, &["calls-gen"], &[("TASK_SANDBOX", mode)]);
+        assert!(!r.ok(), "{mode}: expected a failure: {}", r.combined());
+        assert_denied_create(&r, mode, "gen", &std::fs::canonicalize(&dir).unwrap());
+        assert!(!dir.join("gen").exists(), "{mode}");
+        let _ = std::fs::remove_dir_all(&dir);
+        // A direct call, a sandboxed callee, a nested task process, and a
+        // reference through the callee's own generates.
+        for (task, out) in [
+            ("calls-gen-writes", "gen/out/a.txt"),
+            ("calls-sandboxed-gen-writes", "sbx-gen/a.txt"),
+            ("nested-writes", "out/nested.txt"),
+            ("calls-gen-transitive-writes", "gen/out/a.txt"),
+        ] {
+            let dir = stage("sandbox");
+            let r = run_with_env(&dir, &[task], &[("TASK_SANDBOX", mode)]);
+            assert!(r.ok(), "{mode} {task}: {}", r.combined());
+            assert!(r.stdout.ends_with("a\n"), "{mode} {task}: {}", r.combined());
+            assert_eq!(std::fs::read_to_string(dir.join(out)).unwrap(), "a\n");
+            // Under seccomp, a nested task process warns its own sandbox is
+            // not enforced.
+            assert!(
+                (mode, task) == ("seccomp", "nested-writes") || !r.combined().contains("sandbox:"),
+                "{mode} {task}: {}",
+                r.combined()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+#[test]
+fn writes_naming_a_task_follow_its_vars() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        let dir = stage("sandbox");
+        let r = run_with_env(&dir, &["calls-gen-lang-writes"], &[("TASK_SANDBOX", mode)]);
+        assert!(r.ok(), "{mode}: {}", r.combined());
+        let _ = std::fs::remove_dir_all(&dir);
+        // Granting another directory than the one written in.
+        let dir = stage("sandbox");
+        let r = run_with_env(
+            &dir,
+            &["calls-gen-lang-writes", "WRITES_LANG=de"],
+            &[("TASK_SANDBOX", mode)],
+        );
+        assert!(!r.ok(), "{mode}: expected a failure: {}", r.combined());
+        let mixed = std::fs::canonicalize(&dir).unwrap().join("mixed");
+        assert_denied_create(&r, mode, "gen-lang", &mixed);
+        assert!(dir.join("mixed/de").is_dir(), "{mode}");
+        assert!(!dir.join("mixed/fr").exists(), "{mode}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn writes_naming_a_task_warn_about_a_directory_holding_sources() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        let dir = stage("sandbox");
+        let r = run_with_env(&dir, &["writes-next-to-sources"], &[("TASK_SANDBOX", mode)]);
+        assert!(r.ok(), "{mode}: {}", r.combined());
+        let src = std::fs::canonicalize(&dir).unwrap().join("src");
+        let want = format!(
+            "sandbox: \"writes-next-to-sources\": sandbox.writes {{task: gen-in-src}}: generates \
+             \"src/gen.txt\" makes {} writable, which holds sources too",
+            src.display()
+        );
+        assert!(r.combined().contains(&want), "{mode}: {}", r.combined());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn writes_naming_a_bad_task_fail() {
+    // Resolved on compiling, sandboxing on or off.
+    for (task, code, want) in [
+        (
+            "writes-unknown-task",
+            200,
+            "task: writes-unknown-task: sandbox.writes: task \"no-such-task\" does not exist",
+        ),
+        (
+            "writes-empty-task-name",
+            1,
+            "task: writes-empty-task-name: sandbox.writes: `task: {{.UNSET}}` rendered to an \
+             empty task name",
+        ),
+        (
+            "writes-cycle",
+            204,
+            "task: Cyclic dependency detected: writes-cycle-gen -> writes-cycle-wrapper -> \
+             writes-cycle-gen",
+        ),
+    ] {
+        for mode in ["off", "landlock"] {
+            let dir = stage("sandbox");
+            let r = run_with_env(&dir, &[task], &[("TASK_SANDBOX", mode)]);
+            assert!(!r.ok(), "{task}: expected a failure: {}", r.combined());
+            assert_eq!(r.code, code, "{task}: {}", r.combined());
+            assert!(r.stderr.contains(want), "{task}: {}", r.combined());
+            assert!(!r.stdout.contains("never"), "{task}: {}", r.combined());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+#[test]
+fn writes_naming_a_task_leave_the_fingerprint_alone() {
+    let dir = stage("sandbox");
+    let r = run_with_env(&dir, &["fingerprinted"], &[("TASK_SANDBOX", "off")]);
+    assert!(r.ok(), "{}", r.combined());
+    let checksum = checksum_file(&dir, "fingerprinted").unwrap();
+    let before = std::fs::read_to_string(&checksum).unwrap();
+    let taskfile = dir.join("Taskfile.yml");
+    let yaml = std::fs::read_to_string(&taskfile).unwrap();
+    let declared = "    generates: [fp/a.txt]\n    sandbox: true\n";
+    assert!(yaml.contains(declared));
+    // The referenced task's own fields do not count either.
+    let gen_fields = "  gen:\n    sources: [src/**]\n    generates: [gen/out/*.txt]\n";
+    assert!(yaml.contains(gen_fields));
+    std::fs::write(
+        &taskfile,
+        yaml.replace(
+            declared,
+            "    generates: [fp/a.txt]\n    sandbox:\n      writes: [{task: gen}]\n",
+        )
+        .replace(
+            gen_fields,
+            "  gen:\n    sources: [src/**, secret/**]\n    generates: [gen/other/*.txt]\n",
+        ),
+    )
+    .unwrap();
+    let r = run_with_env(
+        &dir,
+        &["--status", "fingerprinted"],
+        &[("TASK_SANDBOX", "off")],
+    );
+    assert!(r.ok(), "{}", r.combined());
+    assert!(
+        r.stdout
+            .starts_with("task: \"fingerprinted\" is up to date\n"),
+        "{}",
+        r.combined()
+    );
+    assert_eq!(checksum_file(&dir, "fingerprinted").unwrap(), checksum);
+    assert_eq!(std::fs::read_to_string(&checksum).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn writes_naming_the_task_itself_grant_its_own_generates() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        let dir = stage("sandbox");
+        let r = run_with_env(&dir, &["writes-itself"], &[("TASK_SANDBOX", mode)]);
+        assert!(r.ok(), "{mode}: {}", r.combined());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("self/a.txt")).unwrap(),
+            "a\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn writes_naming_a_task_without_generates_warn() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        let dir = stage("sandbox");
+        let r = run_with_env(&dir, &["writes-nothing"], &[("TASK_SANDBOX", mode)]);
+        assert!(r.ok(), "{mode}: {}", r.combined());
+        assert!(
+            r.stderr.contains(
+                "sandbox: \"writes-nothing\": sandbox.writes {task: probe} grants nothing: \
+                 \"probe\" has no generates"
+            ),
+            "{mode}: {}",
+            r.combined()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[test]
 fn generates_outside_the_root_are_left_alone() {
     for mode in ENFORCING.into_iter().filter(|m| available(m)) {
@@ -660,6 +866,7 @@ fn generates_outside_the_root_are_left_alone() {
             "{mode}: {}",
             r.combined()
         );
+        assert!(!std::path::Path::new("/opt/task-sandbox-test").exists());
         assert!(!std::path::Path::new("/proc/sys/task-sandbox-test").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

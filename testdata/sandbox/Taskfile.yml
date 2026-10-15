@@ -279,11 +279,158 @@ tasks:
       - defer: {task: inner}
       - echo ran
 
-  # Generates outside the root, under an existing entry of its ancestors
-  # (`/proc`): left alone, rather than created before the run.
+  # `sandbox.writes` naming a task: the directories its generates write in
+  # are writable. gen/ is missing, so without the entry the callee cannot
+  # create it.
+  gen:
+    sources: [src/**]
+    generates: [gen/out/*.txt]
+    cmds:
+      - mkdir -p gen/out && cat src/a.txt > gen/out/a.txt
+
+  calls-gen:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - task: gen
+      - cat gen/out/a.txt
+
+  calls-gen-writes:
+    sources: [src/**]
+    sandbox:
+      writes: [{task: gen}]
+    cmds:
+      - task: gen
+      - cat gen/out/a.txt
+
+  # The callee is sandboxed too, and creates nothing itself.
+  sandboxed-gen:
+    sources: [src/**]
+    generates: [sbx-gen/a.txt]
+    sandbox: true
+    cmds:
+      - cat src/a.txt > sbx-gen/a.txt
+
+  calls-sandboxed-gen-writes:
+    sources: [src/**]
+    sandbox:
+      writes: [{task: sandboxed-gen}]
+    cmds:
+      - task: sandboxed-gen
+      - cat sbx-gen/a.txt
+
+  # A nested task process: out/ is missing, as for nested-missing-dir.
+  nested-writes:
+    sources: [src/**]
+    sandbox:
+      writes: [{task: nested-inner}]
+    cmds:
+      - '"{{.TASK_EXE}}" nested-inner'
+      - cat out/nested.txt
+
+  # The reference's vars pick the directory: mixed/ holds files the task may
+  # not read, so only the named subdirectory is writable.
+  gen-lang:
+    sources: [src/**]
+    generates: ['mixed/{{.LANG}}/*.txt']
+    cmds:
+      - mkdir -p mixed/{{.LANG}} && cat src/a.txt > mixed/{{.LANG}}/a.txt
+
+  calls-gen-lang-writes:
+    sources: [src/**]
+    sandbox:
+      writes: [{task: gen-lang, vars: {LANG: '{{.WRITES_LANG | default "fr"}}'}}]
+    cmds:
+      - task: gen-lang
+        vars: {LANG: fr}
+      - cat mixed/fr/a.txt
+
+  # The referenced task's generates reference another task in turn.
+  gen-wrapper:
+    generates: [{task: gen}]
+
+  calls-gen-transitive-writes:
+    sources: [src/**]
+    sandbox:
+      writes: [{task: gen-wrapper}]
+    cmds:
+      - task: gen
+      - cat gen/out/a.txt
+
+  writes-unknown-task:
+    sandbox:
+      writes: [{task: no-such-task}]
+    cmds:
+      - echo never
+
+  writes-empty-task-name:
+    sandbox:
+      writes: [{task: '{{.UNSET}}'}]
+    cmds:
+      - echo never
+
+  # A cycle in the referenced task's own generates.
+  writes-cycle:
+    sandbox:
+      writes: [{task: writes-cycle-gen}]
+    cmds:
+      - echo never
+
+  writes-cycle-gen:
+    generates: [{task: writes-cycle-wrapper}]
+
+  writes-cycle-wrapper:
+    generates: [{task: writes-cycle-gen}]
+
+  # A task naming itself: its own generates, writable anyway.
+  writes-itself:
+    sources: [src/**]
+    generates: [self/a.txt]
+    sandbox:
+      writes: [{task: writes-itself}]
+    cmds:
+      - cat src/a.txt > self/a.txt
+
+  # Naming a task without generates grants nothing, with a warning.
+  writes-nothing:
+    sources: [src/**]
+    sandbox:
+      writes: [{task: probe}]
+    cmds:
+      - cat src/a.txt
+
+  # Generates outside the root, under existing entries of its ancestors
+  # (`/opt`, `/proc`): left alone, rather than created before the run.
   generates-outside-the-root:
     sources: [src/**]
     generates: ['/proc/sys/task-sandbox-test/*']
-    sandbox: true
+    sandbox:
+      writes: [{task: gen-in-destdir}]
+    cmds:
+      - task: gen-in-destdir
+
+  gen-in-destdir:
+    generates: ['{{.DESTDIR}}/opt/task-sandbox-test/*']
     cmds:
       - echo ran
+
+  # The referenced task writes next to the referrer's sources.
+  writes-next-to-sources:
+    sources: [src/**]
+    sandbox:
+      writes: [{task: gen-in-src}]
+    cmds:
+      - task: gen-in-src
+
+  gen-in-src:
+    generates: [src/gen.txt]
+    cmds:
+      - echo gen > src/gen.txt
+
+  # Run once, then rerun with `sandbox.writes` naming a task: still up to date.
+  fingerprinted:
+    sources: [src/**]
+    generates: [fp/a.txt]
+    sandbox: true
+    cmds:
+      - mkdir -p fp && cat src/a.txt > fp/a.txt

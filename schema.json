@@ -264,17 +264,17 @@
               "type": "object",
               "properties": {
                 "reads": {
-                  "description": "Files the commands may also read, which are not fingerprinted (e.g. `.git/**`). Same syntax as sources, without `from`.",
+                  "description": "Files the commands may also read, which are not fingerprinted (e.g. `.git/**`). Same syntax as sources, without `from` or `task`.",
                   "type": "array",
                   "items": {
                     "$ref": "#/definitions/sandbox_read"
                   }
                 },
                 "writes": {
-                  "description": "Directories the commands may change freely, relative to the task directory; created if missing. Reads inside them are not restricted.",
+                  "description": "Directories the commands may change freely, relative to the task directory; created if missing. Reads inside them are not restricted. A `task` entry stands for the directories that task's generates write in.",
                   "type": "array",
                   "items": {
-                    "type": "string"
+                    "$ref": "#/definitions/sandbox_write"
                   }
                 }
               },
@@ -681,6 +681,30 @@
               "type": "string"
             }
           },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "sandbox_write": {
+      "oneOf": [
+        {
+          "description": "A directory, relative to the task directory",
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "task": {
+              "description": "A task whose generates directories (the part of each pattern before its first wildcard, or a file's directory) the commands may change freely. Not fingerprinted.",
+              "type": "string",
+              "minLength": 1
+            },
+            "vars": {
+              "description": "Variables the task is compiled with, as in a dependency call",
+              "$ref": "#/definitions/vars"
+            }
+          },
+          "required": ["task"],
           "additionalProperties": false
         }
       ]

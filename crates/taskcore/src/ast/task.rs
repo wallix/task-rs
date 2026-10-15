@@ -82,10 +82,17 @@ pub struct Task {
 }
 
 impl Task {
-    /// The entries that may reference a task by name: in `sources` and
-    /// `generates`.
+    /// The entries that may reference a task by name: in `sources`,
+    /// `generates` and `sandbox.writes`.
     pub(crate) fn glob_entries_mut(&mut self) -> impl Iterator<Item = &mut Glob> {
-        self.sources.iter_mut().chain(self.generates.iter_mut())
+        let writes = self
+            .sandbox
+            .iter_mut()
+            .flat_map(|s| s.write_tasks.iter_mut());
+        self.sources
+            .iter_mut()
+            .chain(self.generates.iter_mut())
+            .chain(writes)
     }
 
     /// Returns the display name, preferring `label`, then `full_name`, then the

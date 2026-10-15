@@ -141,12 +141,13 @@ reparented). Its denials say so. Landlock has no such limit.
 A `task` started by a sandboxed command runs under the enclosing task's rules.
 Its sandbox is set up under them too: the `generates` and `writes` directories
 it would create when missing must already be writable there (for instance, in
-the enclosing task's `generates` or `writes`), or the inner task fails, naming
-the directory. Under Landlock its own rules apply on top of the enclosing ones.
-A process tree has one seccomp supervisor, though: under it, the inner task runs
-under the enclosing task's rules only, and warns that its own are not enforced.
-That includes the `if` of its commands, even when they run under Landlock: a
-denial by the enclosing rules then fails the enclosing task.
+the enclosing task's `generates` or `writes`, or a `writes` entry naming the
+inner task), or the inner task fails, naming the directory. Under Landlock its
+own rules apply on top of the enclosing ones. A process tree has one seccomp
+supervisor, though: under it, the inner task runs under the enclosing task's
+rules only, and warns that its own are not enforced. That includes the `if` of
+its commands, even when they run under Landlock: a denial by the enclosing
+rules then fails the enclosing task.
 
 ### `TASK_CACHE_OCI_USER`, `TASK_CACHE_OCI_PASSWORD`
 

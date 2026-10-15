@@ -253,6 +253,8 @@ pub async fn compiled_task(
         sandbox: orig_task.sandbox.as_ref().map(|s| crate::ast::Sandbox {
             reads: cache.replace_globs(&s.reads),
             writes: cache.replace_vec(&s.writes),
+            write_tasks: cache.replace_globs(&s.write_tasks),
+            task_generates: Vec::new(),
         }),
         dirs: cache.replace_vec(&orig_task.dirs),
         set: orig_task.set.clone(),
@@ -463,6 +465,14 @@ pub async fn compiled_task(
         // glob matching the task dir.
         check_task_references(&new, "sources", &orig_task.sources, &new.sources)?;
         check_task_references(&new, "generates", &orig_task.generates, &new.generates)?;
+        if let (Some(orig), Some(rendered)) = (&orig_task.sandbox, &new.sandbox) {
+            check_task_references(
+                &new,
+                SANDBOX_WRITES,
+                &orig.write_tasks,
+                &rendered.write_tasks,
+            )?;
+        }
     }
     if let Some(resolver) = resolver.filter(|_| evaluate_sh_vars) {
         resolve_globs_from(&mut new, GlobField::Sources, resolver).await?;
@@ -788,6 +798,46 @@ async fn referenced_globs(
             abs
         })
         .collect())
+}
+
+/// The field name `sandbox.writes` errors carry.
+const SANDBOX_WRITES: &str = "sandbox.writes";
+
+/// Resolves `sandbox.writes` task references into their generates, stored in
+/// [`crate::ast::Sandbox::task_generates`], outside fingerprints and cache keys.
+///
+/// Separate from [`compiled_task`]: only a task about to run needs these
+/// grants. Resolving them for tasks compiled for their globs would add
+/// compiles and could report false cycles.
+///
+/// Runs on every full compile, even with sandboxing off. Like task references
+/// in sources, it compiles referenced tasks and evaluates their `sh:` vars,
+/// so bad references fail consistently.
+pub async fn resolve_sandbox_writes(
+    task: &mut Task,
+    resolver: &dyn TaskResolver,
+) -> Result<(), CompileError> {
+    let Some(refs) = task.sandbox.as_ref().map(|s| s.write_tasks.clone()) else {
+        return Ok(());
+    };
+    let mut resolved = Vec::new();
+    for r in &refs {
+        let vars = r.vars.clone().unwrap_or_default();
+        let globs = referenced_globs(
+            task.name(),
+            SANDBOX_WRITES,
+            GlobField::Generates,
+            &r.task,
+            &vars,
+            resolver,
+        )
+        .await?;
+        resolved.push((r.task.clone(), globs));
+    }
+    if let Some(s) = &mut task.sandbox {
+        s.task_generates = resolved;
+    }
+    Ok(())
 }
 
 /// Rejects task names that render empty. `replace_globs` preserves entry

@@ -900,6 +900,12 @@ A task that reads another task's inputs can list `- task: <name>` in its
 `sources` to copy that task's sources instead of repeating them; see
 [`cache`](reference/schema.md#cache).
 
+A task called from a sandboxed one, with `task:` or as a nested `task` process
+from a script, writes its `generates` under the caller's sandbox. Name it in
+`sandbox.writes` (`writes: [{task: rust:build}]`) to make those directories
+writable, and in `sources` to make its inputs readable; see
+[`sandbox`](reference/schema.md#sandbox).
+
 To find every undeclared input in one run, report the accesses without denying
 them. An up-to-date task or remote cache hit runs no commands, so the sandbox
 checks nothing. Use `--force-all` to bypass both for every task in the graph,

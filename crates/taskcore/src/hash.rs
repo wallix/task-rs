@@ -682,6 +682,43 @@ mod tests {
         assert_eq!(hash(&none).unwrap(), hash(&empty).unwrap());
     }
 
+    // A `sandbox.writes` entry naming a task grants access only: neither the
+    // identity nor the cache key of the referring task moves. `sandbox` is
+    // hashed nowhere today; this guards against adding it to `hash`, `name`
+    // or `cache_checksum` later.
+    #[test]
+    fn hash_ignores_sandbox_writes_task_references() {
+        let mut base = sample_task();
+        base.sandbox = Some(crate::ast::Sandbox::default());
+        let mut referenced = base.clone();
+        if let Some(s) = &mut referenced.sandbox {
+            s.write_tasks.push(ast::Glob {
+                task: "lib".to_string(),
+                vars: Some(Vars::from_elements([VarElement {
+                    key: "X".to_string(),
+                    value: Var {
+                        value: Some(Value::String("1".to_string())),
+                        ..Default::default()
+                    },
+                }])),
+                ..Default::default()
+            });
+            s.task_generates.push((
+                "lib".to_string(),
+                vec![ast::Glob {
+                    glob: "/abs/lib/out/*".to_string(),
+                    ..Default::default()
+                }],
+            ));
+        }
+        assert_eq!(hash(&base).unwrap(), hash(&referenced).unwrap());
+        assert_eq!(name(&base).unwrap(), name(&referenced).unwrap());
+        assert_eq!(
+            cache_checksum(&base, "src").unwrap(),
+            cache_checksum(&referenced, "src").unwrap()
+        );
+    }
+
     #[test]
     fn hash_ignores_task_env() {
         // Env is a Vars orderedmap, which Go's hashstructure does not traverse;

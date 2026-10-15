@@ -128,7 +128,8 @@ impl Tasks {
                         dep.task = task_name_with_namespace(&dep.task, &include.namespace);
                     }
                 }
-                // Namespace the task references in sources and generates.
+                // Namespace the task references in sources, generates and
+                // sandbox.
                 for g in task.glob_entries_mut() {
                     if !g.task.is_empty() {
                         g.task = task_name_with_namespace(&g.task, &include.namespace);

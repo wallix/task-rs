@@ -454,8 +454,22 @@ impl Executor {
             // caught on the first hop.
             above: Some(CallPath::extend(&None, &call.task, &call.task)),
         };
-        self.compiled_task_with(call, evaluate_sh_vars, &resolver)
-            .await
+        let mut t = self
+            .compiled_task_with(call, evaluate_sh_vars, &resolver)
+            .await?;
+        // Like `task:` in sources, only on the full compile, which is what the
+        // sandbox policy is built from. Not seeded with this task: a task
+        // compiled for its globs never resolves its `sandbox.writes`, so a
+        // reference back to this one closes no loop (and a cycle in the
+        // referenced tasks' own generates is still caught).
+        if evaluate_sh_vars {
+            let writes = GlobResolver {
+                exec: self,
+                above: None,
+            };
+            crate::variables::resolve_sandbox_writes(&mut t, &writes).await?;
+        }
+        Ok(t)
     }
 
     /// The body of [`Self::compiled_task_inner`], taking the resolver that
@@ -1522,13 +1536,40 @@ impl Executor {
             .map(|w| filepathext::smart_join(&dir_str, w))
             .collect();
         let temp_dir = std::path::PathBuf::from(&self.temp_dir.fingerprint);
-        let generated = t
+        // The task's own generates, and those of the tasks `sandbox.writes`
+        // names, the referenced ones absolute already. Those are shown
+        // relative to the root, as the own ones are relative to the task dir.
+        let own = t
             .generates
             .iter()
-            .filter(|g| !g.negate && !g.glob.is_empty())
-            .map(|g| {
+            .map(|g| (format!("generates {:?}", g.glob), g));
+        let mut referenced = Vec::new();
+        for (task, globs) in &sandbox.task_generates {
+            let writing: Vec<_> = globs
+                .iter()
+                .filter(|g| !g.negate && !g.glob.is_empty())
+                .collect();
+            if writing.is_empty() {
+                self.logger().borrow_mut().warnf(&format!(
+                    "sandbox: {:?}: sandbox.writes {{task: {task}}} grants nothing: {task:?} \
+                     has no generates\n",
+                    t.name()
+                ));
+            }
+            for g in writing {
+                let shown = std::path::Path::new(&g.glob)
+                    .strip_prefix(root)
+                    .map_or_else(|_| g.glob.clone(), |p| p.to_string_lossy().into_owned());
+                let what = format!("sandbox.writes {{task: {task}}}: generates {shown:?}");
+                referenced.push((what, g));
+            }
+        }
+        let generated = own
+            .chain(referenced)
+            .filter(|(_, g)| !g.negate && !g.glob.is_empty())
+            .map(|(what, g)| {
                 let dir = generated_dir(&filepathext::smart_join(&dir_str, &g.glob));
-                (format!("generates {:?}", g.glob), dir)
+                (what, dir)
             })
             .collect();
 

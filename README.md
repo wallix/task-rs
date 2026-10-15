@@ -313,7 +313,8 @@ v3 are intentional.
 - Duplicate YAML task keys are errors instead of last-definition-wins.
 - `sandbox:` restricts a task's commands to its declared sources inside the
   root directory (Linux only: Landlock, or a seccomp fallback), to catch
-  inputs missing from `sources`.
+  inputs missing from `sources`; `sandbox.writes` can name a called task whose
+  outputs its commands write.
 
 ### Changed
 

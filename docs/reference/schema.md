@@ -896,10 +896,10 @@ cache, but two things in `cmds` see only the task's own entries:
   cache entry. Outside the root directory nothing is restricted, except in the
   directories above it (see below). Linux only.
 
-| Field    | Type       | Description                                                                                 |
-| -------- | ---------- | ------------------------------------------------------------------------------------------- |
-| `reads`  | `[]glob`   | Files the commands may also read, not fingerprinted (e.g. `.git/**`); no `from:` or `task:` |
-| `writes` | `[]string` | Directories the commands may change freely, relative to the task directory                  |
+| Field    | Type                       | Description                                                                                   |
+| -------- | -------------------------- | --------------------------------------------------------------------------------------------- |
+| `reads`  | `[]glob`                   | Files the commands may also read, not fingerprinted (e.g. `.git/**`); no `from:` or `task:`   |
+| `writes` | `[]string \| {task, vars}` | Directories the commands may change freely, relative to the task directory, or `{task, vars}` |
 
 What a command can change inside the root directory:
 
@@ -967,6 +967,49 @@ tasks:
       writes: [.ccache]
     cmds:
       - make
+```
+
+The sandbox also covers the tasks the commands call, through `task:` in `cmds`
+or a nested `task` process (a script running `task rust:build`). Those write
+their own `generates`, so a `writes` entry can name a task: `{task: X}`, with
+optional `vars` as a dependency call, makes the directories X's `generates`
+write in writable, as they are for X itself. A pattern writes in its part
+before the first wildcard (`target/**/*` in `target/`), a plain file path in
+its directory (`bin/app` in `bin/`). The name resolves like a `task:` entry of
+`sources`, through X's own `from:` and `task:` generates entries; an unknown
+name, one that renders empty, or a cycle is an error. The entry grants access
+only: it changes neither the task's fingerprint nor its cache key. One whose
+task has no `generates` grants nothing, with a warning.
+
+The entry's `vars` must render the same `generates` as the call the commands
+make: the `vars` of a `task:` command, or the `VAR=value` arguments of a nested
+`task X VAR=value`. The caller's own command-line variables apply to the
+reference, the nested process's arguments do not. A mismatch makes another
+directory writable, and the sandbox denies the callee's writes.
+
+A task that runs X also depends on X's inputs, so it lists them in its own
+`sources` with `- task: X`, which makes them readable and fingerprints them.
+`sandbox.reads` takes no `task:` entry for that: inputs read without being
+fingerprinted would leave a stale up-to-date result or cache entry.
+
+```yaml
+tasks:
+  debstage:
+    sources:
+      - debian/**
+      - task: rust:build
+      - task: i18n:build
+        vars: { LANG: fr }
+    generates: [debian/tmp/**/*]
+    sandbox:
+      writes:
+        - build/tmp
+        - task: rust:build
+        - task: i18n:build
+          vars: { LANG: fr }
+    cmds:
+      # runs `task rust:build` and `task i18n:build LANG=fr`
+      - debian/rules binary
 ```
 
 #### `platforms`
