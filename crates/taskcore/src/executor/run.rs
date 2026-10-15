@@ -1539,10 +1539,11 @@ impl Executor {
         // The task's own generates, and those of the tasks `sandbox.writes`
         // names, the referenced ones absolute already. Those are shown
         // relative to the root, as the own ones are relative to the task dir.
-        let own = t
+        let own: Vec<_> = t
             .generates
             .iter()
-            .map(|g| (format!("generates {:?}", g.glob), g));
+            .map(|g| (format!("generates {:?}", g.glob), g))
+            .collect();
         let mut referenced = Vec::new();
         for (task, globs) in &sandbox.task_generates {
             let writing: Vec<_> = globs
@@ -1564,14 +1565,18 @@ impl Executor {
                 referenced.push((what, g));
             }
         }
-        let generated = own
-            .chain(referenced)
-            .filter(|(_, g)| !g.negate && !g.glob.is_empty())
-            .map(|(what, g)| {
-                let dir = generated_dir(&filepathext::smart_join(&dir_str, &g.glob));
-                (what, dir)
-            })
-            .collect();
+        let dirs = |globs: Vec<(String, &crate::ast::Glob)>| {
+            globs
+                .into_iter()
+                .filter(|(_, g)| !g.negate && !g.glob.is_empty())
+                .map(|(what, g)| {
+                    let dir = generated_dir(&filepathext::smart_join(&dir_str, &g.glob));
+                    (what, dir)
+                })
+                .collect()
+        };
+        let generated = dirs(own);
+        let referenced = dirs(referenced);
 
         // A directory per run, locked while it lives (see `Policy::build`), so
         // that concurrent ones never clear each other's; removed once the task
@@ -1597,6 +1602,7 @@ impl Executor {
                 writable,
                 temp_dir,
                 generated,
+                referenced,
                 system_tmp: std::env::temp_dir(),
                 private_tmp,
             })

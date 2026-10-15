@@ -118,6 +118,9 @@ pub struct PolicyInput<'a> {
     /// Output directories paired with warning labels (`generates "bin/*"`).
     /// Made writable like `writable`, unless they would cover the whole root.
     pub generated: Vec<(String, PathBuf)>,
+    /// Output directories of tasks named in `sandbox.writes`, like `generated`.
+    /// No source-overlap warning: the named task controls its output paths.
+    pub referenced: Vec<(String, PathBuf)>,
     /// The system temporary directory, which commands use unless it contains
     /// the root or is inside it.
     pub system_tmp: PathBuf,
@@ -194,7 +197,10 @@ impl Policy {
             .collect();
 
         let mut warned = HashSet::new();
-        for (what, dir) in &input.generated {
+        let declared = writable.clone();
+        let generated = input.generated.iter().map(|g| (g, true));
+        let referenced = input.referenced.iter().map(|g| (g, false));
+        for ((what, dir), own) in generated.chain(referenced) {
             if unrestricted(&root, dir) {
                 continue;
             }
@@ -205,7 +211,8 @@ impl Policy {
                 ));
                 continue;
             };
-            if !writable.contains(&dir)
+            if own
+                && !declared.contains(&dir)
                 && readable.iter().any(|r| r.starts_with(&dir))
                 && warned.insert(dir.clone())
             {
@@ -673,6 +680,7 @@ mod tests {
                 .iter()
                 .map(|p| (format!("generates {p:?}"), root.join(p)))
                 .collect(),
+            referenced: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: root.join(".task/tmp"),
         })
@@ -711,6 +719,7 @@ mod tests {
                 // In the root's parent: reported.
                 ("parent".to_string(), root.join("..")),
             ],
+            referenced: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: root.join(".task/tmp"),
         })
@@ -742,6 +751,7 @@ mod tests {
             writable: Vec::new(),
             temp_dir: root.join(".task"),
             generated: vec![("out".to_string(), dir)],
+            referenced: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: root.join(".task/tmp"),
         })
@@ -772,6 +782,7 @@ mod tests {
             writable: vec![root.clone(), parent.clone(), root.join("src/..")],
             temp_dir: root.join(".task"),
             generated: Vec::new(),
+            referenced: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: root.join(".task/tmp"),
         })
@@ -793,6 +804,7 @@ mod tests {
             writable: Vec::new(),
             temp_dir: root.clone(),
             generated: Vec::new(),
+            referenced: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: root.join("tmp/run"),
         })
@@ -816,6 +828,7 @@ mod tests {
             writable: vec![root.join("file/out")],
             temp_dir: root.join(".task"),
             generated: Vec::new(),
+            referenced: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: root.join(".task/tmp/run"),
         })
@@ -874,6 +887,7 @@ mod tests {
             writable: Vec::new(),
             temp_dir: root.join(".task"),
             generated: Vec::new(),
+            referenced: Vec::new(),
             system_tmp: root.join("tmp"),
             private_tmp: root.join(".task/tmp/run"),
         })
@@ -886,6 +900,7 @@ mod tests {
             writable: Vec::new(),
             temp_dir: root.join(".task"),
             generated: Vec::new(),
+            referenced: Vec::new(),
             system_tmp: PathBuf::from("/"),
             private_tmp: root.join(".task/tmp/other"),
         })
@@ -900,6 +915,7 @@ mod tests {
             writable: Vec::new(),
             temp_dir: root.join(".task"),
             generated: Vec::new(),
+            referenced: Vec::new(),
             system_tmp: apart.clone(),
             private_tmp: root.join(".task/tmp/none"),
         })
@@ -917,6 +933,7 @@ mod tests {
             writable: Vec::new(),
             temp_dir: root.join(".task"),
             generated: Vec::new(),
+            referenced: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: private_tmp.to_path_buf(),
         })
@@ -942,6 +959,31 @@ mod tests {
         assert!(p.allows(&root.join("src/config.h"), READ_FILE));
         assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
         assert!(p.warnings[0].contains("holds sources too"));
+    }
+
+    #[test]
+    fn a_referenced_directory_holding_sources_is_not_reported() {
+        let (_d, root) = tree(&["po/fr.po", "po/de.po", "src/a.c"]);
+        let input = |generated: Vec<(String, PathBuf)>| PolicyInput {
+            task: "t",
+            root: &root,
+            readable: vec![root.join("po/fr.po"), root.join("src/a.c")],
+            writable: Vec::new(),
+            temp_dir: root.join(".task"),
+            generated,
+            referenced: vec![("i18n".to_string(), root.join("po"))],
+            system_tmp: std::env::temp_dir(),
+            private_tmp: root.join(".task/tmp"),
+        };
+        let p = Policy::build(input(Vec::new())).unwrap();
+        assert!(p.allows(&root.join("po/fr.mo"), MAKE_REG | WRITE_FILE));
+        assert!(p.allows(&root.join("po/de.po"), READ_FILE));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        drop(p);
+        // The task's own generates there still are.
+        let p = Policy::build(input(vec![("own".to_string(), root.join("po"))])).unwrap();
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        assert!(p.warnings[0].starts_with("own makes"), "{:?}", p.warnings);
     }
 
     #[test]

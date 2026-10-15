@@ -762,18 +762,20 @@ fn writes_naming_a_task_follow_its_vars() {
 }
 
 #[test]
-fn writes_naming_a_task_warn_about_a_directory_holding_sources() {
+fn writes_naming_a_task_do_not_warn_about_a_directory_holding_sources() {
     for mode in ENFORCING.into_iter().filter(|m| available(m)) {
         let dir = stage("sandbox");
         let r = run_with_env(&dir, &["writes-next-to-sources"], &[("TASK_SANDBOX", mode)]);
         assert!(r.ok(), "{mode}: {}", r.combined());
-        let src = std::fs::canonicalize(&dir).unwrap().join("src");
-        let want = format!(
-            "sandbox: \"writes-next-to-sources\": sandbox.writes {{task: gen-in-src}}: generates \
-             \"src/gen.txt\" makes {} writable, which holds sources too",
-            src.display()
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/gen.txt")).unwrap(),
+            "gen\n"
         );
-        assert!(r.combined().contains(&want), "{mode}: {}", r.combined());
+        assert!(
+            !r.combined().contains("sandbox:"),
+            "{mode}: {}",
+            r.combined()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

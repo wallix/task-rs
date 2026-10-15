@@ -974,7 +974,10 @@ The sandbox also covers the tasks the commands call, through `task:` in `cmds`
 or a nested `task` process (a script running `task rust:build`). Those write
 their own `generates`, so a `writes` entry can name a task: `{task: X}`, with
 optional `vars` as a dependency call, makes the directories X's `generates`
-write in writable, as they are for X itself. A pattern writes in its part
+write in writable, as they are for X itself. Reads inside them are not
+restricted either, but one that also holds sources draws no warning (a
+translation catalog compiled next to its `.po` file): where X writes is X's to
+change, and a sandboxed X warns about its own `generates`. A pattern writes in its part
 before the first wildcard (`target/**/*` in `target/`), a plain file path in
 its directory (`bin/app` in `bin/`). The name resolves like a `task:` entry of
 `sources`, through X's own `from:` and `task:` generates entries; an unknown
