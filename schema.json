@@ -704,7 +704,28 @@
           "description": "Include generates from other tasks. Use \"deps\" to inherit from direct dependencies, or \"cmds\" to inherit from cmd task-calls.",
           "type": "string",
           "enum": ["deps", "cmds"]
+        },
+        "task": {
+          "description": "Include the same field (sources or generates) of this task, which need not be a dependency or be called. Takes no other key than 'vars'.",
+          "type": "string"
+        },
+        "vars": {
+          "description": "Variables the 'task' entry is compiled with, as in a dependency call",
+          "$ref": "#/definitions/vars"
         }
+      },
+      "dependencies": {
+        "task": {
+          "not": {
+            "anyOf": [
+              { "required": ["glob"] },
+              { "required": ["exclude"] },
+              { "required": ["fingerprint"] },
+              { "required": ["from"] }
+            ]
+          }
+        },
+        "vars": ["task"]
       },
       "additionalProperties": false
     },

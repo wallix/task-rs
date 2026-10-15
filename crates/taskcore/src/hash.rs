@@ -207,8 +207,8 @@ fn encode_task(enc: &mut Encoder, t: &ast::Task) -> Result<(), HashError> {
     enc.str(&t.summary);
     encode_requires(enc, t.requires.as_ref());
     encode_str_slice(enc, &t.aliases);
-    encode_globs(enc, &t.sources);
-    encode_globs(enc, &t.generates);
+    encode_globs(enc, &t.sources)?;
+    encode_globs(enc, &t.generates)?;
     encode_cache(enc, t.cache.as_ref());
     encode_preconditions(enc, &t.preconditions);
     encode_str_slice(enc, &t.dirs);
@@ -310,14 +310,25 @@ fn encode_matrix(enc: &mut Encoder, matrix: Option<&ast::Matrix>) -> Result<(), 
     Ok(())
 }
 
-fn encode_globs(enc: &mut Encoder, globs: &[ast::Glob]) {
+fn encode_globs(enc: &mut Encoder, globs: &[ast::Glob]) -> Result<(), HashError> {
     enc.len(globs.len());
     for g in globs {
         enc.str(&g.glob);
         enc.bool(g.negate);
         enc.str(&g.fingerprint);
-        enc.str(&g.from);
+        if g.task.is_empty() {
+            enc.str(&g.from);
+        } else {
+            // In the `from` slot, so that the encoding of other entries, and
+            // with it every existing hash, is unchanged. No valid `from` holds
+            // a NUL.
+            enc.str("\0task");
+            enc.str(&g.task);
+            // No `vars:` and `vars: {}` compile alike.
+            encode_vars_flat(enc, g.vars.as_ref())?;
+        }
     }
+    Ok(())
 }
 
 fn encode_platforms(enc: &mut Encoder, platforms: &[ast::Platform]) {
@@ -625,6 +636,50 @@ mod tests {
             ..Default::default()
         }];
         assert_ne!(hash(&base).unwrap(), hash(&mutated).unwrap());
+    }
+
+    #[test]
+    fn hash_changes_with_task_reference() {
+        let base = sample_task();
+        let mut referenced = base.clone();
+        referenced.sources.push(ast::Glob {
+            task: "lib".to_string(),
+            ..Default::default()
+        });
+        let mut with_vars = base.clone();
+        with_vars.sources.push(ast::Glob {
+            task: "lib".to_string(),
+            vars: Some(Vars::from_elements([VarElement {
+                key: "X".to_string(),
+                value: Var {
+                    value: Some(Value::String("1".to_string())),
+                    ..Default::default()
+                },
+            }])),
+            ..Default::default()
+        });
+        let mut empty = base.clone();
+        empty.sources.push(ast::Glob::default());
+        let hashes = [&base, &referenced, &with_vars, &empty].map(|t| hash(t).unwrap());
+        for (i, a) in hashes.iter().enumerate() {
+            for b in hashes.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn hash_task_reference_empty_vars_like_none() {
+        let mut none = sample_task();
+        none.sources.push(ast::Glob {
+            task: "lib".to_string(),
+            ..Default::default()
+        });
+        let mut empty = none.clone();
+        if let Some(g) = empty.sources.last_mut() {
+            g.vars = Some(Vars::new());
+        }
+        assert_eq!(hash(&none).unwrap(), hash(&empty).unwrap());
     }
 
     #[test]

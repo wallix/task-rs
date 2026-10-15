@@ -349,8 +349,8 @@ impl Cache {
         list.iter().map(|s| self.replace(s)).collect()
     }
 
-    /// Renders the glob and fingerprint patterns of each entry, preserving the
-    /// other fields. Returns an empty list on a prior error or empty input.
+    /// Renders each entry's glob, fingerprint, task name and vars, preserving
+    /// the other fields. Returns an empty list on a prior error or empty input.
     pub fn replace_globs(&mut self, globs: &[Glob]) -> Vec<Glob> {
         if self.err.is_some() || globs.is_empty() {
             return Vec::new();
@@ -362,6 +362,8 @@ impl Cache {
                 negate: g.negate,
                 fingerprint: self.replace(&g.fingerprint),
                 from: g.from.clone(),
+                task: self.replace(&g.task),
+                vars: g.vars.as_ref().and_then(|v| self.replace_vars(v)),
             })
             .collect()
     }
@@ -3005,6 +3007,7 @@ mod tests {
             negate: true,
             fingerprint: "{{.DIR}}/.stamp".to_string(),
             from: "deps".to_string(),
+            ..Default::default()
         }];
         let out = c.replace_globs(&globs);
         assert_eq!(out.len(), 1);

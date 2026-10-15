@@ -193,6 +193,269 @@ fn from_invalid_value() {
     );
 }
 
+/// `task:` in sources folds in the sources of a task that is neither a dep nor
+/// called, resolved against that task's dir, without running it.
+#[test]
+fn task_reference_in_sources() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  test:\n    sources:\n      - task: build\n      - test.txt\n    cmds:\n      - cat sub/input.txt test.txt > result.txt\n\n  build:\n    dir: sub\n    sources:\n      - input.txt\n    generates:\n      - output.txt\n    cmds:\n      - cp input.txt output.txt\n",
+    );
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    write(&dir.join("sub"), "input.txt", "data\n");
+    write(&dir, "test.txt", "test\n");
+
+    assert!(run(&dir, &["test"]).ok());
+    assert!(dir.join("result.txt").exists());
+    assert!(!dir.join("sub/output.txt").exists(), "build must not run");
+
+    let second = run(&dir, &["test"]);
+    assert!(
+        second.combined().contains("up to date"),
+        "got: {}",
+        second.combined()
+    );
+
+    write(&dir.join("sub"), "input.txt", "changed\n");
+    let third = run(&dir, &["test"]);
+    assert!(
+        !third.combined().contains("up to date"),
+        "test should re-run after build's source changed, got: {}",
+        third.combined()
+    );
+}
+
+/// A `task:` reference passes its `vars`, templated in the referencing task.
+#[test]
+fn task_reference_with_vars() {
+    let dir = scratch(
+        "version: '3'\nvars:\n  T: linux\ntasks:\n  test:\n    sources:\n      - task: build\n        vars:\n          TARGET: '{{.T}}'\n    cmds:\n      - 'true'\n\n  build:\n    sources:\n      - '{{.TARGET}}.txt'\n    cmds:\n      - 'true'\n",
+    );
+    write(&dir, "linux.txt", "x\n");
+    let status = run(&dir, &["--status", "test"]).combined();
+    assert!(
+        status.contains(&status_file(&dir.join("linux.txt"))),
+        "got:\n{status}"
+    );
+}
+
+/// The `file:` line `--status` prints for `path`, which must exist.
+fn status_file(path: &Path) -> String {
+    format!("file: {}", path.display())
+}
+
+/// In an included Taskfile, a `task:` reference names a task of the same
+/// include (by name or alias), or of the root with a leading `:`, like `deps`.
+#[test]
+fn task_reference_in_include_is_namespaced() {
+    let dir = scratch(
+        "version: '3'\nincludes:\n  lib:\n    taskfile: lib\n    dir: lib\ntasks:\n  root-task:\n    sources:\n      - root.txt\n    cmds:\n      - 'true'\n",
+    );
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    write(
+        &dir.join("lib"),
+        "Taskfile.yml",
+        "version: '3'\ntasks:\n  test:\n    sources:\n      - task: build\n    cmds:\n      - 'true'\n\n  test-alias:\n    sources:\n      - task: b\n    cmds:\n      - 'true'\n\n  test-root:\n    sources:\n      - task: ':root-task'\n    cmds:\n      - 'true'\n\n  build:\n    aliases: [b]\n    sources:\n      - input.txt\n    cmds:\n      - 'true'\n",
+    );
+    write(&dir.join("lib"), "input.txt", "x\n");
+    write(&dir, "root.txt", "x\n");
+    let lib_input = status_file(&dir.join("lib/input.txt"));
+    for task in ["lib:test", "lib:test-alias"] {
+        let status = run(&dir, &["--status", task]).combined();
+        assert!(status.contains(&lib_input), "{task}:\n{status}");
+    }
+    let status = run(&dir, &["--status", "lib:test-root"]).combined();
+    assert!(
+        status.contains(&status_file(&dir.join("root.txt"))),
+        "got:\n{status}"
+    );
+}
+
+/// A `task:` reference to an unknown task names the referrer and field, and
+/// exits with the task-not-found code; so does a `from: deps` on a missing dep.
+#[test]
+fn task_reference_to_unknown_task() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  test:\n    sources:\n      - task: missing\n    cmds:\n      - echo hello\n\n  wrapper:\n    deps: [missing]\n    generates:\n      - from: deps\n\n  outer:\n    sources:\n      - task: test\n\n  caller:\n    deps: [test]\n",
+    );
+    for (task, want, code) in [
+        (
+            "test",
+            "task: test: sources: task \"missing\" does not exist\n",
+            200,
+        ),
+        (
+            "wrapper",
+            "task: wrapper: generates: task \"missing\" does not exist\n",
+            200,
+        ),
+        // The innermost referrer is named.
+        (
+            "outer",
+            "task: test: sources: task \"missing\" does not exist\n",
+            200,
+        ),
+        // Under a running task, wrapped like a missing dep.
+        (
+            "caller",
+            "task: Failed to run task \"caller\": task: test: sources: task \"missing\" does not exist\n",
+            201,
+        ),
+    ] {
+        let out = run(&dir, &[task]);
+        assert_eq!(out.stderr, want, "{task}");
+        assert_eq!(out.code, code, "{task}");
+    }
+}
+
+/// A `task:` name that renders empty is an error, not a glob of the task dir.
+#[test]
+fn task_reference_empty_name() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  test:\n    sources:\n      - task: '{{.X}}'\n    cmds:\n      - echo hello\n",
+    );
+    let out = run(&dir, &["test"]);
+    assert_eq!(
+        out.stderr,
+        "task: test: sources: `task: {{.X}}` rendered to an empty task name\n"
+    );
+    assert_eq!(out.code, 1);
+}
+
+/// References that reach their own task fail as a cyclic dependency.
+#[test]
+fn task_reference_cycle() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  self:\n    sources:\n      - task: self\n    cmds:\n      - 'true'\n\n  a:\n    sources:\n      - task: b\n    cmds:\n      - 'true'\n\n  b:\n    sources:\n      - task: a\n    cmds:\n      - 'true'\n",
+    );
+    for (task, want) in [
+        ("self", "task: Cyclic dependency detected: self -> self\n"),
+        ("a", "task: Cyclic dependency detected: a -> b -> a\n"),
+    ] {
+        let out = run(&dir, &[task]);
+        assert_eq!(out.stderr, want, "{task}");
+        assert_eq!(out.code, 204, "{task}");
+    }
+}
+
+/// References are followed transitively, each against its own task's dir.
+#[test]
+fn task_reference_transitive() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  a:\n    sources:\n      - task: b\n    cmds:\n      - 'true'\n\n  b:\n    sources:\n      - task: c\n      - b.txt\n\n  c:\n    dir: cdir\n    sources:\n      - c.txt\n",
+    );
+    std::fs::create_dir_all(dir.join("cdir")).unwrap();
+    write(&dir, "b.txt", "b\n");
+    write(&dir.join("cdir"), "c.txt", "c\n");
+
+    let status = run(&dir, &["--status", "a"]).combined();
+    for f in [dir.join("b.txt"), dir.join("cdir/c.txt")] {
+        assert!(status.contains(&status_file(&f)), "got:\n{status}");
+    }
+
+    assert!(run(&dir, &["a"]).ok());
+    let second = run(&dir, &["a"]);
+    assert!(
+        second.combined().contains("up to date"),
+        "got: {}",
+        second.combined()
+    );
+    write(&dir.join("cdir"), "c.txt", "changed\n");
+    let third = run(&dir, &["a"]);
+    assert!(
+        !third.combined().contains("up to date"),
+        "a should re-run after c's source changed, got: {}",
+        third.combined()
+    );
+}
+
+/// A `task:` reference in `generates` folds in that task's generates.
+#[test]
+fn task_reference_in_generates() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  pkg:\n    sources:\n      - pkg.txt\n    generates:\n      - task: build\n    cmds:\n      - 'true'\n\n  build:\n    dir: sub\n    generates:\n      - out.bin\n",
+    );
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    write(&dir, "pkg.txt", "p\n");
+    write(&dir.join("sub"), "out.bin", "o\n");
+    let status = run(&dir, &["--status", "pkg"]).combined();
+    let (_, generates) = status.split_once("generates:").unwrap();
+    assert!(
+        generates.contains(&status_file(&dir.join("sub/out.bin"))),
+        "got:\n{status}"
+    );
+}
+
+/// An `exclude:` after a `task:` entry removes files the reference folded in.
+#[test]
+fn task_reference_then_exclude() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  test:\n    sources:\n      - task: build\n      - exclude: sub/skip.txt\n    cmds:\n      - 'true'\n\n  build:\n    dir: sub\n    sources:\n      - '*.txt'\n",
+    );
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    write(&dir.join("sub"), "keep.txt", "k\n");
+    write(&dir.join("sub"), "skip.txt", "s\n");
+    let status = run(&dir, &["--status", "test"]).combined();
+    assert!(
+        status.contains(&status_file(&dir.join("sub/keep.txt"))),
+        "got:\n{status}"
+    );
+    assert!(
+        !status.contains(&status_file(&dir.join("sub/skip.txt"))),
+        "got:\n{status}"
+    );
+}
+
+/// A dynamic (`sh:`) var passed through a reference's `vars` reaches the
+/// referenced task's sources.
+#[test]
+fn task_reference_with_sh_var() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  test:\n    sources:\n      - task: build\n        vars:\n          TARGET:\n            sh: echo linux\n    cmds:\n      - 'true'\n\n  build:\n    sources:\n      - '{{.TARGET}}.txt'\n",
+    );
+    write(&dir, "linux.txt", "x\n");
+    let status = run(&dir, &["--status", "test"]).combined();
+    assert!(
+        status.contains(&status_file(&dir.join("linux.txt"))),
+        "got:\n{status}"
+    );
+}
+
+/// A `task:` name, or a dep name read by `from: deps`, templated from a
+/// task-level `sh:` var resolves when the task runs and under `--summary`,
+/// whose fast compile does not run `sh:`.
+#[test]
+fn task_reference_name_from_sh_var() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  plain:\n    vars:\n      T:\n        sh: echo build-x\n    sources:\n      - task: '{{.T}}'\n    cmds:\n      - echo ran\n\n  prefixed:\n    vars:\n      T:\n        sh: echo x\n    sources:\n      - task: 'build-{{.T}}'\n    cmds:\n      - echo ran\n\n  wrapper:\n    vars:\n      T:\n        sh: echo x\n    deps:\n      - task: 'build-{{.T}}'\n    sources:\n      - from: deps\n    cmds:\n      - echo ran\n\n  build-x:\n    sources:\n      - b.txt\n",
+    );
+    write(&dir, "b.txt", "b\n");
+    let b = status_file(&dir.join("b.txt"));
+    for task in ["plain", "prefixed", "wrapper"] {
+        let out = run(&dir, &[task]);
+        assert!(out.ok(), "{task}: {}", out.combined());
+        let status = run(&dir, &["--status", task]).combined();
+        assert!(status.contains(&b), "{task}:\n{status}");
+        let summary = run(&dir, &["--summary", task]);
+        assert!(summary.ok(), "{task}: {}", summary.combined());
+    }
+}
+
+/// A `task:` reference in `sandbox.reads` is rejected rather than ignored.
+#[test]
+fn task_reference_in_sandbox_reads() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  test:\n    sandbox:\n      reads:\n        - task: build\n    cmds:\n      - 'true'\n\n  build:\n    cmds:\n      - 'true'\n",
+    );
+    let out = run(&dir, &["test"]);
+    assert!(!out.ok(), "expected error, got success: {}", out.combined());
+    assert!(
+        out.combined()
+            .contains("does not support `from:` or `task:`"),
+        "got: {}",
+        out.combined()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Included-taskfile var merging
 // ---------------------------------------------------------------------------

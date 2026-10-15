@@ -24,6 +24,18 @@ tasks:
     cmds:
       - cat src/b.txt
 
+  sources-of-another-task:
+    sources:
+      - task: secret-reader
+    sandbox: true
+    cmds:
+      - cat secret/key
+
+  secret-reader:
+    sources: [secret/**]
+    cmds:
+      - cat secret/key
+
   read-outside-sources:
     sources: [src/**]
     sandbox: true

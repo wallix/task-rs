@@ -238,6 +238,11 @@ impl Reader {
                         v.set_dialect(dialect);
                     }
                 }
+                for g in task.sources.iter_mut().chain(task.generates.iter_mut()) {
+                    if let Some(v) = &mut g.vars {
+                        v.set_dialect(dialect);
+                    }
+                }
                 let loc = task.location.get_or_insert_with(ast::Location::default);
                 if loc.taskfile.is_empty() {
                     loc.taskfile = location.clone();

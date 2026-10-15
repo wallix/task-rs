@@ -204,6 +204,14 @@ impl ExecutorError {
             Self::Merge(_) => 107,
             Self::VersionCheck { .. } => 105,
             Self::TaskNotFound { .. } => 200,
+            Self::Compile(e)
+                if matches!(
+                    **e,
+                    CompileError::TaskNotFound { .. } | CompileError::ReferencedTaskNotFound { .. }
+                ) =>
+            {
+                200
+            }
             Self::TaskRun { .. } | Self::Exec(_) | Self::SandboxDenied { .. } => 201,
             Self::TaskInternal { .. } => 202,
             Self::TaskNameConflict { .. } => 203,

@@ -12,7 +12,7 @@ use crate::yaml::Value;
 /// `sandbox: true` restricts the task's commands to its `sources` inside the
 /// root directory; a mapping does the same and widens it with `reads` and
 /// `writes`. `sandbox: false` (or no key) leaves the task unrestricted.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Sandbox {
     /// Files the commands may read without them being fingerprinted, in the
     /// `sources` glob syntax (e.g. `.git/**`).
@@ -42,12 +42,12 @@ impl Sandbox {
                 }
                 let raw: Raw = crate::yaml::from_value(value)
                     .map_err(|e| E::custom(TaskfileDecodeError::wrap(e)))?;
-                // `from:` is resolved for sources and generates only: here it
-                // would silently grant nothing.
-                if raw.reads.iter().any(|g| !g.from.is_empty()) {
+                // `from:` and `task:` are resolved for sources and generates
+                // only: here they would silently grant nothing.
+                if raw.reads.iter().any(Glob::is_reference) {
                     return Err(E::custom(TaskfileDecodeError::message(
-                        "sandbox.reads does not support `from:`; list the files, or add them to \
-                         sources",
+                        "sandbox.reads does not support `from:` or `task:`; list the files, or \
+                         add them to sources",
                     )));
                 }
                 Ok(Some(Self {

@@ -128,6 +128,12 @@ impl Tasks {
                         dep.task = task_name_with_namespace(&dep.task, &include.namespace);
                     }
                 }
+                // Namespace the task references in sources and generates.
+                for g in task.sources.iter_mut().chain(task.generates.iter_mut()) {
+                    if !g.task.is_empty() {
+                        g.task = task_name_with_namespace(&g.task, &include.namespace);
+                    }
+                }
                 // Namespace the task's command calls.
                 for cmd in &mut task.cmds {
                     if !cmd.task.is_empty() {

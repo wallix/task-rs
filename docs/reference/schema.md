@@ -569,6 +569,9 @@ tasks:
       - go build ./...
 ```
 
+An entry can also copy another task's sources with `from:` or `task:`; see
+[`cache`](#cache).
+
 #### `generates`
 
 - **Type**: `[]string` or `[]Glob`
@@ -584,6 +587,9 @@ tasks:
     cmds:
       - go build -o app ./cmd
 ```
+
+An entry can also copy another task's generates with `from:` or `task:`; see
+[`cache`](#cache).
 
 When collecting generated files for a cache archive, wildcards include hidden
 entries such as `node_modules/.bin`. Recursive patterns such as
@@ -843,6 +849,42 @@ tasks:
       - task: build
 ```
 
+A `task:` entry copies the same field of one named task, which need not be a
+dependency or be called. It takes optional `vars`, as a dependency call does,
+and nothing else. The referenced task does not run. Use it to keep a task that
+reads another task's inputs (tests, linters, packaging) in step with that
+task's `sources`, which `sandbox` otherwise reports as soon as they drift:
+
+```yaml
+tasks:
+  build:
+    sources: ["src/**/*.go", go.mod, go.sum]
+    cmds:
+      - go build ./...
+
+  test:
+    sources:
+      - task: build
+      - "tests/**/*.go"
+    sandbox: true
+    cmds:
+      - go test ./...
+```
+
+In an included Taskfile, the name resolves like a `deps` entry: within the
+include, or from the root with a leading `:`. A name that does not exist, or
+that renders empty, is an error. References are followed through the
+referenced task's own `from:` and `task:` entries; a cycle between them fails
+with `Cyclic dependency detected`.
+
+Entries folded in by `from:` or `task:` count for the up-to-date check and the
+cache, but two things in `cmds` see only the task's own entries:
+
+- `for: sources` and `for: generates` iterate the task's own entries; the
+  folded-in ones are left out.
+- `{{.CHECKSUM}}` hashes the task's own sources, so it does not change when a
+  folded-in file does. The cache block's `{{.CHECKSUM}}` does cover them.
+
 #### `sandbox`
 
 - **Type**: `bool | object`
@@ -854,10 +896,10 @@ tasks:
   cache entry. Outside the root directory nothing is restricted, except in the
   directories above it (see below). Linux only.
 
-| Field    | Type       | Description                                                                      |
-| -------- | ---------- | -------------------------------------------------------------------------------- |
-| `reads`  | `[]glob`   | Files the commands may also read, not fingerprinted (e.g. `.git/**`); no `from:` |
-| `writes` | `[]string` | Directories the commands may change freely, relative to the task directory       |
+| Field    | Type       | Description                                                                                 |
+| -------- | ---------- | ------------------------------------------------------------------------------------------- |
+| `reads`  | `[]glob`   | Files the commands may also read, not fingerprinted (e.g. `.git/**`); no `from:` or `task:` |
+| `writes` | `[]string` | Directories the commands may change freely, relative to the task directory                  |
 
 What a command can change inside the root directory:
 

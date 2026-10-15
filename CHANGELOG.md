@@ -14,6 +14,13 @@
   recovered from or ignored, and an enforced sandbox runs a command's `if` under
   the supervisor (without the supervisor, unsandboxed with a warning).
   `TASK_SANDBOX=audit` lists every undeclared access without failing.
+- **`sources` and `generates` can copy another task's entries.** A
+  `- task: <name>` entry, with optional `vars`, folds in that task's `sources`
+  (or `generates`) without it being a dependency or running, so a test or lint
+  task stays in step with the build task whose inputs it reads, including
+  under `sandbox`. An unknown task name in a `task:` or `from:` entry now fails
+  the run or `--status` with exit code 200, naming the referring task and
+  field.
 - **Taskfiles are parsed with a memory-safe YAML parser.** Checksums and the
   positions of decode errors are unchanged; YAML syntax errors are worded and
   sometimes positioned differently (an unclosed `[`, `{` or quote is reported

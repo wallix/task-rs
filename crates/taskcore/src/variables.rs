@@ -72,6 +72,32 @@ pub enum CompileError {
     Glob(String),
     /// Compiling a task referenced by a `from:` clause failed.
     FromTask(String),
+    /// The resolver found no task by the name a `from:` or `task:` entry
+    /// references. [`resolve_globs_from`] replaces it with
+    /// [`Self::ReferencedTaskNotFound`], which names the referrer.
+    TaskNotFound {
+        /// The referenced task name.
+        name: String,
+    },
+    /// A `from:` or `task:` entry in sources/generates references a task that
+    /// does not exist.
+    ReferencedTaskNotFound {
+        /// The task whose entry it is.
+        task: String,
+        /// The field (`sources` or `generates`).
+        field: String,
+        /// The referenced task name.
+        name: String,
+    },
+    /// A `task:` entry in sources/generates rendered to an empty name.
+    EmptyTaskReference {
+        /// The task whose entry it is.
+        task: String,
+        /// The field (`sources` or `generates`).
+        field: String,
+        /// The unrendered `task:` value.
+        template: String,
+    },
     /// Tasks referenced by `from:` clauses compile each other in a cycle.
     Cycle {
         /// The dependency path, outermost task first, ending with the repeat.
@@ -124,6 +150,18 @@ impl std::fmt::Display for CompileError {
             ),
             Self::Glob(message) => write!(f, "task: glob expansion failed: {message}"),
             Self::FromTask(message) => write!(f, "{message}"),
+            Self::TaskNotFound { name } => write!(f, "task: Task {name:?} does not exist"),
+            Self::ReferencedTaskNotFound { task, field, name } => {
+                write!(f, "task: {task}: {field}: task {name:?} does not exist")
+            }
+            Self::EmptyTaskReference {
+                task,
+                field,
+                template,
+            } => write!(
+                f,
+                "task: {task}: {field}: `task: {template}` rendered to an empty task name"
+            ),
             Self::Cycle { path } => {
                 write!(f, "task: Cyclic dependency detected: {}", path.join(" -> "))
             }
@@ -416,9 +454,17 @@ pub async fn compiled_task(
         &mut cache,
     )?;
 
-    // Expand `from:` entries in sources/generates via the resolver, recomputing
-    // the checksum if sources were extended.
-    if let Some(resolver) = resolver {
+    // Expand `from:` and `task:` entries in sources/generates via the resolver,
+    // recomputing the checksum if sources were extended. Not without `sh:`
+    // vars: a name templated from one renders empty, and no fast-compile
+    // consumer (platforms, requires, deps, prompt, summary) reads the globs.
+    if evaluate_sh_vars {
+        // A `task:` name that renders empty would otherwise read as a plain
+        // glob matching the task dir.
+        check_task_references(&new, GlobField::Sources, &orig_task.sources)?;
+        check_task_references(&new, GlobField::Generates, &orig_task.generates)?;
+    }
+    if let Some(resolver) = resolver.filter(|_| evaluate_sh_vars) {
         resolve_globs_from(&mut new, GlobField::Sources, resolver).await?;
         resolve_globs_from(&mut new, GlobField::Generates, resolver).await?;
         if has_from_entries(&orig_task.sources) && !new.sources.is_empty() {
@@ -609,9 +655,10 @@ fn compute_full_name(orig_task: &Task, vars: &Vars) -> String {
     full_name
 }
 
-/// Reports whether any glob in the slice carries a `from:` directive.
+/// Reports whether any glob in the slice carries a `from:` or `task:`
+/// reference.
 fn has_from_entries(globs: &[Glob]) -> bool {
-    globs.iter().any(|g| !g.from.is_empty())
+    globs.iter().any(Glob::is_reference)
 }
 
 /// Selects which glob list of a task `resolve_globs_from` operates on.
@@ -630,9 +677,9 @@ impl GlobField {
     }
 }
 
-/// Expands `from: deps` / `from: cmds` entries of a task's sources or generates
-/// into the same field of the referenced tasks, made absolute against each
-/// child's directory. Ports Go `resolveGlobsFrom`.
+/// Expands `from: deps` / `from: cmds` / `task:` entries of a task's sources or
+/// generates into the same field of the referenced tasks, made absolute against
+/// each child's directory. Ports Go `resolveGlobsFrom`, plus `task:`.
 async fn resolve_globs_from(
     task: &mut Task,
     field: GlobField,
@@ -650,12 +697,15 @@ async fn resolve_globs_from(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for g in &globs {
-        if g.from.is_empty() {
+        if !g.is_reference() {
             dedup_add(g.clone(), &mut resolved, &mut seen);
             continue;
         }
         // The tasks whose same field is folded in, as (name, vars) pairs.
         let calls: Vec<(String, Vars)> = match g.from.as_str() {
+            _ if !g.task.is_empty() => {
+                vec![(g.task.clone(), g.vars.clone().unwrap_or_default())]
+            }
             "deps" => task
                 .deps
                 .iter()
@@ -676,7 +726,17 @@ async fn resolve_globs_from(
             }
         };
         for (name, vars) in calls {
-            let ct = resolver.compiled_task_for_globs(&name, &vars).await?;
+            let ct = resolver
+                .compiled_task_for_globs(&name, &vars)
+                .await
+                .map_err(|e| match e {
+                    CompileError::TaskNotFound { name } => CompileError::ReferencedTaskNotFound {
+                        task: task.name().to_string(),
+                        field: field.name().to_string(),
+                        name,
+                    },
+                    other => other,
+                })?;
             // Make each child glob absolute against the child's dir, so it
             // resolves correctly when the parent (possibly a different dir)
             // computes checksums.
@@ -686,7 +746,7 @@ async fn resolve_globs_from(
                 GlobField::Generates => &ct.generates,
             };
             for cg in child_globs {
-                if !cg.from.is_empty() {
+                if cg.is_reference() {
                     continue;
                 }
                 let mut abs = Glob {
@@ -711,6 +771,27 @@ async fn resolve_globs_from(
         GlobField::Generates => task.generates = resolved,
     }
     Ok(())
+}
+
+/// Rejects task names that render empty. `replace_globs` preserves entry
+/// order, so `orig` and the rendered field correspond entry for entry.
+fn check_task_references(task: &Task, field: GlobField, orig: &[Glob]) -> Result<(), CompileError> {
+    let rendered = match field {
+        GlobField::Sources => &task.sources,
+        GlobField::Generates => &task.generates,
+    };
+    match orig
+        .iter()
+        .zip(rendered)
+        .find(|(o, r)| !o.task.is_empty() && r.task.is_empty())
+    {
+        Some((o, _)) => Err(CompileError::EmptyTaskReference {
+            task: task.name().to_string(),
+            field: field.name().to_string(),
+            template: o.task.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Appends `g` to `resolved` unless an equal glob (same pattern, negation, and

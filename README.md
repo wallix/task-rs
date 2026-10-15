@@ -248,7 +248,10 @@ tasks:
       - from: deps
 ```
 
-Use `from: cmds` instead when the related tasks are invoked through `cmds`.
+Use `from: cmds` instead when the related tasks are invoked through `cmds`,
+and `- task: <name>` (with optional `vars`) to copy the entries of one task
+that is neither a dependency nor called, such as a test task reusing its build
+task's sources.
 Literal globs and inherited entries can be combined, and duplicates are removed
 automatically.
 
@@ -303,7 +306,8 @@ v3 are intentional.
 - Unconditional, sequential `setup` tasks.
 - File and OCI build-cache backends with local or distributed locking.
 - Representative fingerprint files for large `sources` or `generates` globs.
-- `from: deps` and `from: cmds` inheritance for sources and generated files.
+- `from: deps`, `from: cmds` and `task:` inheritance for sources and generated
+  files.
 - `--status`, `--export-cache`, `--import-cache`, and self-update commands.
 - Native Jinja templating and an automated migration path from Go templates.
 - Duplicate YAML task keys are errors instead of last-definition-wins.

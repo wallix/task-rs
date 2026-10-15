@@ -896,6 +896,10 @@ the tasks the commands call with `task:`. It does not apply to the sandboxed
 task's own `deps`. Linux only. See [`sandbox`](reference/schema.md#sandbox)
 for `reads` and `writes`.
 
+A task that reads another task's inputs can list `- task: <name>` in its
+`sources` to copy that task's sources instead of repeating them; see
+[`cache`](reference/schema.md#cache).
+
 To find every undeclared input in one run, report the accesses without denying
 them. An up-to-date task or remote cache hit runs no commands, so the sandbox
 checks nothing. Use `--force-all` to bypass both for every task in the graph,

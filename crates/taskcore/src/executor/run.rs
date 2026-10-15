@@ -2004,6 +2004,21 @@ impl crate::variables::TaskResolver for GlobResolver<'_> {
                     ExecutorError::CyclicDependency { path } => {
                         crate::variables::CompileError::Cycle { path }
                     }
+                    // Typed, so the referrer can name itself in the message
+                    // and the process exits with the task-not-found code.
+                    ExecutorError::TaskNotFound { task_name, .. } => {
+                        crate::variables::CompileError::TaskNotFound { name: task_name }
+                    }
+                    // A reference deeper down that names no task: kept as is,
+                    // naming the innermost referrer.
+                    ExecutorError::Compile(e)
+                        if matches!(
+                            *e,
+                            crate::variables::CompileError::ReferencedTaskNotFound { .. }
+                        ) =>
+                    {
+                        *e
+                    }
                     other => crate::variables::CompileError::FromTask(other.to_string()),
                 })
         })

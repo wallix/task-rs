@@ -4,23 +4,38 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer};
 
 use super::error::TaskfileDecodeError;
+use super::vars::Vars;
 use crate::yaml::Value;
 
-/// A file pattern. It accepts four YAML shapes:
+/// A file pattern. It accepts five YAML shapes:
 ///
 /// - scalar: a plain glob pattern (`"src/**/*.go"`).
 /// - `exclude:` a negated pattern.
 /// - `glob:` + optional `fingerprint:`: the glob defines the file set while
 ///   `fingerprint` names a single representative file to hash instead.
-/// - `from:` references generates from other tasks (e.g. `deps`, `cmds`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// - `from:` references the same field of other tasks (`deps`, `cmds`).
+/// - `task:` + optional `vars:` references the same field of one named task,
+///   called or not.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Glob {
     pub glob: String,
     pub negate: bool,
     /// When set, only this file is hashed for up-to-date checks.
     pub fingerprint: String,
-    /// When set, references generates from other tasks (e.g. `deps`).
+    /// When set, references the same field of other tasks (e.g. `deps`).
     pub from: String,
+    /// When set, references the same field of this task.
+    pub task: String,
+    /// The variables `task` is compiled with.
+    pub vars: Option<Vars>,
+}
+
+impl Glob {
+    /// Whether the entry references other tasks (`from:` or `task:`) rather
+    /// than matching files itself.
+    pub fn is_reference(&self) -> bool {
+        !self.from.is_empty() || !self.task.is_empty()
+    }
 }
 
 impl<'de> Deserialize<'de> for Glob {
@@ -43,10 +58,32 @@ impl<'de> Deserialize<'de> for Glob {
                     fingerprint: String,
                     #[serde(default)]
                     from: String,
+                    #[serde(default)]
+                    task: String,
+                    vars: Option<Vars>,
                 }
                 let raw: Raw = crate::yaml::from_value(value)
                     .map_err(|e| de::Error::custom(TaskfileDecodeError::wrap(e)))?;
                 let mut g = Glob::default();
+                if !raw.task.is_empty() {
+                    if !(raw.exclude.is_empty()
+                        && raw.glob.is_empty()
+                        && raw.fingerprint.is_empty()
+                        && raw.from.is_empty())
+                    {
+                        return Err(de::Error::custom(TaskfileDecodeError::message(
+                            "a `task:` entry takes only `vars:`",
+                        )));
+                    }
+                    g.task = raw.task;
+                    g.vars = raw.vars;
+                    return Ok(g);
+                }
+                if raw.vars.is_some() {
+                    return Err(de::Error::custom(TaskfileDecodeError::message(
+                        "`vars:` requires `task:`",
+                    )));
+                }
                 if !raw.from.is_empty() {
                     g.from = raw.from;
                     return Ok(g);
@@ -147,5 +184,43 @@ mod tests {
         assert_eq!(globs[2].glob, "vendor/**");
         assert!(globs[2].negate);
         assert!(globs[2].from.is_empty());
+    }
+
+    #[test]
+    fn task_reference() {
+        let g: Glob = crate::yaml::from_str("task: build").unwrap();
+        assert_eq!(g.task, "build");
+        assert!(g.vars.is_none());
+        assert!(g.glob.is_empty());
+        assert!(g.is_reference());
+    }
+
+    #[test]
+    fn task_reference_with_vars() {
+        let g: Glob = crate::yaml::from_str("task: build\nvars:\n  TARGET: linux\n").unwrap();
+        assert_eq!(g.task, "build");
+        assert_eq!(g.vars.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn task_reference_rejects_glob_fields() {
+        for input in [
+            "task: build\nglob: src/**",
+            "task: build\nexclude: src/**",
+            "task: build\nfingerprint: x",
+            "task: build\nfrom: deps",
+        ] {
+            let err = crate::yaml::from_str::<Glob>(input).unwrap_err();
+            assert!(
+                err.to_string().contains("takes only `vars:`"),
+                "{input}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn vars_without_task() {
+        let err = crate::yaml::from_str::<Glob>("glob: src/**\nvars:\n  A: b").unwrap_err();
+        assert!(err.to_string().contains("requires `task:`"), "{err}");
     }
 }

@@ -67,6 +67,20 @@ fn sources_and_outputs_are_allowed() {
 }
 
 #[test]
+fn sources_of_a_referenced_task_are_allowed() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        let dir = stage("sandbox");
+        let r = run_with_env(
+            &dir,
+            &["sources-of-another-task"],
+            &[("TASK_SANDBOX", mode)],
+        );
+        assert!(r.ok(), "{mode}: {}", r.combined());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
 fn a_fingerprinted_glob_allows_every_file_it_matches() {
     for mode in ENFORCING.into_iter().filter(|m| available(m)) {
         let dir = stage("sandbox");
