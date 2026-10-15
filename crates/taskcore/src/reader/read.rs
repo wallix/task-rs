@@ -236,7 +236,7 @@ impl Reader {
                         v.set_dialect(dialect);
                     }
                 }
-                for g in task.sources.iter_mut().chain(task.generates.iter_mut()) {
+                for g in task.glob_entries_mut() {
                     if let Some(v) = &mut g.vars {
                         v.set_dialect(dialect);
                     }

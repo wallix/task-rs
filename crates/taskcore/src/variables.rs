@@ -461,8 +461,8 @@ pub async fn compiled_task(
     if evaluate_sh_vars {
         // A `task:` name that renders empty would otherwise read as a plain
         // glob matching the task dir.
-        check_task_references(&new, GlobField::Sources, &orig_task.sources)?;
-        check_task_references(&new, GlobField::Generates, &orig_task.generates)?;
+        check_task_references(&new, "sources", &orig_task.sources, &new.sources)?;
+        check_task_references(&new, "generates", &orig_task.generates, &new.generates)?;
     }
     if let Some(resolver) = resolver.filter(|_| evaluate_sh_vars) {
         resolve_globs_from(&mut new, GlobField::Sources, resolver).await?;
@@ -726,41 +726,9 @@ async fn resolve_globs_from(
             }
         };
         for (name, vars) in calls {
-            let ct = resolver
-                .compiled_task_for_globs(&name, &vars)
-                .await
-                .map_err(|e| match e {
-                    CompileError::TaskNotFound { name } => CompileError::ReferencedTaskNotFound {
-                        task: task.name().to_string(),
-                        field: field.name().to_string(),
-                        name,
-                    },
-                    other => other,
-                })?;
-            // Make each child glob absolute against the child's dir, so it
-            // resolves correctly when the parent (possibly a different dir)
-            // computes checksums.
-            let child_dir = ct.compute_dir().to_string_lossy().into_owned();
-            let child_globs = match field {
-                GlobField::Sources => &ct.sources,
-                GlobField::Generates => &ct.generates,
-            };
-            for cg in child_globs {
-                if cg.is_reference() {
-                    continue;
-                }
-                let mut abs = Glob {
-                    glob: filepathext::smart_join(&child_dir, &cg.glob)
-                        .to_string_lossy()
-                        .into_owned(),
-                    negate: cg.negate,
-                    ..Default::default()
-                };
-                if !cg.fingerprint.is_empty() {
-                    abs.fingerprint = filepathext::smart_join(&child_dir, &cg.fingerprint)
-                        .to_string_lossy()
-                        .into_owned();
-                }
+            let globs =
+                referenced_globs(task.name(), field.name(), field, &name, &vars, resolver).await?;
+            for abs in globs {
                 dedup_add(abs, &mut resolved, &mut seen);
             }
         }
@@ -773,13 +741,63 @@ async fn resolve_globs_from(
     Ok(())
 }
 
-/// Rejects task names that render empty. `replace_globs` preserves entry
-/// order, so `orig` and the rendered field correspond entry for entry.
-fn check_task_references(task: &Task, field: GlobField, orig: &[Glob]) -> Result<(), CompileError> {
-    let rendered = match field {
-        GlobField::Sources => &task.sources,
-        GlobField::Generates => &task.generates,
+/// Resolves `field` of task `name` with `vars`, including its references.
+/// Globs are absolute against that task's directory so referrers in other
+/// directories resolve them correctly. Errors identify the referring task
+/// and field through `referrer` and `label`.
+async fn referenced_globs(
+    referrer: &str,
+    label: &str,
+    field: GlobField,
+    name: &str,
+    vars: &Vars,
+    resolver: &dyn TaskResolver,
+) -> Result<Vec<Glob>, CompileError> {
+    let ct = resolver
+        .compiled_task_for_globs(name, vars)
+        .await
+        .map_err(|e| match e {
+            CompileError::TaskNotFound { name } => CompileError::ReferencedTaskNotFound {
+                task: referrer.to_string(),
+                field: label.to_string(),
+                name,
+            },
+            other => other,
+        })?;
+    let child_dir = ct.compute_dir().to_string_lossy().into_owned();
+    let child_globs = match field {
+        GlobField::Sources => &ct.sources,
+        GlobField::Generates => &ct.generates,
     };
+    Ok(child_globs
+        .iter()
+        .filter(|cg| !cg.is_reference())
+        .map(|cg| {
+            let mut abs = Glob {
+                glob: filepathext::smart_join(&child_dir, &cg.glob)
+                    .to_string_lossy()
+                    .into_owned(),
+                negate: cg.negate,
+                ..Default::default()
+            };
+            if !cg.fingerprint.is_empty() {
+                abs.fingerprint = filepathext::smart_join(&child_dir, &cg.fingerprint)
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            abs
+        })
+        .collect())
+}
+
+/// Rejects task names that render empty. `replace_globs` preserves entry
+/// order, so `orig` and `rendered` correspond entry for entry.
+fn check_task_references(
+    task: &Task,
+    field: &str,
+    orig: &[Glob],
+    rendered: &[Glob],
+) -> Result<(), CompileError> {
     match orig
         .iter()
         .zip(rendered)
@@ -787,7 +805,7 @@ fn check_task_references(task: &Task, field: GlobField, orig: &[Glob]) -> Result
     {
         Some((o, _)) => Err(CompileError::EmptyTaskReference {
             task: task.name().to_string(),
-            field: field.name().to_string(),
+            field: field.to_string(),
             template: o.task.clone(),
         }),
         None => Ok(()),

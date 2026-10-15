@@ -129,7 +129,7 @@ impl Tasks {
                     }
                 }
                 // Namespace the task references in sources and generates.
-                for g in task.sources.iter_mut().chain(task.generates.iter_mut()) {
+                for g in task.glob_entries_mut() {
                     if !g.task.is_empty() {
                         g.task = task_name_with_namespace(&g.task, &include.namespace);
                     }
