@@ -117,6 +117,30 @@ fn reading_outside_sources_fails() {
     }
 }
 
+#[test]
+fn seccomp_reads_paths_through_proc_without_process_vm_readv() {
+    // Only debug builds take `/proc/<pid>/mem` on this switch, as on a kernel
+    // without `process_vm_readv`.
+    if !cfg!(debug_assertions) || !available("seccomp") {
+        return;
+    }
+    let env = [
+        ("TASK_SANDBOX", "seccomp"),
+        ("TASK_TEST_SECCOMP_PROC_MEM", "1"),
+    ];
+    let dir = stage("sandbox");
+    let r = run_with_env(&dir, &["sources-and-outputs"], &env);
+    assert!(r.ok(), "{}", r.combined());
+    let r = run_with_env(&dir, &["read-outside-sources"], &env);
+    assert!(!r.ok(), "expected a failure: {}", r.combined());
+    let out = r.combined();
+    assert!(
+        out.contains("sandbox: denied read of ") && out.contains("secret/key"),
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// What a failed sandboxed command adds to its output.
 const HINT: &str = "task: [read-outside-sources] ran sandboxed: a \"Permission denied\" \
                     above may be a file missing from sources";

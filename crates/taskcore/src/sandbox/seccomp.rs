@@ -342,8 +342,9 @@ fn program(ops: &[(libc::c_long, &'static str, Op)]) -> io::Result<Vec<libc::soc
 /// installs, on a thread of its own that ends right after; a syscall it hands
 /// over can be let through (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`, which kernels
 /// before 5.5 lack although they have listeners); and a child's memory can be
-/// read, which `kernel.yama.ptrace_scope` 2 or more forbids. A process already
-/// under a supervisor passes the first two: that one checks its commands.
+/// read, by either means [`Process`] has, which `kernel.yama.ptrace_scope` 2
+/// or more forbids. A process already under a supervisor passes the first
+/// two: that one checks its commands.
 pub(crate) fn probe() -> Result<(), String> {
     static PROBED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
     PROBED
@@ -380,7 +381,7 @@ fn child_memory_readable() -> Result<(), String> {
     let mut buf = [0u8; 8];
     let read = u32::try_from(pid)
         .map_err(|_| io::Error::other("pid out of range"))
-        .and_then(|p| read_exact(&Process(p), std::ptr::addr_of!(MARK) as u64, &mut buf));
+        .and_then(|p| read_exact(&Process::new(p), std::ptr::addr_of!(MARK) as u64, &mut buf));
     // SAFETY: `pid` is this process's child, killed and reaped here.
     unsafe {
         libc::kill(pid, libc::SIGKILL);
@@ -595,7 +596,7 @@ pub(crate) fn supervise(
             Some((_, name, op)) if native => {
                 let caller = Caller {
                     pid: req.pid,
-                    mem: &Process(req.pid),
+                    mem: &Process::notified(req.pid, &listener, req.id),
                 };
                 let found = judge(&layers, name, accesses(&caller, &req.data.args, *op));
                 (*name, found, None)
@@ -813,11 +814,56 @@ trait Memory {
     fn read(&self, addr: u64, buf: &mut [u8]) -> io::Result<usize>;
 }
 
-/// The memory of the process (or thread) `pid`.
-struct Process(u32);
+/// The memory of the process (or thread) `pid`, read with `process_vm_readv`,
+/// or through `/proc/<pid>/mem` on a kernel without it
+/// (`CONFIG_CROSS_MEMORY_ATTACH` unset, as in some microVM guests).
+struct Process<'a> {
+    pid: u32,
+    /// The read's notification. Checking it after opening `/proc/<pid>/mem`
+    /// ensures the descriptor belongs to the caller, not a reused pid. The
+    /// supervisor checks again before answering, covering `process_vm_readv`
+    /// too.
+    notification: Option<(&'a OwnedFd, u64)>,
+    /// `/proc/<pid>/mem`, opened on first use, or the `errno` that failed it.
+    mem: std::cell::OnceCell<Result<OwnedFd, i32>>,
+}
 
-impl Memory for Process {
-    fn read(&self, addr: u64, buf: &mut [u8]) -> io::Result<usize> {
+/// Whether `process_vm_readv` failed with `ENOSYS`, so that later reads go
+/// through `/proc/<pid>/mem` straight away.
+static NO_VM_READV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether reads skip `process_vm_readv`, as without it: forced in test
+/// builds by `TASK_TEST_SECCOMP_PROC_MEM`.
+fn no_vm_readv() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *FORCED.get_or_init(|| std::env::var_os("TASK_TEST_SECCOMP_PROC_MEM").is_some()) {
+            return true;
+        }
+    }
+    NO_VM_READV.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+impl<'a> Process<'a> {
+    /// Process `pid`, outside any notification.
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            notification: None,
+            mem: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Process `pid`, whose syscall `listener` notified as `id`.
+    fn notified(pid: u32, listener: &'a OwnedFd, id: u64) -> Self {
+        Self {
+            notification: Some((listener, id)),
+            ..Self::new(pid)
+        }
+    }
+
+    fn read_vm(&self, addr: u64, buf: &mut [u8]) -> io::Result<usize> {
         let local = libc::iovec {
             iov_base: buf.as_mut_ptr().cast(),
             iov_len: buf.len(),
@@ -827,7 +873,7 @@ impl Memory for Process {
             iov_len: buf.len(),
         };
         let pid =
-            libc::pid_t::try_from(self.0).map_err(|_| io::Error::other("pid out of range"))?;
+            libc::pid_t::try_from(self.pid).map_err(|_| io::Error::other("pid out of range"))?;
         // SAFETY: `local` covers `buf`; the remote range is only read by the
         // kernel.
         let n = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
@@ -836,6 +882,77 @@ impl Memory for Process {
             Ok(n) => Ok(n),
             Err(_) => Err(io::Error::last_os_error()),
         }
+    }
+
+    /// Opens `/proc/<pid>/mem`, failing as `process_vm_readv` would: `EPERM`
+    /// for the ptrace access check, `ESRCH` once the caller or its
+    /// notification is gone.
+    fn open_mem(&self) -> Result<OwnedFd, i32> {
+        let path = CString::new(format!("/proc/{}/mem", self.pid)).map_err(|_| libc::EINVAL)?;
+        // SAFETY: `path` is NUL-terminated and outlives the call.
+        let fd = owned(unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) })
+            .map_err(|e| open_errno(e.raw_os_error()))?;
+        match self.notification {
+            Some((listener, id)) if !id_valid(listener, id) => Err(libc::ESRCH),
+            _ => Ok(fd),
+        }
+    }
+
+    fn read_proc(&self, addr: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let fd = self
+            .mem
+            .get_or_init(|| self.open_mem())
+            .as_ref()
+            .map_err(|&errno| io::Error::from_raw_os_error(errno))?;
+        let at =
+            libc::off_t::try_from(addr).map_err(|_| io::Error::from_raw_os_error(libc::EFAULT))?;
+        // SAFETY: `buf` is valid for writes of its length.
+        let n = unsafe { libc::pread(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), at) };
+        let errno = (n < 0).then(|| io::Error::last_os_error().raw_os_error());
+        pread_result(n, errno.flatten())
+    }
+}
+
+/// Maps a `/proc/<pid>/mem` open error to a memory-read error. Never returns
+/// a path-lookup error recognized by [`kernel_fails`], which would let the
+/// caller's syscall through unchecked.
+fn open_errno(errno: Option<i32>) -> i32 {
+    match errno {
+        Some(libc::EACCES | libc::EPERM) => libc::EPERM,
+        // No `/proc/<pid>`: the caller is gone.
+        Some(libc::ENOENT | libc::ESRCH) => libc::ESRCH,
+        Some(e) if !kernel_fails(&io::Error::from_raw_os_error(e)) => e,
+        _ => libc::EIO,
+    }
+}
+
+/// What `pread` on `/proc/<pid>/mem` returning `n`, failing with `errno`,
+/// means, as `process_vm_readv` has it.
+fn pread_result(n: isize, errno: Option<i32>) -> io::Result<usize> {
+    match usize::try_from(n) {
+        Ok(n) if n > 0 => Ok(n),
+        // The caller's memory is gone: it exited or exec'd.
+        Ok(_) => Err(io::Error::from_raw_os_error(libc::ESRCH)),
+        Err(_) => Err(io::Error::from_raw_os_error(match errno {
+            // Nothing mapped there, `process_vm_readv`'s `EFAULT`.
+            Some(libc::EIO) => libc::EFAULT,
+            Some(e) if !kernel_fails(&io::Error::from_raw_os_error(e)) => e,
+            _ => libc::EIO,
+        })),
+    }
+}
+
+impl Memory for Process<'_> {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> io::Result<usize> {
+        if !no_vm_readv() {
+            match self.read_vm(addr, buf) {
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+                    NO_VM_READV.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                read => return read,
+            }
+        }
+        self.read_proc(addr, buf)
     }
 }
 
@@ -1584,8 +1701,8 @@ mod tests {
         (op, args)
     }
 
-    fn me() -> Process {
-        Process(std::process::id())
+    fn me() -> Process<'static> {
+        Process::new(std::process::id())
     }
 
     /// A fresh directory with `secret/key`, `src/a` and `out/`, canonical.
@@ -1610,6 +1727,54 @@ mod tests {
             rights: access::READ_FILE,
             what: "read",
         }
+    }
+
+    #[test]
+    fn memory_is_read_through_proc_without_process_vm_readv() {
+        static BUF: [u8; 6] = *b"path\0x";
+        // From another thread, by its thread id, as a notification names it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // SAFETY: gettid takes no arguments and cannot fail.
+            tx.send(unsafe { libc::syscall(libc::SYS_gettid) } as u32)
+                .unwrap();
+            wait.recv().unwrap();
+        });
+        let tid = rx.recv().unwrap();
+        let mem = Process::new(tid);
+        let mut buf = [0u8; 6];
+        assert_eq!(mem.read_proc(BUF.as_ptr() as u64, &mut buf).unwrap(), 6);
+        assert_eq!(&buf, &BUF);
+        let unmapped = mem.read_proc(0, &mut buf).unwrap_err();
+        assert_eq!(unmapped.raw_os_error(), Some(libc::EFAULT));
+        done.send(()).unwrap();
+        thread.join().unwrap();
+        // Read once the notification is gone: what the pid names may be
+        // another process.
+        let listener = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+        let gone = Process::notified(std::process::id(), &listener, 1);
+        let e = gone.read_proc(BUF.as_ptr() as u64, &mut buf).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::ESRCH));
+        // No such process (above any `pid_max`): gone too, not a lookup
+        // failure that would let the syscall through unchecked.
+        let e = Process::new(1 << 30).read_proc(0, &mut buf).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[test]
+    fn proc_mem_failures_never_read_as_a_failed_lookup() {
+        let errno = |r: io::Result<usize>| r.unwrap_err().raw_os_error().unwrap();
+        assert_eq!(open_errno(Some(libc::EACCES)), libc::EPERM);
+        assert_eq!(open_errno(Some(libc::ENOENT)), libc::ESRCH);
+        assert_eq!(open_errno(Some(libc::ENOTDIR)), libc::EIO);
+        assert_eq!(open_errno(Some(libc::EMFILE)), libc::EMFILE);
+        assert_eq!(open_errno(None), libc::EIO);
+        assert_eq!(pread_result(4, None).unwrap(), 4);
+        assert_eq!(errno(pread_result(0, None)), libc::ESRCH);
+        assert_eq!(errno(pread_result(-1, Some(libc::EIO))), libc::EFAULT);
+        assert_eq!(errno(pread_result(-1, Some(libc::EFAULT))), libc::EIO);
+        assert_eq!(errno(pread_result(-1, Some(libc::EINTR))), libc::EINTR);
     }
 
     #[test]

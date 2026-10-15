@@ -18,7 +18,8 @@
   from `sources` then fails the build instead of leaving a stale up-to-date
   result or cache entry. `sandbox.reads` and `sandbox.writes` widen it. The
   restriction uses Landlock, or a slower seccomp supervisor on kernels without
-  it; with neither available, the default `TASK_SANDBOX=auto` runs commands
+  it (which also works without `process_vm_readv`, as in some microVM guests);
+  with neither available, the default `TASK_SANDBOX=auto` runs commands
   unrestricted with a warning (`TASK_SANDBOX=landlock` or `seccomp` makes it an
   error). Any denial the supervisor sees fails the task, even one the command
   recovered from or ignored, and an enforced sandbox runs a command's `if` under

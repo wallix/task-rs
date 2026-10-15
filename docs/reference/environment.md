@@ -123,7 +123,9 @@ available, `auto` runs commands unrestricted, with a warning.
 
 The supervisor needs `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (Linux 5.5), and to
 read the memory of the commands' processes, which `kernel.yama.ptrace_scope`
-2 or more forbids. task checks both before using it: `auto` then falls back to
+2 or more forbids. It reads it through `/proc/<pid>/mem` on kernels without
+`process_vm_readv` (built without `CONFIG_CROSS_MEMORY_ATTACH`, as some microVM
+guests are). task checks both before using it: `auto` then falls back to
 no restriction with a warning, `seccomp` and `audit` fail with an error, and
 under Landlock the `if` of commands runs unsandboxed, with a warning. It knows
 the syscalls of x86_64 and aarch64 only. Every syscall of another architecture
