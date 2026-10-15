@@ -109,3 +109,12 @@ tokio = { version = "1" }
 # process_vm_readv) and their structs; std has none of them. Already in the
 # tree through brush-core and getrandom.
 libc = "0.2"
+
+# brush-parser 0.4.0 lists insta, which it only uses in its tests, as a normal
+# dependency. That pulls in pest, and pest 2.9.3 adds stacker and psm, whose
+# per-architecture stack-switching assembly would be compiled into the binary
+# for code it never runs. Upstream dropped the dependency (reubeno/brush#1168)
+# after 0.4.0; until a release ships it, take 0.4.0 plus that one change from
+# WALLIX's fork. Drop this patch once a brush-parser release includes #1168.
+[patch.crates-io]
+brush-parser = { git = "https://github.com/wallix/brush", rev = "f489a1ca8f59691f159352b6676e0b256631a87a" }
