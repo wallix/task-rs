@@ -19,7 +19,9 @@ use crate::logger::Color;
 use crate::output::{Output, SharedWriter};
 use crate::precondition;
 use crate::requires;
-use crate::sandbox::{Backend, Denial, Layers, Policy, PolicyInput, Sandbox, remove_stale_tmp};
+use crate::sandbox::{
+    Backend, Condition, Denial, Layers, Policy, PolicyInput, Sandbox, remove_stale_tmp,
+};
 use crate::slicesext;
 use crate::templater::Cache as TemplaterCache;
 use crate::variables::{self, CompileContext};
@@ -1145,8 +1147,8 @@ impl Executor {
     /// Runs a single deferred command. Deferred commands are left un-templated
     /// during compilation so they can be rendered here against the task's
     /// variables plus `EXIT_CODE` (the failing command's exit status). Errors are
-    /// ignored, except a sandbox denial, returned to fail the task. Ports Go
-    /// `runDeferred`.
+    /// ignored except for sandbox denials and conditions that could not run
+    /// sandboxed; these fail the task. Ports Go `runDeferred`.
     async fn run_deferred(
         self: &Rc<Self>,
         t: &Task,
@@ -1179,7 +1181,8 @@ impl Executor {
             *slot = rendered;
         }
         match self.run_command(&task, call, i, ancestors).await {
-            // Not ignored: the task's outputs may depend on an undeclared input.
+            // Not ignored: the task's outputs may depend on an undeclared input,
+            // or on a condition that could not be checked.
             Err(e) if e.is_sandbox_failure() => Some(e),
             Err(e) => {
                 self.logger().borrow_mut().verbose_errf(
@@ -1206,26 +1209,46 @@ impl Executor {
             return Ok(());
         };
 
-        // Like a task-level `if` and preconditions, a command's `if` runs
-        // unsandboxed: under Landlock a denial would only make it false,
-        // skipping the command as if it did not apply.
         if !cmd.if_.trim().is_empty() {
+            let (env, sandbox) = self.command_env(t, ancestors);
+            let sandbox = self.condition_sandbox(t, sandbox.as_ref()).await;
             let opts = RunCommandOptions {
                 command: cmd.if_.clone(),
                 dir: Some(t.compute_dir()),
-                env: split_env(env::get(t, self.env_precedence)),
+                env,
                 posix_opts: Vec::new(),
                 bash_opts: Vec::new(),
                 stdout: Stdio::Inherit,
                 stderr: Stdio::Inherit,
-                sandbox: None,
+                sandbox: sandbox.clone(),
             };
-            if execext::run_command(opts).await.is_err() {
-                self.logger().borrow_mut().verbose_outf(
-                    Color::Yellow,
-                    &format!("task: [{}] if condition not met - skipped\n", t.name()),
-                );
-                return Ok(());
+            let before = sandbox.as_ref().map_or(0, Sandbox::denial_count);
+            let result = execext::run_command(opts).await;
+            let denied = self.report_sandbox(t, sandbox.as_ref(), false, before);
+            // A sandboxed condition is false when it says so, not when the
+            // sandbox refused it something or could not start; any other
+            // error makes it false, as without a sandbox.
+            if denied {
+                return Err(ExecutorError::SandboxDenied {
+                    task_name: t.name().to_string(),
+                    denied: Denied::Condition,
+                });
+            }
+            match result {
+                Ok(()) => {}
+                Err(execext::Error::Sandbox(source)) => {
+                    return Err(ExecutorError::ConditionSandbox {
+                        task_name: t.name().to_string(),
+                        source,
+                    });
+                }
+                Err(_) => {
+                    self.logger().borrow_mut().verbose_outf(
+                        Color::Yellow,
+                        &format!("task: [{}] if condition not met - skipped\n", t.name()),
+                    );
+                    return Ok(());
+                }
             }
         }
 
@@ -1602,6 +1625,36 @@ impl Executor {
         (env, sandbox)
     }
 
+    /// The sandbox a command's `if` runs under, given the command's own; warns
+    /// once when Landlock enforces the command but its `if` goes unchecked,
+    /// without the seccomp supervisor.
+    async fn condition_sandbox(&self, t: &Task, sandbox: Option<&Sandbox>) -> Option<Sandbox> {
+        let sandbox = sandbox?;
+        // Probing blocks the first time: only Landlock asks for it.
+        let probed = if matches!(sandbox.backend, Backend::Landlock(_)) {
+            tokio::task::spawn_blocking(crate::sandbox::supervisor_available)
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+        } else {
+            Ok(())
+        };
+        match sandbox.for_condition(|| probed) {
+            Condition::Sandboxed(s) => Some(s),
+            Condition::Unsandboxed => None,
+            Condition::Unchecked(why) => {
+                if !self.condition_unchecked_warned.replace(true) {
+                    self.logger().borrow_mut().warnf(&format!(
+                        "task: [{}] sandbox: the seccomp supervisor is unavailable ({why}): the \
+                         if conditions of this run's commands run unsandboxed; the commands \
+                         themselves stay under Landlock\n",
+                        t.name()
+                    ));
+                }
+                None
+            }
+        }
+    }
+
     /// Reports what a sandboxed command was denied, or would have been when
     /// auditing; returns whether anything was denied.
     ///
@@ -1625,7 +1678,12 @@ impl Executor {
         let mut logger = logger.borrow_mut();
         let color = if audit { Color::Yellow } else { Color::Red };
         if sandbox.unenforced() && !self.sandbox_unenforced_warned.replace(true) {
-            let what = "this run's sandboxes are not enforced";
+            let what = if sandbox.landlock_condition {
+                "the if conditions of this run's commands are checked only against the \
+                 enclosing tasks' rules; the commands themselves stay under Landlock"
+            } else {
+                "this run's sandboxes are not enforced"
+            };
             logger.warnf(&format!(
                 "task: [{}] sandbox: this task runs under the seccomp supervisor of an enclosing \
                  sandboxed command, which checks only the enclosing tasks' rules: {what}\n",

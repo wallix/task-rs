@@ -47,6 +47,18 @@ mod seccomp {
     pub(crate) fn supervise(_: OwnedFd, _: Vec<Arc<Policy>>, _: bool, _: Denials) {}
 }
 
+/// Checks that the seccomp supervisor works here; blocks the first time.
+pub fn supervisor_available() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        seccomp::probe()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("seccomp needs Linux".to_string())
+    }
+}
+
 pub use policy::{Policy, PolicyInput, remove_stale_tmp, remove_tmp};
 
 /// What `TASK_SANDBOX` asks for.
@@ -240,6 +252,9 @@ pub struct Layers {
     unenforced: Arc<AtomicBool>,
     /// The worker thread, or why it could not be restricted.
     worker: tokio::sync::OnceCell<Result<Worker, String>>,
+    /// The same policies under the seccomp supervisor, for the `if` of
+    /// commands run under Landlock (see [`Sandbox::for_condition`]).
+    condition: std::sync::OnceLock<Arc<Layers>>,
 }
 
 impl Layers {
@@ -257,6 +272,7 @@ impl Layers {
             denials: Arc::new(Mutex::new(Seen::default())),
             unenforced: Arc::new(AtomicBool::new(false)),
             worker: tokio::sync::OnceCell::new(),
+            condition: std::sync::OnceLock::new(),
         })
     }
 }
@@ -323,8 +339,8 @@ fn restriction(
         }
         #[cfg(target_os = "linux")]
         Backend::Seccomp { enforce } => {
-            // A command must not find out at its first syscall that the
-            // supervisor cannot work.
+            // Under Landlock, only a command's `if` gets here: it must not
+            // find out at its first syscall that the supervisor cannot work.
             seccomp::probe()
                 .map_err(|e| io::Error::other(format!("seccomp is unavailable: {e}")))?;
             // The supervisor comes first, from this unfiltered thread.
@@ -362,6 +378,18 @@ fn restriction(
     }
 }
 
+/// What a command's `if` runs under (see [`Sandbox::for_condition`]).
+#[derive(Debug)]
+pub enum Condition {
+    /// This sandbox.
+    Sandboxed(Sandbox),
+    /// No sandbox: the command's own runs unrestricted too.
+    Unsandboxed,
+    /// No sandbox, although the command's own runs under Landlock: the
+    /// seccomp supervisor is unavailable, for this reason.
+    Unchecked(String),
+}
+
 /// What a sandboxed command runs under.
 #[derive(Clone, Debug)]
 pub struct Sandbox {
@@ -369,12 +397,45 @@ pub struct Sandbox {
     pub backend: Backend,
     /// What it enforces.
     pub layers: Arc<Layers>,
+    /// Whether this is the sandbox of the `if` of a command that runs under
+    /// Landlock (see [`Sandbox::for_condition`]).
+    pub landlock_condition: bool,
 }
 
 impl Sandbox {
     /// A sandbox for `layers`.
     pub fn new(backend: Backend, layers: Arc<Layers>) -> Self {
-        Self { backend, layers }
+        Self {
+            backend,
+            layers,
+            landlock_condition: false,
+        }
+    }
+
+    /// What a command's `if` runs under: the same policies with seccomp,
+    /// even under Landlock. Landlock would make a denied condition false
+    /// and skip the command as if it did not apply; the supervisor reports the
+    /// denial so it fails the task instead. `supervisor` is
+    /// [`supervisor_available`], consulted only under Landlock: without it
+    /// the condition runs unsandboxed, as it would without the sandbox.
+    pub fn for_condition(&self, supervisor: impl FnOnce() -> Result<(), String>) -> Condition {
+        match self.backend {
+            Backend::Landlock(_) => match supervisor() {
+                Ok(()) => {
+                    let layers = self
+                        .layers
+                        .condition
+                        .get_or_init(|| Layers::new(self.layers.policies.clone()));
+                    Condition::Sandboxed(Self {
+                        landlock_condition: true,
+                        ..Self::new(Backend::Seccomp { enforce: true }, Arc::clone(layers))
+                    })
+                }
+                Err(why) => Condition::Unchecked(why),
+            },
+            Backend::Seccomp { .. } => Condition::Sandboxed(self.clone()),
+            Backend::None => Condition::Unsandboxed,
+        }
     }
 
     /// The `TMPDIR` the command needs, if a layer has one.
@@ -461,6 +522,34 @@ fn set_no_new_privs() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_condition_runs_unchecked_without_the_supervisor_under_landlock() {
+        let sandbox = |backend| Sandbox::new(backend, Layers::new(Vec::new()));
+        let unavailable = || Err("EPERM".to_string());
+        let unreached = || -> Result<(), String> { panic!("probed needlessly") };
+        assert!(matches!(
+            sandbox(Backend::Landlock(4)).for_condition(unavailable),
+            Condition::Unchecked(why) if why == "EPERM"
+        ));
+        let Condition::Sandboxed(s) = sandbox(Backend::Landlock(4)).for_condition(|| Ok(())) else {
+            panic!("expected the supervisor");
+        };
+        assert_eq!(s.backend, Backend::Seccomp { enforce: true });
+        assert!(s.landlock_condition);
+        for enforce in [true, false] {
+            let Condition::Sandboxed(s) =
+                sandbox(Backend::Seccomp { enforce }).for_condition(unreached)
+            else {
+                panic!("expected the same sandbox");
+            };
+            assert_eq!(s.backend, Backend::Seccomp { enforce });
+        }
+        assert!(matches!(
+            sandbox(Backend::None).for_condition(unreached),
+            Condition::Unsandboxed
+        ));
+    }
 
     #[test]
     fn parses_modes() {

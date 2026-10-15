@@ -41,6 +41,12 @@ fn available(mode: &str) -> bool {
 
 const ENFORCING: [&str; 2] = ["landlock", "seccomp"];
 
+/// Whether a command's `if` can run sandboxed under `mode`: under Landlock,
+/// it needs the seccomp supervisor too.
+fn condition_available(mode: &str) -> bool {
+    available(mode) && (mode != "landlock" || available("seccomp"))
+}
+
 #[test]
 fn sources_and_outputs_are_allowed() {
     for mode in ENFORCING.into_iter().filter(|m| available(m)) {
@@ -215,6 +221,39 @@ fn an_excluded_read_is_denied() {
             out.contains("secret/key: Permission denied"),
             "{mode}: {out}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn a_condition_denied_by_the_sandbox_fails_rather_than_skips() {
+    // Under Landlock too: the condition runs under the seccomp supervisor,
+    // which reports the denial instead of only making the condition false.
+    for mode in ["landlock", "seccomp", "audit"]
+        .into_iter()
+        .filter(|m| condition_available(m))
+    {
+        let dir = stage("sandbox");
+        let r = run_with_env(
+            &dir,
+            &["if-reads-outside-sources"],
+            &[("TASK_SANDBOX", mode)],
+        );
+        let out = r.combined();
+        assert!(
+            out.contains("read of ") && out.contains("secret/key"),
+            "{mode}: {out}"
+        );
+        if mode != "audit" {
+            assert!(!r.ok(), "{mode}: {out}");
+            assert!(
+                out.contains("if condition of \"if-reads-outside-sources\" was denied"),
+                "{mode}: {out}"
+            );
+            assert_not_recorded(&dir, "if-reads-outside-sources", mode);
+        } else {
+            assert!(r.ok() && out.contains("ran\n"), "{out}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -474,7 +513,7 @@ fn assert_not_recorded(dir: &std::path::Path, task: &str, mode: &str) {
 
 #[test]
 fn a_false_condition_still_skips() {
-    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+    for mode in ENFORCING.into_iter().filter(|m| condition_available(m)) {
         let dir = stage("sandbox");
         let r = run_with_env(&dir, &["if-false"], &[("TASK_SANDBOX", mode)]);
         assert!(r.ok(), "{mode}: {}", r.combined());
@@ -568,26 +607,6 @@ fn what_the_kernel_refuses_first_is_no_denial() {
             "{mode}: {out}"
         );
         assert!(!out.contains("sandbox:"), "{mode}: {out}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-#[test]
-fn a_condition_runs_unsandboxed() {
-    // Like a task-level `if`: under Landlock a denial would only make the
-    // condition false, skipping the command as if it did not apply.
-    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
-        let dir = stage("sandbox");
-        let r = run_with_env(
-            &dir,
-            &["if-reads-outside-sources"],
-            &[("TASK_SANDBOX", mode)],
-        );
-        assert!(
-            r.ok() && r.stdout.contains("ran\n"),
-            "{mode}: {}",
-            r.combined()
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -81,7 +81,7 @@ pub enum ExecutorError {
     },
     /// `TASK_SANDBOX` holds a value it does not know.
     SandboxMode(crate::sandbox::UnknownMode),
-    /// The sandbox denied a command an access. Unlike a failed
+    /// The sandbox denied a command (or its `if`) an access. Unlike a failed
     /// command, `ignore_error` and deferred commands never ignore it: what ran
     /// may have depended on an undeclared input.
     SandboxDenied {
@@ -89,6 +89,14 @@ pub enum ExecutorError {
         task_name: String,
         /// What was denied.
         denied: Denied,
+    },
+    /// The sandbox of a command's `if` could not be set up, so the condition
+    /// did not run.
+    ConditionSandbox {
+        /// The task whose command it was.
+        task_name: String,
+        /// Why.
+        source: std::io::Error,
     },
     /// The run was cancelled by a signal.
     Cancelled,
@@ -157,6 +165,19 @@ impl std::fmt::Display for ExecutorError {
                 "task: a command of {task_name:?} was denied by the sandbox (or ran alongside one \
                  that was, under the same sandbox): what it did may depend on an undeclared input"
             ),
+            Self::SandboxDenied {
+                task_name,
+                denied: Denied::Condition,
+            } => write!(
+                f,
+                "task: the if condition of {task_name:?} was denied by the sandbox"
+            ),
+            Self::ConditionSandbox { task_name, source } => {
+                write!(
+                    f,
+                    "task: the if condition of {task_name:?} cannot run sandboxed: {source}"
+                )
+            }
             Self::Cancelled => write!(f, "task: run cancelled"),
             Self::Io(e) => write!(f, "task: {e}"),
         }
@@ -170,6 +191,8 @@ impl std::error::Error for ExecutorError {}
 pub enum Denied {
     /// A command, or one running alongside it under the same sandbox.
     Command,
+    /// A command's `if`.
+    Condition,
 }
 
 impl ExecutorError {
@@ -208,12 +231,12 @@ impl ExecutorError {
         }
     }
 
-    /// Reports whether this error is a sandbox denial, unwrapping a
-    /// [`ExecutorError::TaskRun`] wrapper: failures `ignore_error` and `defer`
-    /// do not ignore.
+    /// Reports whether this error is a sandbox denial, or a command's `if`
+    /// that could not run sandboxed, unwrapping a [`ExecutorError::TaskRun`]
+    /// wrapper: failures `ignore_error` and `defer` do not ignore.
     pub fn is_sandbox_failure(&self) -> bool {
         match self {
-            Self::SandboxDenied { .. } => true,
+            Self::SandboxDenied { .. } | Self::ConditionSandbox { .. } => true,
             Self::TaskRun { source, .. } => source.is_sandbox_failure(),
             _ => false,
         }

@@ -113,20 +113,23 @@ How tasks with [`sandbox:`](schema.md#sandbox) are restricted:
 
 Landlock reports a denial only as the command's own "Permission denied", so a
 command that recovers from one passes. The seccomp modes name every denied
-path after the command, and `seccomp` fails the task on any of them. Use
-`audit` to list all of a build's undeclared inputs in one run. Both mechanisms
-need Linux. On other systems, or when neither is available, `auto` runs
-commands unrestricted, with a warning.
+path after the command, and `seccomp` fails the task on any of them. Whenever
+commands are sandboxed and enforced (Landlock included), a command's `if` runs
+under the enforcing supervisor when it is available; under `audit` it runs
+under the reporting one, and when `auto` falls back to no restriction,
+unrestricted. Use `audit` to list all of a build's undeclared inputs in one
+run. Both mechanisms need Linux. On other systems, or when neither is
+available, `auto` runs commands unrestricted, with a warning.
 
 The supervisor needs `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (Linux 5.5), and to
 read the memory of the commands' processes, which `kernel.yama.ptrace_scope`
 2 or more forbids. task checks both before using it: `auto` then falls back to
-no restriction with a warning, and `seccomp` and `audit` fail with an error.
-It knows the syscalls of x86_64 and aarch64 only. Every syscall of another
-architecture (a 32-bit binary on a 64-bit kernel) or of x32, whose paths it
-does not check, fails with "Permission denied"; `audit` lets them through.
-Either way they are reported once per architecture, without failing the task
-by themselves.
+no restriction with a warning, `seccomp` and `audit` fail with an error, and
+under Landlock the `if` of commands runs unsandboxed, with a warning. It knows
+the syscalls of x86_64 and aarch64 only. Every syscall of another architecture
+(a 32-bit binary on a 64-bit kernel) or of x32, whose paths it does not check,
+fails with "Permission denied"; `audit` lets them through. Either way they are
+reported once per architecture, without failing the task by themselves.
 
 Reading a process's memory takes the same permission as tracing it, so the
 supervisor cannot check, and denies every checked syscall of, a process that
@@ -142,6 +145,8 @@ the enclosing task's `generates` or `writes`), or the inner task fails, naming
 the directory. Under Landlock its own rules apply on top of the enclosing ones.
 A process tree has one seccomp supervisor, though: under it, the inner task runs
 under the enclosing task's rules only, and warns that its own are not enforced.
+That includes the `if` of its commands, even when they run under Landlock: a
+denial by the enclosing rules then fails the enclosing task.
 
 ### `TASK_CACHE_OCI_USER`, `TASK_CACHE_OCI_PASSWORD`
 

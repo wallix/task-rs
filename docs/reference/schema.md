@@ -897,12 +897,13 @@ sandbox is enforced; see the
 
 Under the seccomp supervisor, any access it denies fails the task and records
 no fingerprint or cache entry, even when the command recovered from it
-(`cat secret || true`) or ignores its errors (`ignore_error`, `defer`). Under
-Landlock, a denial is only the command's own "Permission denied": a command
-that fails on it fails the task as usual, but one that recovers from it, or
-whose errors are ignored, passes unnoticed. A command's `if`, like a
-task-level `if` and `preconditions`, runs outside the sandbox and is not
-checked.
+(`cat secret || true`) or ignores its errors (`ignore_error`, `defer`). A
+command's `if` runs under the supervisor when the sandbox is enforced, so a
+denied condition fails the task too; under Landlock, when the supervisor is
+unavailable, it runs unsandboxed with a warning. Under Landlock, a denial is
+only the command's own "Permission denied": a command that fails on it fails
+the task as usual, but one that recovers from it, or whose errors are ignored,
+passes unnoticed.
 `TASK_SANDBOX=audit` reports instead of failing.
 
 The sandbox checks a build's declared inputs; it is not a security boundary.

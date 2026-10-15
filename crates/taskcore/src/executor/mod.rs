@@ -177,6 +177,9 @@ pub struct Executor {
     /// Whether the run already warned that an enclosing seccomp supervisor
     /// leaves its sandboxes unenforced.
     pub(crate) sandbox_unenforced_warned: std::cell::Cell<bool>,
+    /// Whether the run already warned that commands' `if` conditions run
+    /// unsandboxed, for want of the seccomp supervisor under Landlock.
+    pub(crate) condition_unchecked_warned: std::cell::Cell<bool>,
     /// Every Taskfile read, which sandboxed commands may read (a nested `task`
     /// parses them).
     pub(crate) taskfile_paths: Vec<String>,
@@ -244,6 +247,7 @@ impl Default for Executor {
             sandbox_mode: crate::sandbox::Mode::default(),
             sandbox_backend: tokio::sync::OnceCell::new(),
             sandbox_unenforced_warned: std::cell::Cell::new(false),
+            condition_unchecked_warned: std::cell::Cell::new(false),
             taskfile_paths: Vec::new(),
             prompted_vars: RefCell::new(None),
             prompter: None,

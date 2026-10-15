@@ -905,8 +905,12 @@ including called tasks:
 TASK_SANDBOX=audit task build --force-all
 ```
 
-Only commands are checked: dynamic variables (`sh:`), `if` conditions (of the
-task or of a command) and `preconditions` run outside the sandbox.
+Only commands and their `if` are checked: dynamic variables (`sh:`), a
+task-level `if` and `preconditions` run outside the sandbox. When the sandbox
+is enforced, a command's `if` runs under the seccomp supervisor even where
+commands run under Landlock, so that a denied read fails the task rather than
+skipping the command. Where Landlock works but the supervisor does not, the
+`if` runs unsandboxed, with a warning.
 
 Under the seccomp supervisor, any denial fails the task, even when the command
 went on to succeed (`cat secret || true`) or its errors are ignored
