@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use cap_primitives::fs::{self as capfs, FollowSymlinks};
+use ocicas::restore::{DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, MAX_LINK_TARGET, MODE_MASK, Tree};
 use zip::write::{FileOptions, SimpleFileOptions};
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -100,109 +100,85 @@ pub fn write_archive(
     Ok(())
 }
 
-/// Longest symlink target an entry may carry: `PATH_MAX` on Linux. A link's
-/// body is read into memory, so it gets a bound of its own.
-const MAX_LINK_TARGET: u64 = 4096;
-
-/// The permission bits an extracted entry may keep: setuid, setgid and sticky
-/// are dropped, so a restored file never runs with its owner's privileges.
-const MODE_MASK: u32 = 0o777;
-
-/// The modes given an entry that records none, as the writer would record them
-/// for a file or directory created under the usual `022` umask.
-const DEFAULT_FILE_MODE: u32 = 0o644;
-const DEFAULT_DIR_MODE: u32 = 0o755;
-
-/// What a restore may write. The archive may come from a shared remote cache,
+/// What a restore may write. A cache entry may come from a shared remote cache,
 /// so it is untrusted: every entry is checked against the policy before any is
-/// written, and a refusal leaves the tree untouched.
-///
-/// Neither the entry count nor the total size is bounded: a legitimate cache
-/// can be arbitrarily large, so an archive can fill the disk up to the sizes
-/// its entries declare (never past them).
+/// written, and a refusal leaves the tree untouched. The writes themselves are
+/// confined to the root by [`ocicas::restore`], which also documents what is
+/// left unbounded.
 #[derive(Default)]
 pub struct RestorePolicy<'a> {
-    /// Checks the metadata in the comment; an error refuses the archive.
+    /// Checks the cache metadata; an error refuses the entry.
     pub check_meta: Option<&'a MetaCheck<'a>>,
     /// Whether the entry at this root-relative, slash-separated path may be
     /// written. Entries naming a `.git` component are refused regardless.
     pub accept: Option<&'a dyn Fn(&str) -> bool>,
 }
 
-/// A check on an archive's comment metadata.
+/// A check on a cache entry's metadata.
 pub type MetaCheck<'a> = dyn Fn(&CacheMeta) -> Result<(), CacheError> + 'a;
 
-/// The plain components of an entry name, slash- or backslash-separated, with
-/// `.` and empty segments dropped. Refuses a name that is absolute, has a `..`
-/// component, or a component the platform reads as a prefix or root (`C:` on
-/// Windows), so joining the result onto the extraction root cannot leave it.
-/// `..` is refused rather than resolved: the kernel resolves it after any
-/// symlink before it, which a lexical clean does not see. A `.git` component
-/// is refused too, so no restore can plant hooks or rewrite a repository's
-/// configuration, as is, on Windows, a name the platform aliases (see
-/// [`windows_aliased`]).
-fn entry_components(name: &str) -> Result<Vec<&str>, CacheError> {
-    let outside = || CacheError::msg(format!("entry {name:?} is outside the extraction root"));
-    if name.starts_with(['/', '\\']) {
-        return Err(outside());
-    }
-    let mut parts = Vec::new();
-    for part in name.split(['/', '\\']) {
-        match part {
-            "" | "." => {}
-            ".." => return Err(outside()),
-            _ => {
-                let mut comps = Path::new(part).components();
-                if !matches!(
-                    (comps.next(), comps.next()),
-                    (Some(std::path::Component::Normal(_)), None)
-                ) {
-                    return Err(outside());
-                }
-                if part.eq_ignore_ascii_case(".git") {
-                    return Err(CacheError::msg(format!(
-                        "entry {name:?} is inside a .git directory"
-                    )));
-                }
-                if cfg!(windows) && windows_aliased(part) {
-                    return Err(CacheError::msg(format!(
-                        "entry {name:?}: {part:?} is not a plain Windows file name"
-                    )));
-                }
-                parts.push(part);
-            }
+impl RestorePolicy<'_> {
+    /// Check entry `name`, already split into `parts`, against the policy. A
+    /// `.git` component is refused, so no restore can plant hooks or rewrite a
+    /// repository's configuration.
+    pub fn check_entry(&self, name: &str, parts: &[String]) -> Result<(), CacheError> {
+        if parts.iter().any(|p| is_git_name(p)) {
+            return Err(CacheError::rejected(format!(
+                "entry {name:?} is inside a .git directory"
+            )));
         }
+        if let Some(accept) = self.accept
+            && !accept(&parts.join("/"))
+        {
+            return Err(CacheError::rejected(format!(
+                "entry {name:?} is not one of the files this restore may write"
+            )));
+        }
+        Ok(())
     }
-    if parts.is_empty() {
-        return Err(CacheError::msg(format!("entry {name:?} names no path")));
-    }
-    Ok(parts)
 }
 
-/// Whether Windows would read path component `part` as something other than
-/// the file it names: a device (`CON`, `NUL`, `COM1`, … with any extension), an
-/// alternate data stream (`:`), or a name it silently trims (trailing dot or
-/// space) and so aliases with another. Mirrors Go's `filepath.IsLocal`.
-fn windows_aliased(part: &str) -> bool {
-    if part.contains(':') || part.ends_with(['.', ' ']) {
+/// Whether path component `part` names a `.git` directory: case-insensitively,
+/// and on Windows also as its 8.3 short name `GIT~<n>`, as git's own
+/// `core.protectNTFS` does.
+pub fn is_git_name(part: &str) -> bool {
+    if part.eq_ignore_ascii_case(".git") {
         return true;
     }
-    let stem = part.split('.').next().unwrap_or(part).trim_end_matches(' ');
-    let upper = stem.to_ascii_uppercase();
-    if matches!(
-        upper.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-    ) {
-        return true;
+    cfg!(windows)
+        && part.len() > 4
+        && part
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case("git~"))
+        && part
+            .get(4..)
+            .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The cache files under `dir` a restore would refuse, as inside a `.git`
+/// directory, split off `files`: saving them would make the entry unusable.
+pub fn split_git_files(dir: &Path, files: &[String]) -> (Vec<String>, Vec<String>) {
+    files.iter().cloned().partition(|f| {
+        let rel = resolve(dir, f);
+        let rel = rel.strip_prefix(dir).unwrap_or(&rel);
+        !rel.components()
+            .any(|c| is_git_name(&c.as_os_str().to_string_lossy()))
+    })
+}
+
+/// A restore failure from [`ocicas::restore`], as this module reports its own.
+fn restore_err(e: ocicas::Error) -> CacheError {
+    match e {
+        ocicas::Error::Io(e) => CacheError::Io(e),
+        ocicas::Error::Format(m) => CacheError::Msg(m),
+        e => CacheError::Ocicas(e),
     }
-    let mut chars = stem.chars();
-    let prefix: String = chars.by_ref().take(3).collect();
-    let digit: String = chars.collect();
-    (prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT"))
-        && matches!(
-            digit.as_str(),
-            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "\u{b9}" | "\u{b2}" | "\u{b3}"
-        )
+}
+
+/// An entry name split into the components a restore writes. Backslashes
+/// separate too: some Windows writers use them.
+fn entry_components(name: &str) -> Result<Vec<String>, CacheError> {
+    ocicas::restore::components(name, true).map_err(restore_err)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -247,17 +223,8 @@ fn plan<R: Read + std::io::Seek>(
         let mode = entry.unix_mode().map_or(default, |m| m & MODE_MASK);
         let size = entry.size();
         drop(entry);
-        let parts: Vec<String> = entry_components(&name)?
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        if let Some(accept) = policy.accept
-            && !accept(&parts.join("/"))
-        {
-            return Err(CacheError::rejected(format!(
-                "entry {name:?} is not one of the files this restore may write"
-            )));
-        }
+        let parts = entry_components(&name)?;
+        policy.check_entry(&name, &parts)?;
         planned.push(Planned {
             index,
             name,
@@ -267,159 +234,13 @@ fn plan<R: Read + std::io::Seek>(
             size,
         });
     }
-    // An entry below a symlink entry would be written through the link.
-    let links: std::collections::BTreeSet<&[String]> = planned
-        .iter()
-        .filter(|p| p.kind == Kind::Symlink)
-        .map(|p| p.parts.as_slice())
-        .collect();
-    for p in &planned {
-        for depth in 1..p.parts.len() {
-            if let Some(prefix) = p.parts.get(..depth)
-                && let Some(part) = prefix.last()
-                && links.contains(prefix)
-            {
-                return Err(CacheError::msg(format!(
-                    "entry {:?}: parent {part:?} is a symlink",
-                    p.name
-                )));
-            }
-        }
-    }
-    Ok(planned)
-}
-
-/// Open the directory `parents` names below `root`, one component at a time
-/// and never through a symlink, creating missing ones when `create` is set.
-/// Every later operation is relative to the returned handle, so a directory
-/// swapped for a link after this walk cannot redirect it.
-fn open_parent(root: &fs::File, parents: &[String], create: bool) -> Result<fs::File, CacheError> {
-    let mut dir = root.try_clone()?;
-    for part in parents {
-        let part_path = Path::new(part);
-        match capfs::stat(&dir, part_path, FollowSymlinks::No) {
-            Ok(m) if m.file_type().is_symlink() => {
-                return Err(CacheError::msg(format!("parent {part:?} is a symlink")));
-            }
-            Ok(_) => {}
-            Err(e) if create && e.kind() == std::io::ErrorKind::NotFound => {
-                capfs::create_dir(&dir, part_path, &capfs::DirOptions::new())?;
-            }
-            Err(e) => return Err(e.into()),
-        }
-        dir = capfs::open_dir_nofollow(&dir, part_path)?;
-    }
-    Ok(dir)
-}
-
-/// Open `leaf` in `dir` for reading, failing rather than following it if it
-/// is a symlink; with `directory`, failing too if it is not a directory.
-#[cfg(unix)]
-fn open_nofollow(dir: &fs::File, leaf: &Path, directory: bool) -> std::io::Result<fs::File> {
-    use capfs::OpenOptionsExt;
-    let flags = libc::O_NOFOLLOW | if directory { libc::O_DIRECTORY } else { 0 };
-    capfs::open(
-        dir,
-        leaf,
-        capfs::OpenOptions::new().read(true).custom_flags(flags),
+    ocicas::restore::check_link_parents(
+        planned
+            .iter()
+            .map(|p| (p.parts.as_slice(), p.kind == Kind::Symlink)),
     )
-}
-
-/// Without `O_NOFOLLOW`, the open stays confined to `dir` by the handle-relative
-/// resolution; the callers check the type through the handle.
-#[cfg(not(unix))]
-fn open_nofollow(dir: &fs::File, leaf: &Path, _directory: bool) -> std::io::Result<fs::File> {
-    capfs::open(dir, leaf, capfs::OpenOptions::new().read(true))
-}
-
-/// The type of whatever `leaf` names in `dir`, without following a link.
-fn leaf_type(dir: &fs::File, leaf: &Path) -> Result<Option<capfs::FileType>, CacheError> {
-    match capfs::stat(dir, leaf, FollowSymlinks::No) {
-        Ok(m) => Ok(Some(m.file_type())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Remove the file or symlink `leaf` names in `dir`, so the entry written next
-/// gets a fresh inode rather than an existing one (perhaps hard-linked
-/// elsewhere). A directory there is an error: the entry cannot replace it.
-fn clear_leaf(dir: &fs::File, leaf: &Path, name: &str) -> Result<(), CacheError> {
-    match leaf_type(dir, leaf)? {
-        None => Ok(()),
-        Some(t) if t.is_dir() => Err(CacheError::msg(format!(
-            "entry {name:?}: a directory is in the way"
-        ))),
-        Some(_) => Ok(capfs::remove_file(dir, leaf)?),
-    }
-}
-
-/// Whether `disk` holds exactly what `entry` decompresses to. Streams both
-/// through fixed buffers.
-fn same_stream(mut disk: impl Read, mut entry: impl Read) -> Result<bool, CacheError> {
-    let mut want = [0u8; 8192];
-    let mut have = [0u8; 8192];
-    loop {
-        let n = entry.read(&mut want)?;
-        if n == 0 {
-            // The entry ended: the file matches only if it did too.
-            return Ok(disk.read(&mut have[..1])? == 0);
-        }
-        let got = have
-            .get_mut(..n)
-            .ok_or_else(|| CacheError::msg("short read"))?;
-        if disk.read_exact(got).is_err() || got != want.get(..n).unwrap_or_default() {
-            return Ok(false);
-        }
-    }
-}
-
-/// Whether the regular file `leaf` in `dir` can stay as it is: its only link,
-/// already `mode`, `size` bytes long and identical to `entry`. Never on a
-/// platform without link counts and modes; the entry is then rewritten.
-#[cfg(unix)]
-fn unchanged(
-    dir: &fs::File,
-    leaf: &Path,
-    mode: u32,
-    size: u64,
-    entry: impl Read,
-) -> Result<bool, CacheError> {
-    use std::os::unix::fs::MetadataExt;
-    let file = open_nofollow(dir, leaf, false)?;
-    let md = file.metadata()?;
-    if !md.is_file() || md.nlink() != 1 || md.len() != size || md.mode() & 0o7777 != mode {
-        return Ok(false);
-    }
-    same_stream(std::io::BufReader::new(file), entry)
-}
-
-#[cfg(not(unix))]
-fn unchanged(
-    _dir: &fs::File,
-    _leaf: &Path,
-    _mode: u32,
-    _size: u64,
-    _entry: impl Read,
-) -> Result<bool, CacheError> {
-    Ok(false)
-}
-
-/// Copy `entry` into `out`, refusing one that inflates past the `size` its
-/// header declared.
-fn copy_entry(
-    name: &str,
-    size: u64,
-    entry: impl Read,
-    out: &mut fs::File,
-) -> Result<(), CacheError> {
-    let written = std::io::copy(&mut entry.take(size.saturating_add(1)), out)?;
-    if written > size {
-        return Err(CacheError::msg(format!(
-            "entry {name:?} is larger than its declared {size} bytes"
-        )));
-    }
-    Ok(())
+    .map_err(restore_err)?;
+    Ok(planned)
 }
 
 /// Read a symlink entry's target, refusing one longer than [`MAX_LINK_TARGET`].
@@ -434,58 +255,29 @@ fn link_target(name: &str, entry: impl Read) -> Result<Vec<u8>, CacheError> {
     Ok(target)
 }
 
-/// Write one planned entry under the directory handle `parent`. An existing
-/// file or symlink at the destination is replaced by a fresh one, never
-/// written or chmodded through; a file is left alone only when it is already
-/// identical, mode included, and linked nowhere else.
+/// Write one planned entry into `tree`. A file is left alone only when it is
+/// already identical, mode included, and linked nowhere else; otherwise it is
+/// written as a fresh inode.
 fn write_entry<R: Read + std::io::Seek>(
     archive: &mut ZipArchive<R>,
     p: &Planned,
-    parent: &fs::File,
-    leaf: &Path,
-    base_dir: &Path,
+    tree: &mut Tree,
 ) -> Result<(), CacheError> {
     match p.kind {
-        Kind::Dir => {
-            match leaf_type(parent, leaf)? {
-                Some(t) if t.is_dir() => {}
-                Some(_) => {
-                    capfs::remove_file(parent, leaf)?;
-                    capfs::create_dir(parent, leaf, &capfs::DirOptions::new())?;
-                }
-                None => capfs::create_dir(parent, leaf, &capfs::DirOptions::new())?,
-            }
-            Ok(())
-        }
+        Kind::Dir => tree.dir(&p.parts, p.mode).map_err(restore_err),
         Kind::Symlink => {
             let target = link_target(&p.name, archive.by_index(p.index)?)?;
-            if leaf_type(parent, leaf)?.is_some_and(|t| t.is_symlink())
-                && capfs::read_link_contents(parent, leaf)
-                    .is_ok_and(|l| l.as_os_str().as_encoded_bytes() == target)
-            {
-                return Ok(());
-            }
-            clear_leaf(parent, leaf, &p.name)?;
-            make_symlink(&target, parent, leaf, base_dir, &p.parts)?;
-            Ok(())
+            tree.symlink(&p.parts, &target).map_err(restore_err)
         }
         Kind::File => {
-            if leaf_type(parent, leaf)?.is_some_and(|t| t.is_file())
-                && unchanged(parent, leaf, p.mode, p.size, archive.by_index(p.index)?)?
+            if tree
+                .unchanged(&p.parts, p.mode, p.size, archive.by_index(p.index)?)
+                .map_err(restore_err)?
             {
                 return Ok(());
             }
-            clear_leaf(parent, leaf, &p.name)?;
-            // `create_new` fails on anything at `leaf`, a symlink included, so
-            // the file is never opened through a link swapped in meanwhile.
-            let mut out = capfs::open(
-                parent,
-                leaf,
-                capfs::OpenOptions::new().write(true).create_new(true),
-            )?;
-            copy_entry(&p.name, p.size, archive.by_index(p.index)?, &mut out)?;
-            set_file_mode(&out, p.mode)?;
-            Ok(())
+            tree.file(&p.parts, p.mode, p.size, archive.by_index(p.index)?)
+                .map_err(restore_err)
         }
     }
 }
@@ -496,11 +288,10 @@ fn write_entry<R: Read + std::io::Seek>(
 /// while writing aborts and is returned.
 ///
 /// Names that escape the root, or whose parent chain crosses a symlink, are
-/// refused. Every operation is relative to a directory handle opened without
-/// following links from a handle on `base_dir`, so a concurrent swap cannot
-/// redirect it either. Permission bits are applied, without setuid, setgid or
-/// sticky, through the entry's own handle; directories get theirs last, so a
-/// read-only one does not stop its contents from being restored.
+/// refused, and every write is confined to `base_dir` (see
+/// [`ocicas::restore`]). Permission bits are applied without setuid, setgid or
+/// sticky; directories get theirs last, so a read-only one does not stop its
+/// contents from being restored.
 pub fn extract_archive(
     zip_path: &Path,
     base_dir: &Path,
@@ -514,34 +305,11 @@ pub fn extract_archive(
     }
     let planned = plan(&mut archive, policy)?;
 
-    let root = capfs::open_ambient_dir(base_dir, cap_primitives::ambient_authority())?;
-    let mut cached: Option<(Vec<String>, fs::File)> = None;
-    let mut dirs = Vec::new();
+    let mut tree = Tree::open(base_dir).map_err(restore_err)?;
     for p in &planned {
-        let Some((leaf, parents)) = p.parts.split_last() else {
-            continue;
-        };
-        let parent = match cached.take() {
-            Some((names, dir)) if names.as_slice() == parents => dir,
-            _ => open_parent(&root, parents, true)
-                .map_err(|e| CacheError::msg(format!("entry {:?}: {e}", p.name)))?,
-        };
-        write_entry(&mut archive, p, &parent, Path::new(leaf), base_dir)?;
-        if p.kind == Kind::Dir {
-            dirs.push(p);
-        }
-        cached = Some((parents.to_vec(), parent));
+        write_entry(&mut archive, p, &mut tree)?;
     }
-    // Innermost first, so a directory losing its write bit comes after its
-    // children have been written.
-    for p in dirs.iter().rev() {
-        let Some((leaf, parents)) = p.parts.split_last() else {
-            continue;
-        };
-        let parent = open_parent(&root, parents, false)?;
-        let dir = open_nofollow(&parent, Path::new(leaf), true)?;
-        set_file_mode(&dir, p.mode)?;
-    }
+    tree.finish().map_err(restore_err)?;
     Ok(meta)
 }
 
@@ -556,7 +324,7 @@ pub fn archive_matches(base_dir: &Path, zip_path: &Path, files: &[String]) -> bo
     let Ok(mut archive) = ZipArchive::new(file) else {
         return false;
     };
-    let Ok(root) = capfs::open_ambient_dir(base_dir, cap_primitives::ambient_authority()) else {
+    let Ok(mut tree) = Tree::open(base_dir) else {
         return false;
     };
 
@@ -581,14 +349,7 @@ pub fn archive_matches(base_dir: &Path, zip_path: &Path, files: &[String]) -> bo
         if !seen.contains_key(&fpath) {
             return false; // extraneous file in zip
         }
-        let Some((leaf, parents)) = parts.split_last() else {
-            return false;
-        };
-        let parents: Vec<String> = parents.iter().map(|s| (*s).to_string()).collect();
-        let Ok(dir) = open_parent(&root, &parents, false) else {
-            return false;
-        };
-        if !entry_matches_disk(&dir, Path::new(leaf), is_symlink, size, entry).unwrap_or(false) {
+        if !tree.matches(&parts, is_symlink, size, entry) {
             return false;
         }
         seen.insert(fpath, true);
@@ -596,44 +357,20 @@ pub fn archive_matches(base_dir: &Path, zip_path: &Path, files: &[String]) -> bo
 
     for (f, found) in &seen {
         if !found {
-            if fs::metadata(f).map(|m| m.is_dir()).unwrap_or(false) {
+            // A listed directory has no entry of its own; check it through the
+            // same confined walk.
+            let parts: Option<Vec<String>> = f.strip_prefix(base_dir).ok().map(|rel| {
+                rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect()
+            });
+            if parts.is_some_and(|parts| tree.is_dir(&parts)) {
                 continue;
             }
             return false;
         }
     }
     true
-}
-
-/// Whether `leaf` in `dir` is what `entry` holds: a symlink with its target,
-/// or a regular file of its size and content.
-fn entry_matches_disk(
-    dir: &fs::File,
-    leaf: &Path,
-    is_symlink: bool,
-    size: u64,
-    entry: impl Read,
-) -> Result<bool, CacheError> {
-    let Some(kind) = leaf_type(dir, leaf)? else {
-        return Ok(false);
-    };
-    if is_symlink {
-        if !kind.is_symlink() {
-            return Ok(false);
-        }
-        let target = link_target("", entry)?;
-        let link = capfs::read_link_contents(dir, leaf)?;
-        return Ok(link.as_os_str().as_encoded_bytes() == target);
-    }
-    if !kind.is_file() {
-        return Ok(false);
-    }
-    let file = open_nofollow(dir, leaf, false)?;
-    let md = file.metadata()?;
-    if !md.is_file() || md.len() != size {
-        return Ok(false);
-    }
-    same_stream(std::io::BufReader::new(file), entry)
 }
 
 /// Resolve a possibly-relative cache file path against the working directory.
@@ -662,49 +399,6 @@ fn perm_bits(meta: &fs::Metadata) -> u32 {
     } else {
         0o644
     }
-}
-
-/// Apply unix permission bits through an open handle, which no symlink can
-/// redirect. A no-op on non-unix platforms, which have no mode.
-#[cfg(unix)]
-fn set_file_mode(file: &fs::File, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(fs::Permissions::from_mode(mode))
-}
-
-#[cfg(not(unix))]
-fn set_file_mode(_file: &fs::File, _mode: u32) -> std::io::Result<()> {
-    Ok(())
-}
-
-/// Create `leaf` in `dir` as a symlink to `target`, its raw bytes.
-#[cfg(unix)]
-fn make_symlink(
-    target: &[u8],
-    dir: &fs::File,
-    leaf: &Path,
-    _base_dir: &Path,
-    _parts: &[String],
-) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    capfs::symlink_contents(std::ffi::OsStr::from_bytes(target), dir, leaf)
-}
-
-/// Create the symlink by path: the handle-relative call refuses an absolute
-/// target, which a cached link may legitimately have. The parents were just
-/// walked without following links; only a concurrent swap could redirect it.
-#[cfg(windows)]
-fn make_symlink(
-    target: &[u8],
-    _dir: &fs::File,
-    _leaf: &Path,
-    base_dir: &Path,
-    parts: &[String],
-) -> std::io::Result<()> {
-    let path: PathBuf = std::iter::once(base_dir.to_path_buf())
-        .chain(parts.iter().map(PathBuf::from))
-        .collect();
-    std::os::windows::fs::symlink_file(String::from_utf8_lossy(target).as_ref(), path)
 }
 
 #[cfg(test)]
@@ -1151,34 +845,30 @@ mod tests {
     }
 
     #[test]
+    fn git_names() {
+        for part in [".git", ".GIT", ".Git"] {
+            assert!(is_git_name(part), "{part}");
+        }
+        assert_eq!(is_git_name("GIT~1"), cfg!(windows));
+        assert_eq!(is_git_name("git~12"), cfg!(windows));
+        for part in ["git", ".gitignore", "git~", "GIT~x", ".git2"] {
+            assert!(!is_git_name(part), "{part}");
+        }
+        let dir = Path::new("/p");
+        let (keep, git) = split_git_files(
+            dir,
+            &["out/a".into(), "/p/sub/.git/HEAD".into(), ".git/x".into()],
+        );
+        assert_eq!(keep, ["out/a"]);
+        assert_eq!(git, ["/p/sub/.git/HEAD", ".git/x"]);
+    }
+
+    #[test]
     fn extract_refuses_git_entries() {
         for name in [".git/hooks/pre-commit", "sub/.GIT/config"] {
             let dst = tempdir();
             let bytes = zip_bytes(|zw| add_file(zw, name, b"x"));
             assert!(extract_bytes(&bytes, &dst).is_err(), "{name:?} accepted");
-        }
-    }
-
-    #[test]
-    fn windows_aliased_names() {
-        for part in [
-            "CON",
-            "con.txt",
-            "Nul",
-            "aux.tar.gz",
-            "COM1",
-            "lpt9.log",
-            "COM\u{b9}",
-            "CONIN$",
-            "a.",
-            "a ",
-            "file:stream",
-            "c:",
-        ] {
-            assert!(windows_aliased(part), "{part:?}");
-        }
-        for part in ["CONSOLE", "COM10", "com", "LPT0", "a.b", "nul_", ".hidden"] {
-            assert!(!windows_aliased(part), "{part:?}");
         }
     }
 
@@ -1228,6 +918,17 @@ mod tests {
         assert!(!matches_bytes(&longer, &dst, &["a"]));
         let other = zip_bytes(|zw| add_file(zw, "a", b"abd"));
         assert!(!matches_bytes(&other, &dst, &["a"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_matches_does_not_read_hard_linked_files() {
+        let outside = tempdir();
+        fs::write(outside.join("secret"), b"S").unwrap();
+        let dst = tempdir();
+        fs::hard_link(outside.join("secret"), dst.join("h")).unwrap();
+        let bytes = zip_bytes(|zw| add_file(zw, "h", b"S"));
+        assert!(!matches_bytes(&bytes, &dst, &["h"]));
     }
 
     #[test]

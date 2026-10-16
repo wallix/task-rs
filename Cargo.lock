@@ -2069,8 +2069,10 @@ name = "ocicas"
 version = "4.8.0"
 dependencies = [
  "bytes",
+ "cap-primitives",
  "fastcdc",
  "hyper",
+ "libc",
  "oci-client",
  "reqwest",
  "rustls",

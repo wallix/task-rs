@@ -37,14 +37,15 @@
   embeds `{{.CHECKSUM}}`.
 - **A Jinja task with `from:` or `task:` entries renders its `preconditions` as
   Jinja again,** instead of as Go templates.
-- **A `file://` cache entry now restores only the task's generated files.** A
-  poisoned entry could write any file in the project (the Taskfile, git hooks,
-  other tasks' checksums), in 4.8.0 and earlier also outside it, and change the
-  permissions of files and directories outside it through symlinks and hard
-  links. An entry holding anything outside the task's `generates`, or cached
-  for another task or other sources, is now refused before anything is written,
-  and the task runs instead. `--import-cache` still restores every task's
-  files, but no restore writes into `.git`, or an import into the temp
+- **A cache entry now restores only the task's generated files.** A poisoned
+  `file://`, `oci://` or `vk` entry could write any file in the project (the
+  Taskfile, git hooks, other tasks' checksums) and reach outside it: a zip one
+  in 4.8.0 and earlier by its names, either through a hard link already in the
+  project (an `oci://` one rewriting the linked file, a zip one changing its
+  permissions). An entry holding anything outside the task's `generates`, or cached
+  for another task or other sources, is now refused before anything is
+  written, and the task runs instead. `--import-cache` still restores every
+  task's files, but no restore writes into `.git`, or an import into the temp
   directory's `tmp`. Entries named with a `..` component are refused, and
   restored files and directories lose their setuid, setgid and sticky bits.
 

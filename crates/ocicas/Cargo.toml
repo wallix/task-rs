@@ -23,6 +23,13 @@ reqwest.workspace = true
 hyper.workspace = true
 bytes.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util", "time"] }
+# Handle-relative, no-follow filesystem operations confine a restore of an
+# untrusted file set to its directory; std has no such API.
+cap-primitives.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# `O_NOFOLLOW`/`O_DIRECTORY` for those opens.
+libc.workspace = true
 
 [dev-dependencies]
 # The lock tests build a reqwest client, and reqwest is pinned

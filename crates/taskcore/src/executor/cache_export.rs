@@ -202,8 +202,19 @@ impl Executor {
                     files.insert(st.checksum_file.clone(), task.name().to_string());
                 }
             }
-            for f in &st.cache_files {
-                files.insert(f.clone(), task.name().to_string());
+            let (keep, git) = archive::split_git_files(Path::new(&self.dir), &st.cache_files);
+            if !git.is_empty() {
+                self.logger().borrow_mut().errf(
+                    Color::Yellow,
+                    &format!(
+                        "task: {:?}: leaving out {} file(s) inside .git, which import refuses\n",
+                        task.name(),
+                        git.len()
+                    ),
+                );
+            }
+            for f in keep {
+                files.insert(f, task.name().to_string());
             }
         }
         Ok(())

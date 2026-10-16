@@ -767,9 +767,7 @@ caches:
 
 Supported `url` (storage) schemes:
 
-- `file://<dir>` — local archives. A restore writes only the task's
-  `generates`: an archive holding any other file, or cached for another task
-  or other sources, is refused before anything is written, and the task runs.
+- `file://<dir>` — local archives.
 - `oci://[user:password@]host/repo:tag[?ca=<file>][&cas=<dir>][&plainhttp=1]` —
   a chunk-deduplicated artifact on any OCI registry. Environment credentials
   are `$TASK_VK_API_KEY` (a bearer token, such as a vk-registry API key) or
@@ -777,6 +775,10 @@ Supported `url` (storage) schemes:
   taking precedence. `$TASK_CACHE_OCI_CA` and `$TASK_CACHE_OCI_CAS_DIR` provide
   the other environment settings. Against a vk-registry server, Task also
   negotiates its transparent-zstd upload mode automatically.
+
+Whatever the scheme, a restore writes only the task's `generates`: an entry
+holding any other file, or cached for another task or other sources, is refused
+before anything is written, and the task runs instead.
 
 OCI cache requests retry connection failures, timeouts and interrupted transfers
 up to three times, waiting 2, 4 and 8 seconds between attempts. Each retry starts

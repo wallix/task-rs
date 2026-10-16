@@ -24,8 +24,10 @@ use crate::auth::Auth;
 use crate::cas::{assemble, build, digest_hex, sha256_hex};
 use crate::error::{Error, Result, with_causes};
 use crate::index::{
-    ARTIFACT_TYPE, ChunkRef, Index, MEDIA_TYPE_CHUNK, MEDIA_TYPE_INDEX, unmarshal_index,
+    ARTIFACT_TYPE, ChunkRef, Index, MAX_CHUNK_BLOB, MAX_INDEX_BLOB, MEDIA_TYPE_CHUNK,
+    MEDIA_TYPE_INDEX, unmarshal_index,
 };
+use crate::restore;
 use crate::retry::{is_transport, with_retry};
 
 /// Bounds parallel chunk transfers (pull fetches and push uploads).
@@ -61,6 +63,16 @@ pub struct RemoteOptions {
     pub cache_dir: Option<PathBuf>,
     /// Talk to the registry without TLS (local development).
     pub plain_http: bool,
+}
+
+/// A resolved entry whose index has been fetched and validated, but whose
+/// chunks have not: see [`Store::pull_index`].
+pub struct Pulled {
+    image: Reference,
+    /// The validated index: the file list a restore would write.
+    pub index: Index,
+    /// The manifest annotations.
+    pub annotations: BTreeMap<String, String>,
 }
 
 /// Counts of the uploads performed and skipped (already present) and the bytes
@@ -350,8 +362,19 @@ impl Store {
 
     /// Resolve `tag`, fetch the missing chunks (through the local CAS when
     /// configured) and assemble the file set under `dir`. Returns the index and
-    /// the manifest annotations.
+    /// the manifest annotations. [`Store::pull_index`] and
+    /// [`Store::assemble_pulled`] split it, so a caller can vet the file list
+    /// and annotations before anything is fetched or written: this applies no
+    /// policy on which paths the entry may write (see [`assemble`]).
     pub async fn pull(&self, tag: &str, dir: &Path) -> Result<(Index, BTreeMap<String, String>)> {
+        let pulled = self.pull_index(tag).await?;
+        self.assemble_pulled(&pulled, dir).await?;
+        Ok((pulled.index, pulled.annotations))
+    }
+
+    /// Resolve `tag` and fetch its validated index and manifest annotations,
+    /// without fetching a chunk or writing a file.
+    pub async fn pull_index(&self, tag: &str) -> Result<Pulled> {
         let image = self.reference(tag)?;
         let (client, image, auth) = (&self.client, &image, &self.auth.registry_auth());
         let (manifest, _digest) =
@@ -370,18 +393,24 @@ impl Store {
             .iter()
             .find(|l| l.media_type == MEDIA_TYPE_INDEX)
             .ok_or_else(|| Error::format(format!("{tag} has no index layer")))?;
-        let raw_idx = pull_blob_bytes(&self.client, image, index_desc).await?;
-        let idx = unmarshal_index(&raw_idx)?;
+        let raw_idx = pull_blob_bytes(&self.client, image, index_desc, MAX_INDEX_BLOB).await?;
+        let index = unmarshal_index(&raw_idx)?;
+        Ok(Pulled {
+            image: image.clone(),
+            index,
+            annotations: m.annotations.unwrap_or_default(),
+        })
+    }
 
-        let source = self.chunk_source(image, &idx).await?;
-        let owned_idx = idx.clone();
+    /// Fetch the chunks of a pulled index and assemble its file set under
+    /// `dir` (see [`assemble`]).
+    pub async fn assemble_pulled(&self, pulled: &Pulled, dir: &Path) -> Result<()> {
+        let source = self.chunk_source(&pulled.image, &pulled.index).await?;
+        let owned_idx = pulled.index.clone();
         let dir = dir.to_path_buf();
         tokio::task::spawn_blocking(move || assemble(&owned_idx, &dir, source))
             .await
-            .map_err(join_err)??;
-
-        let annotations = m.annotations.unwrap_or_default();
-        Ok((idx, annotations))
+            .map_err(join_err)?
     }
 
     /// Prefetch the chunks absent from the local CAS (or all chunks into memory
@@ -418,6 +447,7 @@ impl Store {
                         &client,
                         &image,
                         &descriptor(MEDIA_TYPE_CHUNK, c.digest.clone(), c.size),
+                        MAX_CHUNK_BLOB,
                     )
                     .await?;
                     cas_write(&dir, &c.digest, &data)
@@ -434,6 +464,7 @@ impl Store {
                     &self.client,
                     image,
                     &descriptor(MEDIA_TYPE_CHUNK, c.digest.clone(), c.size),
+                    MAX_CHUNK_BLOB,
                 )
                 .await?;
                 mem.insert(c.digest.clone(), data);
@@ -464,16 +495,58 @@ async fn pull_blob_bytes(
     client: &Client,
     image: &Reference,
     desc: &OciDescriptor,
+    max: usize,
 ) -> Result<Vec<u8>> {
     with_retry(|| async move {
-        let mut buf = Vec::with_capacity(desc.size.max(0) as usize);
+        // Grown as bytes arrive, never sized from the descriptor: its size is
+        // registry metadata, and an index's chunk sizes are not yet trusted.
+        let mut buf = Vec::new();
         client
-            .pull_blob(image, desc, &mut buf)
+            .pull_blob(image, desc, CappedBuf { buf: &mut buf, max })
             .await
             .map_err(oci_err)?;
         Ok(buf)
     })
     .await
+}
+
+/// An in-memory blob sink that fails once more than `max` bytes arrive, so a
+/// registry cannot make a pull hold more than that.
+struct CappedBuf<'a> {
+    buf: &'a mut Vec<u8>,
+    max: usize,
+}
+
+impl tokio::io::AsyncWrite for CappedBuf<'_> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.buf.len().saturating_add(data.len()) > this.max {
+            return std::task::Poll::Ready(Err(std::io::Error::other(format!(
+                "blob is larger than {} bytes",
+                this.max
+            ))));
+        }
+        this.buf.extend_from_slice(data);
+        std::task::Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
 }
 
 async fn blob_exists(client: &Client, image: &Reference, digest: &str) -> Result<bool> {
@@ -619,36 +692,77 @@ async fn push_blob_zstd(
     Ok(())
 }
 
-fn cas_file(dir: &Path, digest: &str) -> Option<PathBuf> {
-    digest_hex(digest).map(|hex| dir.join("sha256").join(hex))
+/// The local CAS's `sha256` directory, held open: every chunk operation is
+/// relative to it, never through a symlink, so a link planted in the store
+/// cannot redirect one. `dir` itself is the user's configured location.
+fn cas_dir(dir: &Path, create: bool) -> Result<std::fs::File> {
+    if create {
+        std::fs::create_dir_all(dir)?;
+    }
+    let root = cap_primitives::fs::open_ambient_dir(dir, cap_primitives::ambient_authority())?;
+    restore::open_parent(&root, &["sha256".to_string()], create)
+}
+
+fn cas_hex(digest: &str) -> Result<&str> {
+    digest_hex(digest).ok_or_else(|| Error::format(format!("bad digest {digest:?}")))
 }
 
 fn cas_valid(dir: &Path, digest: &str) -> bool {
-    cas_file(dir, digest)
-        .and_then(|p| std::fs::metadata(p).ok())
-        .is_some_and(|m| m.is_file())
+    let (Ok(hex), Ok(sub)) = (cas_hex(digest), cas_dir(dir, false)) else {
+        return false;
+    };
+    restore::leaf_type(&sub, Path::new(hex)).is_ok_and(|t| t.is_some_and(|t| t.is_file()))
 }
 
-/// Store a chunk atomically (tmp + rename), so concurrent pulls never observe a
-/// half-written entry.
+/// Create an unpredictable temporary file exclusively, then rename it into
+/// place. Concurrent pulls see only complete chunks, and a planted file cannot
+/// redirect the write.
 fn cas_write(dir: &Path, digest: &str, data: &[u8]) -> Result<()> {
-    let hex = digest_hex(digest).ok_or_else(|| Error::format(format!("bad digest {digest:?}")))?;
-    let subdir = dir.join("sha256");
-    std::fs::create_dir_all(&subdir)?;
-    let tmp = subdir.join(format!(".{hex}.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, subdir.join(hex))?;
-    Ok(())
+    use std::io::Write as _;
+    static TMPS: AtomicI64 = AtomicI64::new(0);
+    let hex = cas_hex(digest)?;
+    let sub = cas_dir(dir, true)?;
+    let random = std::hash::BuildHasher::hash_one(
+        &std::collections::hash_map::RandomState::new(),
+        (
+            std::process::id(),
+            TMPS.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now(),
+        ),
+    );
+    let tmp = PathBuf::from(format!(".{hex}.tmp.{}.{random:016x}", std::process::id()));
+    let mut file = cap_primitives::fs::open(
+        &sub,
+        &tmp,
+        cap_primitives::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true),
+    )?;
+    let written = file.write_all(data).and_then(|()| {
+        drop(file);
+        cap_primitives::fs::rename(&sub, &tmp, &sub, Path::new(hex))
+    });
+    if written.is_err() {
+        let _ = cap_primitives::fs::remove_file(&sub, &tmp);
+    }
+    Ok(written?)
 }
 
 /// Read a chunk from the local CAS, verifying its digest; a corrupted entry is
 /// removed and reported so the restore fails rather than trusting bad bytes.
+/// The entry is opened without following a link and must be a regular file.
 fn read_cas(dir: &Path, digest: &str) -> Result<Vec<u8>> {
-    let path =
-        cas_file(dir, digest).ok_or_else(|| Error::format(format!("bad digest {digest:?}")))?;
-    let data = std::fs::read(&path)?;
+    use std::io::Read as _;
+    let hex = cas_hex(digest)?;
+    let sub = cas_dir(dir, false)?;
+    let mut file = restore::open_nofollow(&sub, Path::new(hex), false)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::format(format!("CAS entry {digest} is not a file")));
+    }
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
     if sha256_hex(&data) != digest {
-        let _ = std::fs::remove_file(&path);
+        let _ = cap_primitives::fs::remove_file(&sub, Path::new(hex));
         return Err(Error::format(format!("corrupt CAS entry {digest}")));
     }
     Ok(data)
@@ -703,6 +817,61 @@ fn join_err(e: JoinError) -> Error {
 mod tests {
     use super::*;
     use crate::testutil::{FakeServer, install_crypto};
+
+    fn cas_tmp(tag: &str) -> PathBuf {
+        static N: AtomicI64 = AtomicI64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ocicas-cas-{}-{tag}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn cas_round_trips_and_drops_corrupt_entries() {
+        let dir = cas_tmp("rt");
+        let digest = sha256_hex(b"chunk");
+        assert!(!cas_valid(&dir, &digest));
+        cas_write(&dir, &digest, b"chunk").unwrap();
+        assert!(cas_valid(&dir, &digest));
+        assert_eq!(read_cas(&dir, &digest).unwrap(), b"chunk");
+        let hex = digest_hex(&digest).unwrap();
+        std::fs::write(dir.join("sha256").join(hex), b"other").unwrap();
+        assert!(read_cas(&dir, &digest).is_err());
+        assert!(!cas_valid(&dir, &digest));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cas_does_not_follow_planted_symlinks() {
+        let outside = cas_tmp("outside");
+        let digest = sha256_hex(b"chunk");
+        let hex = digest_hex(&digest).unwrap().to_string();
+
+        // A symlinked `sha256` directory.
+        let dir = cas_tmp("dirlink");
+        std::os::unix::fs::symlink(&outside, dir.join("sha256")).unwrap();
+        assert!(cas_write(&dir, &digest, b"chunk").is_err());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+
+        // An entry that is a link to a file holding the right bytes elsewhere.
+        let dir = cas_tmp("leaflink");
+        std::fs::create_dir(dir.join("sha256")).unwrap();
+        std::fs::write(outside.join("secret"), b"chunk").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), dir.join("sha256").join(&hex)).unwrap();
+        assert!(!cas_valid(&dir, &digest));
+        assert!(read_cas(&dir, &digest).is_err());
+        // Writing replaces the link rather than writing through it.
+        cas_write(&dir, &digest, b"chunk").unwrap();
+        assert!(
+            std::fs::symlink_metadata(dir.join("sha256").join(&hex))
+                .unwrap()
+                .is_file()
+        );
+        assert_eq!(std::fs::read(outside.join("secret")).unwrap(), b"chunk");
+    }
 
     /// A credential-gated registry omits the capability header from an
     /// anonymous probe's 401 response, so the probe sends credentials.
@@ -763,7 +932,7 @@ mod tests {
         ]);
         let image = format!("{}/repo:tag", server.authority()).parse().unwrap();
         let desc = descriptor(MEDIA_TYPE_CHUNK, sha256_hex(b"complete"), 8);
-        let body = pull_blob_bytes(&http_client(), &image, &desc)
+        let body = pull_blob_bytes(&http_client(), &image, &desc, MAX_CHUNK_BLOB)
             .await
             .unwrap();
         assert_eq!(body, b"complete");
@@ -773,12 +942,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_blob_larger_than_its_cap_is_refused() {
+        install_crypto();
+        // The descriptor understates the size; the cap holds regardless.
+        let server = FakeServer::start_raw(
+            (0..4)
+                .map(|_| {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\ncomplete"
+                        .into()
+                })
+                .collect(),
+        );
+        let image = format!("{}/repo:tag", server.authority()).parse().unwrap();
+        let desc = descriptor(MEDIA_TYPE_CHUNK, sha256_hex(b"complete"), 1);
+        let error = pull_blob_bytes(&http_client(), &image, &desc, 4)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("larger than"), "{error}");
+    }
+
+    #[tokio::test]
     async fn a_blob_digest_mismatch_is_final() {
         install_crypto();
         let server = FakeServer::start(vec![(200, "corrupt")]);
         let image = format!("{}/repo:tag", server.authority()).parse().unwrap();
         let desc = descriptor(MEDIA_TYPE_CHUNK, sha256_hex(b"correct"), 7);
-        let error = pull_blob_bytes(&http_client(), &image, &desc)
+        let error = pull_blob_bytes(&http_client(), &image, &desc, MAX_CHUNK_BLOB)
             .await
             .unwrap_err();
         assert!(matches!(error, Error::Format(_)), "{error}");

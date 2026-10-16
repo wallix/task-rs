@@ -8,8 +8,8 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::fs::{File, Metadata, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{File, Metadata};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::chunker::{AVG_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::error::{Error, Result};
 use crate::index::{ChunkRef, FileEntry, Index, ZSTD_LEVEL, safe_rel_path, zstd_decode_bounded};
+use crate::restore::{self, Tree};
 
 /// Concatenate the given files (slash-separated paths relative to `base_dir`,
 /// duplicates ignored) into the content stream, chunk it, and emit each
@@ -165,35 +166,79 @@ impl Read for ConcatFiles {
 /// Restore the file set under `base_dir`, fetching the stream chunks through
 /// `src`. Every chunk is digest-verified and its decompressed size checked, so a
 /// corrupt or substituted blob fails the restore instead of landing on disk.
-/// Existing files are overwritten.
+///
+/// The set is untrusted: every path is checked before anything is written (see
+/// [`crate::restore`]), and every entry is written confined to `base_dir`, an
+/// existing file or symlink replaced by a fresh one, never written through.
+/// It applies no policy on *which* paths may be written: a caller restoring
+/// into a project vets [`Index::files`] first (as `task` does through
+/// [`crate::Store::pull_index`]).
 pub fn assemble<Src>(idx: &Index, base_dir: &Path, src: Src) -> Result<()>
 where
     Src: FnMut(&str) -> Result<Vec<u8>>,
 {
+    let parts = idx
+        .files
+        .iter()
+        .map(|f| restore::components(&f.path, false))
+        .collect::<Result<Vec<_>>>()?;
+    restore::check_link_parents(
+        parts
+            .iter()
+            .zip(&idx.files)
+            .map(|(p, f)| (p.as_slice(), !f.symlink.is_empty())),
+    )?;
+    let mut tree = Tree::open(base_dir)?;
     let mut stream = StreamReader::new(idx, src);
-    for entry in &idx.files {
-        if !safe_rel_path(&entry.path) {
-            return Err(Error::format(format!(
-                "unsafe path {:?} in index",
-                entry.path
-            )));
-        }
-        // A symlink entry can point outside the root; a later entry written
-        // under it would escape. Reject any write whose parent chain crosses a
-        // symlink.
-        check_no_symlink_parents(base_dir, &entry.path)?;
-        let full = base_dir.join(from_slash(&entry.path));
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+    for (entry, parts) in idx.files.iter().zip(&parts) {
         if !entry.symlink.is_empty() {
-            remove_path(&full)?;
-            make_symlink(&entry.symlink, &full)?;
+            tree.symlink(parts, entry.symlink.as_bytes())?;
             continue;
         }
-        assemble_file(entry, &full, &mut stream)?;
+        let size = u64::try_from(entry.size)
+            .map_err(|_| Error::format(format!("{}: negative size", entry.path)))?;
+        let mut body = EntryReader {
+            stream: &mut stream,
+            remaining: size,
+        };
+        tree.file(parts, entry.mode, size, &mut body)?;
+        if body.remaining > 0 {
+            return Err(Error::format(format!("{}: short contents", entry.path)));
+        }
     }
-    Ok(())
+    tree.finish()
+}
+
+/// One file's bytes out of the stream, exactly as many as the index gives it.
+struct EntryReader<'s, 'a, Src> {
+    stream: &'s mut StreamReader<'a, Src>,
+    remaining: u64,
+}
+
+impl<Src> Read for EntryReader<'_, '_, Src>
+where
+    Src: FnMut(&str) -> Result<Vec<u8>>,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let want = self
+            .remaining
+            .min(buf.len() as u64)
+            .min(MAX_CHUNK_SIZE as u64) as usize;
+        if want == 0 {
+            return Ok(0);
+        }
+        let data = self.stream.read(want).map_err(|e| match e {
+            Error::Io(e) => e,
+            Error::Format(m) | Error::Network(m) => std::io::Error::other(m),
+            e => std::io::Error::other(e),
+        })?;
+        let n = data.len();
+        if let Some(dst) = buf.get_mut(..n) {
+            dst.copy_from_slice(&data);
+        }
+        self.remaining = self.remaining.saturating_sub(n as u64);
+        Ok(n)
+    }
 }
 
 /// Walks the decompressed stream chunk by chunk; consumers read exactly the
@@ -255,63 +300,14 @@ where
     }
 }
 
-fn assemble_file<Src>(
-    entry: &FileEntry,
-    full: &Path,
-    stream: &mut StreamReader<'_, Src>,
-) -> Result<()>
-where
-    Src: FnMut(&str) -> Result<Vec<u8>>,
-{
-    // O_TRUNC on a stale symlink would write through it into the link target:
-    // replace anything that is not a regular file.
-    if let Ok(meta) = std::fs::symlink_metadata(full)
-        && !meta.file_type().is_file()
-    {
-        remove_path(full)?;
-    }
-    let mut f = open_write(full, entry.mode)?;
-    // The file may pre-exist with other permissions: enforce the index's.
-    set_perm(&f, entry.mode)?;
-
-    let mut remaining = entry.size;
-    while remaining > 0 {
-        let want = remaining.min(MAX_CHUNK_SIZE as i64);
-        let data = stream.read(want as usize)?;
-        f.write_all(&data)?;
-        remaining = remaining.saturating_sub(data.len() as i64);
-    }
-    Ok(())
-}
-
-/// Reject a path any of whose existing parent directories is a symlink: writing
-/// under it would follow the link out of `base_dir`. The leaf is not checked —
-/// it is the entry being (re)created.
-fn check_no_symlink_parents(base_dir: &Path, slash_path: &str) -> Result<()> {
-    let parts: Vec<&str> = slash_path.split('/').collect();
-    let n = parts.len();
-    let mut dir = base_dir.to_path_buf();
-    for part in parts.iter().take(n.saturating_sub(1)) {
-        dir.push(part);
-        match std::fs::symlink_metadata(&dir) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    return Err(Error::format(format!(
-                        "{slash_path:?}: parent {part:?} is a symlink"
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Return the bare hex of a `sha256:<hex>` digest — the layout helper for
 /// content-addressed stores (`.../sha256/<hex>`).
 pub fn digest_hex(digest: &str) -> Option<&str> {
-    digest.strip_prefix("sha256:").filter(|hex| hex.len() == 64)
+    // Require lowercase hex: this names a local store file, so a forged
+    // digest containing `/` or `..` must not become a path.
+    digest.strip_prefix("sha256:").filter(|hex| {
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
@@ -351,57 +347,6 @@ fn perm_bits(m: &Metadata) -> u32 {
     } else {
         0o644
     }
-}
-
-fn open_write(path: &Path, mode: u32) -> Result<File> {
-    let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(mode);
-    }
-    let _ = mode;
-    Ok(opts.open(path)?)
-}
-
-#[cfg(unix)]
-fn set_perm(f: &File, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    f.set_permissions(std::fs::Permissions::from_mode(mode))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_perm(_f: &File, _mode: u32) -> Result<()> {
-    Ok(())
-}
-
-fn remove_path(p: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(p) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-        Ok(meta) => {
-            if meta.file_type().is_dir() {
-                std::fs::remove_dir_all(p)?;
-            } else {
-                std::fs::remove_file(p)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-#[cfg(unix)]
-fn make_symlink(target: &str, link: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(target, link)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn make_symlink(target: &str, link: &Path) -> Result<()> {
-    std::os::windows::fs::symlink_file(target, link)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -584,5 +529,129 @@ mod tests {
         );
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&dst).ok();
+    }
+
+    /// A one-file index of `body` at `path` with `mode`, plus the chunks.
+    fn one_file(path: &str, mode: u32, body: &[u8]) -> (Index, HashMap<String, Vec<u8>>) {
+        let src = tmpdir("src");
+        write_file(&src, "f", body);
+        let (mut idx, store) = mem_build(&src, &["f".to_string()], false);
+        idx.files[0].path = path.to_string();
+        idx.files[0].mode = mode;
+        (idx, store)
+    }
+
+    fn symlink_entry(path: &str, target: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            mode: 0o777,
+            size: 0,
+            symlink: target.to_string(),
+        }
+    }
+
+    #[test]
+    fn assemble_refuses_paths_that_leave_the_root() {
+        for path in [
+            "../x",
+            "a/../../x",
+            "/abs",
+            "a\\..\\..\\x",
+            "\\abs",
+            "x\0",
+            "",
+        ] {
+            let (idx, store) = one_file(path, 0o644, b"x");
+            let root = tmpdir("root");
+            let dst = root.join("dst");
+            std::fs::create_dir(&dst).unwrap();
+            assert!(
+                assemble(&idx, &dst, mem_source(&store)).is_err(),
+                "{path:?}"
+            );
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "{path:?}");
+            assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 0, "{path:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assemble_refuses_entries_under_its_own_symlink_before_writing() {
+        let outside = tmpdir("outside");
+        let (mut idx, store) = one_file("a/secret", 0o644, b"PWN");
+        idx.files
+            .insert(0, symlink_entry("a", outside.to_str().unwrap()));
+        let dst = tmpdir("dst");
+        let err = assemble(&idx, &dst, mem_source(&store)).unwrap_err();
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+        assert!(!outside.join("secret").exists());
+        assert!(std::fs::symlink_metadata(dst.join("a")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assemble_does_not_follow_symlinks_on_disk() {
+        let outside = tmpdir("outside");
+        std::fs::write(outside.join("secret"), b"S").unwrap();
+        let dst = tmpdir("dst");
+        std::os::unix::fs::symlink(&outside, dst.join("p")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), dst.join("leaf")).unwrap();
+        let (idx, store) = one_file("p/secret", 0o644, b"PWN");
+        assert!(assemble(&idx, &dst, mem_source(&store)).is_err());
+        let (idx, store) = one_file("leaf", 0o644, b"PWN");
+        assemble(&idx, &dst, mem_source(&store)).unwrap();
+        assert_eq!(std::fs::read(outside.join("secret")).unwrap(), b"S");
+        assert_eq!(std::fs::read(dst.join("leaf")).unwrap(), b"PWN");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assemble_does_not_write_or_chmod_a_hard_linked_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let outside = tmpdir("outside");
+        let secret = outside.join("secret");
+        std::fs::write(&secret, b"S").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let dst = tmpdir("dst");
+        std::fs::hard_link(&secret, dst.join("h")).unwrap();
+        let (idx, store) = one_file("h", 0o777, b"PWN");
+        assemble(&idx, &dst, mem_source(&store)).unwrap();
+        assert_eq!(std::fs::read(&secret).unwrap(), b"S");
+        let mode = std::fs::metadata(&secret).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o600);
+        assert_eq!(std::fs::read(dst.join("h")).unwrap(), b"PWN");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assemble_duplicate_entry_does_not_follow_earlier_symlink() {
+        let outside = tmpdir("outside");
+        let (mut idx, store) = one_file("x", 0o644, b"PWN");
+        let target = outside.join("f");
+        idx.files
+            .insert(0, symlink_entry("x", target.to_str().unwrap()));
+        let dst = tmpdir("dst");
+        assemble(&idx, &dst, mem_source(&store)).unwrap();
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(dst.join("x")).unwrap(), b"PWN");
+    }
+
+    #[test]
+    fn assemble_refuses_an_oversized_symlink_target() {
+        let idx = Index {
+            files: vec![symlink_entry("l", &"t/".repeat(4096))],
+            ..Index::new()
+        };
+        let dst = tmpdir("dst");
+        assert!(assemble(&idx, &dst, |_: &str| Ok(Vec::new())).is_err());
+    }
+
+    #[test]
+    fn digest_hex_takes_only_lowercase_hex() {
+        let good = format!("sha256:{}", "a".repeat(64));
+        assert!(digest_hex(&good).is_some());
+        let forged = format!("sha256:{:/<64}", "../../../../tmp/x");
+        assert!(digest_hex(&forged).is_none());
+        assert!(digest_hex(&format!("sha256:{}", "A".repeat(64))).is_none());
     }
 }

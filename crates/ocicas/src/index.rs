@@ -33,6 +33,15 @@ pub const MEDIA_TYPE_CHUNK: &str = "application/vnd.wallix.cas.chunk.v1+zstd";
 /// cap only guards decompression against a zstd bomb.
 const MAX_INDEX_SIZE: usize = 1 << 30;
 
+/// Bounds the index blob as downloaded, before it is decompressed: a quarter
+/// of [`MAX_INDEX_SIZE`], far above what zstd makes of any index that fits it.
+pub(crate) const MAX_INDEX_BLOB: usize = MAX_INDEX_SIZE / 4;
+
+/// Bounds one chunk blob as downloaded: twice [`MAX_CHUNK_SIZE`], above zstd's
+/// worst-case expansion of a raw chunk (and the raw chunk the transparent
+/// scheme serves).
+pub(crate) const MAX_CHUNK_BLOB: usize = MAX_CHUNK_SIZE * 2;
+
 /// References one compressed chunk blob of the stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkRef {
@@ -129,13 +138,13 @@ impl Index {
         }
     }
 
-    /// Total length of the concatenated contents (symlinks contribute nothing).
-    fn stream_size(&self) -> i64 {
+    /// Total length of the concatenated contents (symlinks contribute nothing),
+    /// or `None` if it overflows.
+    fn stream_size(&self) -> Option<i64> {
         self.files
             .iter()
             .filter(|f| f.symlink.is_empty())
-            .map(|f| f.size)
-            .sum()
+            .try_fold(0i64, |sum, f| sum.checked_add(f.size))
     }
 
     /// Render the index as zstd-compressed deterministic JSON.
@@ -169,27 +178,6 @@ pub fn unmarshal_index(data: &[u8]) -> Result<Index> {
             idx.compression.algo
         )));
     }
-    let mut chunked: i64 = 0;
-    for c in &idx.chunks {
-        if c.raw_size < 0 || c.size < 0 {
-            return Err(Error::format("negative chunk size"));
-        }
-        // The chunker never emits more: a larger raw size is a forged index
-        // trying to force a huge allocation on restore.
-        if c.raw_size > MAX_CHUNK_SIZE as i64 {
-            return Err(Error::format(format!(
-                "chunk {}: raw size {} exceeds max {}",
-                c.digest, c.raw_size, MAX_CHUNK_SIZE
-            )));
-        }
-        chunked = chunked.saturating_add(c.raw_size);
-    }
-    let need = idx.stream_size();
-    if chunked != need {
-        return Err(Error::format(format!(
-            "chunks cover {chunked} bytes, files need {need}"
-        )));
-    }
     for f in &idx.files {
         if !safe_rel_path(&f.path) {
             return Err(Error::format(format!("unsafe path {:?} in index", f.path)));
@@ -206,17 +194,57 @@ pub fn unmarshal_index(data: &[u8]) -> Result<Index> {
             )));
         }
     }
+    let mut chunked: i64 = 0;
+    for c in &idx.chunks {
+        if c.raw_size < 0 || c.size < 0 {
+            return Err(Error::format("negative chunk size"));
+        }
+        if c.size > MAX_CHUNK_BLOB as i64 {
+            return Err(Error::format(format!(
+                "chunk {}: size {} exceeds max {MAX_CHUNK_BLOB}",
+                c.digest, c.size
+            )));
+        }
+        // The chunker never emits more: a larger raw size is a forged index
+        // trying to force a huge allocation on restore.
+        if c.raw_size > MAX_CHUNK_SIZE as i64 {
+            return Err(Error::format(format!(
+                "chunk {}: raw size {} exceeds max {}",
+                c.digest, c.raw_size, MAX_CHUNK_SIZE
+            )));
+        }
+        if crate::cas::digest_hex(&c.digest).is_none() {
+            return Err(Error::format(format!(
+                "chunk digest {:?} is malformed",
+                c.digest
+            )));
+        }
+        chunked = chunked
+            .checked_add(c.raw_size)
+            .ok_or_else(|| Error::format("chunk sizes overflow"))?;
+    }
+    let need = idx
+        .stream_size()
+        .ok_or_else(|| Error::format("file sizes overflow"))?;
+    if chunked != need {
+        return Err(Error::format(format!(
+            "chunks cover {chunked} bytes, files need {need}"
+        )));
+    }
     Ok(idx)
 }
 
 /// Accepts slash-separated relative paths without empty, "." or ".."
-/// components — the zip-slip guard of the format.
+/// components, and that [`crate::restore::components`] accepts (no NUL, no
+/// backslash, nothing the platform reads as a root or alias) — the zip-slip
+/// guard of the format.
 pub(crate) fn safe_rel_path(p: &str) -> bool {
     if p.is_empty() || p.starts_with('/') {
         return false;
     }
     !p.split('/')
         .any(|part| part.is_empty() || part == "." || part == "..")
+        && crate::restore::components(p, false).is_ok()
 }
 
 /// Decode a zstd frame, capping the output at `max` bytes so a bomb fails
@@ -238,9 +266,11 @@ pub(crate) fn zstd_decode_bounded(data: &[u8], max: usize) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// A chunk reference; `digest` is padded to a well-formed one.
     fn chunk(digest: &str, size: i64, raw: i64) -> ChunkRef {
+        let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
         ChunkRef {
-            digest: digest.to_string(),
+            digest: format!("sha256:{hex:0<64}"),
             size,
             raw_size: raw,
         }
@@ -278,6 +308,13 @@ mod tests {
         assert!(!safe_rel_path("a/../b"));
         assert!(!safe_rel_path("./a"));
         assert!(!safe_rel_path("a//b"));
+        assert!(!safe_rel_path("a/.."));
+        assert!(!safe_rel_path(".."));
+        // A backslash is a separator to Windows, which would read
+        // `a\..\..\x` as escaping.
+        assert!(!safe_rel_path("a\\..\\..\\x"));
+        assert!(!safe_rel_path("\\abs"));
+        assert!(!safe_rel_path("a\0b"));
         assert!(safe_rel_path("a/b/c.txt"));
         assert!(safe_rel_path("file"));
     }
@@ -294,6 +331,38 @@ mod tests {
         });
         let blob = idx.marshal().expect("marshal");
         assert!(unmarshal_index(&blob).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_chunk_digests() {
+        // 64 characters, but a path: it would name a file outside the CAS.
+        let forged = format!("sha256:{:/<64}", "../../../../tmp/x");
+        for digest in [forged, "sha256:AA".to_string(), "md5:00".to_string()] {
+            let mut idx = Index::new();
+            idx.chunks.push(ChunkRef {
+                digest: digest.clone(),
+                size: 0,
+                raw_size: 0,
+            });
+            let blob = idx.marshal().expect("marshal");
+            assert!(unmarshal_index(&blob).is_err(), "{digest}");
+        }
+    }
+
+    #[test]
+    fn rejects_file_sizes_that_overflow() {
+        let mut idx = Index::new();
+        for path in ["a", "b"] {
+            idx.files.push(FileEntry {
+                path: path.to_string(),
+                mode: 0o644,
+                size: i64::MAX,
+                symlink: String::new(),
+            });
+        }
+        let blob = idx.marshal().expect("marshal");
+        let err = unmarshal_index(&blob).unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{err}");
     }
 
     #[test]

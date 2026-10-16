@@ -28,6 +28,7 @@ mod chunker;
 mod error;
 mod index;
 mod lock;
+pub mod restore;
 mod retry;
 mod store;
 #[cfg(test)]
@@ -42,4 +43,4 @@ pub use index::{
     MEDIA_TYPE_CHUNK, MEDIA_TYPE_INDEX, unmarshal_index,
 };
 pub use lock::{Lease, Locker};
-pub use store::{PushStats, RemoteOptions, Store};
+pub use store::{Pulled, PushStats, RemoteOptions, Store};

@@ -129,7 +129,7 @@ fn warn_cache_save_failed(logger: &mut Logger, repo: &str, task_name: &str, err:
 /// Attempt to download and restore a cached entry for `task` into `dir`. On
 /// success returns `(true, meta)`; the caller verifies the generates checksum
 /// against the restored files. A miss or any recoverable failure returns
-/// `(false, _)`. `source_value` is the task's current sources checksum: a zip
+/// `(false, _)`. `source_value` is the task's current sources checksum: an
 /// entry cached for other sources, or for another task, is refused before
 /// anything is written, as is one holding files outside the task's generates.
 pub async fn cache_restore(
@@ -139,11 +139,10 @@ pub async fn cache_restore(
     dir: &Path,
     logger: &mut Logger,
 ) -> (bool, CacheMeta) {
-    let task_name = task.name();
     match url {
         CacheUrl::Zip { path } => restore_file(Path::new(path), task, source_value, dir, logger),
         CacheUrl::Oci { repo, tag, opts } => {
-            restore_oci(repo, tag, opts.clone(), task_name, dir, logger).await
+            restore_oci(repo, tag, opts.clone(), task, source_value, dir, logger).await
         }
         CacheUrl::Redis => {
             logger.verbose_errf(
@@ -155,29 +154,67 @@ pub async fn cache_restore(
     }
 }
 
-/// The checks on a zip entry's comment that need no restored file: it has a
-/// generates checksum, and was cached for this task and these sources.
-fn check_zip_meta(
-    meta: &CacheMeta,
-    local_name: &str,
-    source_value: &str,
-) -> Result<(), CacheError> {
-    if meta.generates.is_empty() {
-        return Err(CacheError::rejected("it has no generates checksum"));
+/// What a task's restore accepts, the same for every transport: an entry
+/// cached for this task and these sources, with a generates checksum, holding
+/// only the task's generates. Both transports write an entry from those alone
+/// (see [`cache_save`]), so anything else is not one Task wrote.
+struct TaskRestore {
+    local_name: String,
+    source_value: String,
+    matcher: CacheMatcher,
+    root: String,
+}
+
+impl TaskRestore {
+    fn new(task: &Task, source_value: &str, dir: &Path) -> Self {
+        Self {
+            local_name: task.local_name(),
+            source_value: source_value.to_string(),
+            matcher: CacheMatcher::new(&task.compute_dir().to_string_lossy(), &task.generates),
+            root: dir.to_string_lossy().into_owned(),
+        }
     }
-    if !meta.task.is_empty() && meta.task != local_name {
-        return Err(CacheError::rejected(format!(
-            "task name mismatch: cached {:?}, expected {local_name:?}",
-            meta.task
-        )));
+
+    fn check_meta(&self, meta: &CacheMeta) -> Result<(), CacheError> {
+        let (local_name, source_value) = (&self.local_name, &self.source_value);
+        if meta.generates.is_empty() {
+            return Err(CacheError::rejected("it has no generates checksum"));
+        }
+        // Both are always recorded on save; one missing is not an entry Task
+        // wrote for this task.
+        if meta.task != *local_name {
+            return Err(CacheError::rejected(format!(
+                "task name mismatch: cached {:?}, expected {local_name:?}",
+                meta.task
+            )));
+        }
+        if meta.sources.is_empty() || meta.sources != *source_value {
+            return Err(CacheError::rejected(format!(
+                "sources checksum mismatch: cached {}, got {source_value}",
+                meta.sources
+            )));
+        }
+        Ok(())
     }
-    if !meta.sources.is_empty() && meta.sources != source_value {
-        return Err(CacheError::rejected(format!(
-            "sources checksum mismatch: cached {}, got {source_value}",
-            meta.sources
-        )));
+
+    fn accept(&self, rel: &str) -> bool {
+        self.matcher.matches(&self.root, rel)
     }
-    Ok(())
+}
+
+/// Warn on rejected entries, which are not what Task wrote; report other
+/// restore failures only at verbose level.
+fn report_restore_error(logger: &mut Logger, task_name: &str, what: &str, e: &CacheError) {
+    if let CacheError::Rejected(e) = e {
+        logger.errf(
+            Color::Yellow,
+            &format!(
+                "task: WARNING: cache for {task_name:?} rejected: {e}, running task normally\n"
+            ),
+        );
+    } else {
+        logger.verbose_errf(Color::Yellow, &format!("task: {what}: {e}\n"));
+    }
 }
 
 fn restore_file(
@@ -191,13 +228,9 @@ fn restore_file(
     if !zip_path.exists() {
         return (false, CacheMeta::default()); // miss
     }
-    // The archive is written from the task's generates alone (see
-    // `cache_save`), so an entry outside them is not one it wrote.
-    let local_name = task.local_name();
-    let matcher = CacheMatcher::new(&task.compute_dir().to_string_lossy(), &task.generates);
-    let root = dir.to_string_lossy();
-    let check = |m: &CacheMeta| check_zip_meta(m, &local_name, source_value);
-    let accept = |rel: &str| matcher.matches(&root, rel);
+    let restore = TaskRestore::new(task, source_value, dir);
+    let check = |m: &CacheMeta| restore.check_meta(m);
+    let accept = |rel: &str| restore.accept(rel);
     let policy = archive::RestorePolicy {
         check_meta: Some(&check),
         accept: Some(&accept),
@@ -210,30 +243,42 @@ fn restore_file(
             );
             (true, meta)
         }
-        Err(CacheError::Rejected(e)) => {
-            logger.errf(
-                Color::Yellow,
-                &format!(
-                    "task: WARNING: cache for {task_name:?} rejected: {e}, running task normally\n"
-                ),
-            );
-            (false, CacheMeta::default())
-        }
         Err(e) => {
-            logger.verbose_errf(Color::Yellow, &format!("task: cache extract: {e}\n"));
+            report_restore_error(logger, task_name, "cache extract", &e);
             (false, CacheMeta::default())
         }
     }
+}
+
+/// Check an OCI entry's annotations and file list against `restore`, as
+/// [`archive::extract_archive`] checks a zip's, before anything is fetched.
+fn vet_oci(
+    restore: &TaskRestore,
+    meta: &CacheMeta,
+    index: &ocicas::Index,
+) -> Result<(), CacheError> {
+    restore.check_meta(meta)?;
+    let accept = |rel: &str| restore.accept(rel);
+    let policy = archive::RestorePolicy {
+        check_meta: None,
+        accept: Some(&accept),
+    };
+    index.files.iter().try_for_each(|f| {
+        let parts = ocicas::restore::components(&f.path, false)?;
+        policy.check_entry(&f.path, &parts)
+    })
 }
 
 async fn restore_oci(
     repo: &str,
     tag: &str,
     opts: ocicas::RemoteOptions,
-    task_name: &str,
+    task: &Task,
+    source_value: &str,
     dir: &Path,
     logger: &mut Logger,
 ) -> (bool, CacheMeta) {
+    let task_name = task.name();
     let store = match ocicas::Store::open(repo, opts).await {
         Ok(s) => s,
         Err(e) => {
@@ -247,22 +292,7 @@ async fn restore_oci(
     };
     match store.resolve_annotations(tag).await {
         Ok(None) => return (false, CacheMeta::default()), // miss
-        Ok(Some(ann)) => {
-            if ann
-                .get(oci::ANN_GENERATES)
-                .map(String::as_str)
-                .unwrap_or("")
-                .is_empty()
-            {
-                logger.errf(
-                    Color::Yellow,
-                    &format!(
-                        "task: WARNING: cache for {task_name:?} has no generates checksum, rejecting\n"
-                    ),
-                );
-                return (false, CacheMeta::default());
-            }
-        }
+        Ok(Some(_)) => {}
         Err(e) => {
             logger.verbose_errf(
                 Color::Yellow,
@@ -272,15 +302,38 @@ async fn restore_oci(
             return (false, CacheMeta::default());
         }
     }
-    // Take metadata from the annotations pull returns, not the pre-check ones:
-    // the tag may have been repushed between the two resolves.
-    match store.pull(tag, dir).await {
-        Ok((_idx, ann)) => {
+    // Vet the annotations and the file list the index fetch returns — not the
+    // pre-check's, as the tag may have been repushed in between — before any
+    // chunk is fetched or file written.
+    let pulled = match store.pull_index(tag).await {
+        Ok(p) => p,
+        Err(e) => {
+            logger.verbose_errf(
+                Color::Yellow,
+                &format!("task: cache restore {task_name:?}: {e}\n"),
+            );
+            warn_cache_unreachable(logger, repo, &e);
+            return (false, CacheMeta::default());
+        }
+    };
+    let meta = meta_from_annotations(&pulled.annotations);
+    let restore = TaskRestore::new(task, source_value, dir);
+    if let Err(e) = vet_oci(&restore, &meta, &pulled.index) {
+        report_restore_error(
+            logger,
+            task_name,
+            &format!("cache restore {task_name:?}"),
+            &e,
+        );
+        return (false, CacheMeta::default());
+    }
+    match store.assemble_pulled(&pulled, dir).await {
+        Ok(()) => {
             logger.errf(
                 Color::Magenta,
                 &format!("task: {task_name:?} restored from cache\n"),
             );
-            (true, meta_from_annotations(&ann))
+            (true, meta)
         }
         Err(e) => {
             logger.verbose_errf(
@@ -329,6 +382,23 @@ pub async fn cache_save(
         }
     };
     let source_value = checker.source_value().to_string();
+    let (files, git) = archive::split_git_files(dir, &st.cache_files);
+    if !git.is_empty() {
+        logger.errf(
+            Color::Yellow,
+            &format!(
+                "task: WARNING: cache save {task_name:?}: leaving out {} file(s) inside .git, which no restore writes\n",
+                git.len()
+            ),
+        );
+    }
+    if files.is_empty() {
+        return;
+    }
+    let st = crate::fingerprint::TaskStatus {
+        cache_files: files,
+        ..st
+    };
 
     match url {
         CacheUrl::Zip { path } => {
@@ -503,6 +573,80 @@ fn rename_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn oci_index(paths: &[&str]) -> ocicas::Index {
+        let mut idx: ocicas::Index = serde_json::from_value(serde_json::json!({
+            "version": ocicas::INDEX_VERSION,
+            "chunker": {"algo": "", "min": 0, "avg": 0, "max": 0},
+            "compression": {"algo": "zstd", "level": 3},
+            "files": [],
+        }))
+        .unwrap();
+        for p in paths {
+            idx.files.push(ocicas::FileEntry {
+                path: (*p).to_string(),
+                mode: 0o644,
+                size: 0,
+                symlink: String::new(),
+            });
+        }
+        idx
+    }
+
+    #[test]
+    fn oci_restore_takes_only_the_tasks_generates() {
+        let root = std::env::temp_dir().join("task-oci-vet");
+        let task = Task {
+            task: "build".into(),
+            dirs: vec![root.to_string_lossy().into_owned()],
+            generates: vec![crate::ast::Glob {
+                glob: "out/**".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let restore = TaskRestore::new(&task, "src1", &root);
+        let meta = CacheMeta {
+            task: "build".into(),
+            sources: "src1".into(),
+            generates: "gen".into(),
+        };
+        assert!(vet_oci(&restore, &meta, &oci_index(&["out/a", "out/b/c"])).is_ok());
+        for bad in [
+            "Taskfile.yml",
+            "out/.git/hooks/x",
+            ".git/config",
+            ".task/checksum/x",
+        ] {
+            let err = vet_oci(&restore, &meta, &oci_index(&["out/a", bad])).unwrap_err();
+            assert!(matches!(err, CacheError::Rejected(_)), "{bad}: {err}");
+        }
+        for wrong in [
+            CacheMeta {
+                task: "other".into(),
+                ..meta.clone()
+            },
+            CacheMeta {
+                sources: "src2".into(),
+                ..meta.clone()
+            },
+            CacheMeta {
+                generates: String::new(),
+                ..meta.clone()
+            },
+            CacheMeta {
+                task: String::new(),
+                ..meta.clone()
+            },
+            CacheMeta {
+                sources: String::new(),
+                ..meta.clone()
+            },
+        ] {
+            let err = vet_oci(&restore, &wrong, &oci_index(&["out/a"])).unwrap_err();
+            assert!(matches!(err, CacheError::Rejected(_)), "{wrong:?}: {err}");
+        }
+    }
 
     #[test]
     fn parse_file_and_oci_and_redis() {
