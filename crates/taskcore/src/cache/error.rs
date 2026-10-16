@@ -16,6 +16,9 @@ pub enum CacheError {
     Ocicas(ocicas::Error),
     /// A backend requested by the URL scheme that this build does not support.
     Unsupported(String),
+    /// A cached entry refused before anything was restored from it: it does
+    /// not belong to the task, or would write outside its outputs.
+    Rejected(String),
     /// Any other message-only failure.
     Msg(String),
 }
@@ -23,6 +26,9 @@ pub enum CacheError {
 impl CacheError {
     pub fn msg(s: impl Into<String>) -> CacheError {
         CacheError::Msg(s.into())
+    }
+    pub fn rejected(s: impl Into<String>) -> CacheError {
+        CacheError::Rejected(s.into())
     }
     pub fn url(s: impl Into<String>) -> CacheError {
         CacheError::Url(s.into())
@@ -40,6 +46,7 @@ impl fmt::Display for CacheError {
             CacheError::Url(s) => write!(f, "{s}"),
             CacheError::Ocicas(e) => write!(f, "{e}"),
             CacheError::Unsupported(s) => write!(f, "{s}"),
+            CacheError::Rejected(s) => write!(f, "{s}"),
             CacheError::Msg(s) => write!(f, "{s}"),
         }
     }

@@ -26,7 +26,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use crate::ast::Task;
-use crate::fingerprint::ChecksumChecker;
+use crate::fingerprint::{CacheMatcher, ChecksumChecker};
 use crate::logger::{Color, Logger};
 
 pub use archive::CacheMeta;
@@ -126,17 +126,22 @@ fn warn_cache_save_failed(logger: &mut Logger, repo: &str, task_name: &str, err:
     }
 }
 
-/// Attempt to download and restore a cached entry into `dir`. On success
-/// returns `(true, meta)`; the caller verifies the metadata against the current
-/// task state. A miss or any recoverable failure returns `(false, _)`.
+/// Attempt to download and restore a cached entry for `task` into `dir`. On
+/// success returns `(true, meta)`; the caller verifies the generates checksum
+/// against the restored files. A miss or any recoverable failure returns
+/// `(false, _)`. `source_value` is the task's current sources checksum: a zip
+/// entry cached for other sources, or for another task, is refused before
+/// anything is written, as is one holding files outside the task's generates.
 pub async fn cache_restore(
     url: &CacheUrl,
-    task_name: &str,
+    task: &Task,
+    source_value: &str,
     dir: &Path,
     logger: &mut Logger,
 ) -> (bool, CacheMeta) {
+    let task_name = task.name();
     match url {
-        CacheUrl::Zip { path } => restore_file(Path::new(path), task_name, dir, logger),
+        CacheUrl::Zip { path } => restore_file(Path::new(path), task, source_value, dir, logger),
         CacheUrl::Oci { repo, tag, opts } => {
             restore_oci(repo, tag, opts.clone(), task_name, dir, logger).await
         }
@@ -150,31 +155,69 @@ pub async fn cache_restore(
     }
 }
 
+/// The checks on a zip entry's comment that need no restored file: it has a
+/// generates checksum, and was cached for this task and these sources.
+fn check_zip_meta(
+    meta: &CacheMeta,
+    local_name: &str,
+    source_value: &str,
+) -> Result<(), CacheError> {
+    if meta.generates.is_empty() {
+        return Err(CacheError::rejected("it has no generates checksum"));
+    }
+    if !meta.task.is_empty() && meta.task != local_name {
+        return Err(CacheError::rejected(format!(
+            "task name mismatch: cached {:?}, expected {local_name:?}",
+            meta.task
+        )));
+    }
+    if !meta.sources.is_empty() && meta.sources != source_value {
+        return Err(CacheError::rejected(format!(
+            "sources checksum mismatch: cached {}, got {source_value}",
+            meta.sources
+        )));
+    }
+    Ok(())
+}
+
 fn restore_file(
     zip_path: &Path,
-    task_name: &str,
+    task: &Task,
+    source_value: &str,
     dir: &Path,
     logger: &mut Logger,
 ) -> (bool, CacheMeta) {
+    let task_name = task.name();
     if !zip_path.exists() {
         return (false, CacheMeta::default()); // miss
     }
-    match archive::extract_archive(zip_path, dir) {
+    // The archive is written from the task's generates alone (see
+    // `cache_save`), so an entry outside them is not one it wrote.
+    let local_name = task.local_name();
+    let matcher = CacheMatcher::new(&task.compute_dir().to_string_lossy(), &task.generates);
+    let root = dir.to_string_lossy();
+    let check = |m: &CacheMeta| check_zip_meta(m, &local_name, source_value);
+    let accept = |rel: &str| matcher.matches(&root, rel);
+    let policy = archive::RestorePolicy {
+        check_meta: Some(&check),
+        accept: Some(&accept),
+    };
+    match archive::extract_archive(zip_path, dir, &policy) {
         Ok(meta) => {
-            if meta.generates.is_empty() {
-                logger.errf(
-                    Color::Yellow,
-                    &format!(
-                        "task: WARNING: cache for {task_name:?} has no generates checksum, rejecting\n"
-                    ),
-                );
-                return (false, CacheMeta::default());
-            }
             logger.errf(
                 Color::Magenta,
                 &format!("task: {task_name:?} restored from cache\n"),
             );
             (true, meta)
+        }
+        Err(CacheError::Rejected(e)) => {
+            logger.errf(
+                Color::Yellow,
+                &format!(
+                    "task: WARNING: cache for {task_name:?} rejected: {e}, running task normally\n"
+                ),
+            );
+            (false, CacheMeta::default())
         }
         Err(e) => {
             logger.verbose_errf(Color::Yellow, &format!("task: cache extract: {e}\n"));

@@ -80,6 +80,95 @@ pub fn cache_globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<String>> {
     Ok(tree_globs(dir, own(globs), folded))
 }
 
+/// Match paths against [`cache_globs`]'s `globs` without walking the tree,
+/// so a restore can reject entries outside the task's generates before writing.
+/// Matches every path the walk lists, but may also match paths below directory
+/// symlinks that a wildcard would not cross. A restore rejects those separately.
+pub struct CacheMatcher {
+    own: MatchGroup,
+    folded: Vec<MatchGroup>,
+}
+
+/// One group's entries, joined and split as the walk splits them.
+struct MatchGroup {
+    includes: Vec<Vec<String>>,
+    excludes: Vec<Vec<String>>,
+    fingerprints: Vec<Vec<String>>,
+}
+
+/// `path`'s segments with the walk's root marker, dropping the `.` and empty
+/// segments a pattern may carry (an absolute one is not cleaned when joined):
+/// the walk lists such paths, and saving normalises them away.
+fn normalized_segments(path: &str) -> Vec<String> {
+    rooted_segments(path)
+        .into_iter()
+        .enumerate()
+        .filter(|(i, s)| *i == 0 || !matches!(*s, "" | "."))
+        .map(|(_, s)| s.to_string())
+        .collect()
+}
+
+impl MatchGroup {
+    fn new<'a>(dir: &str, globs: impl Iterator<Item = &'a Glob>) -> Self {
+        let mut group = Self {
+            includes: Vec::new(),
+            excludes: Vec::new(),
+            fingerprints: Vec::new(),
+        };
+        for g in globs {
+            let segments = normalized_segments(&join_pattern(dir, &g.glob));
+            if g.negate {
+                group.excludes.push(segments);
+            } else {
+                group.includes.push(segments);
+                if !g.fingerprint.is_empty() {
+                    group
+                        .fingerprints
+                        .push(normalized_segments(&join_pattern(dir, &g.fingerprint)));
+                }
+            }
+        }
+        group
+    }
+
+    fn excluded(&self, segments: &[&str]) -> bool {
+        self.excludes
+            .iter()
+            .any(|e| match_segments(e, segments, Options::TREE.dotglob))
+    }
+
+    fn lists(&self, segments: &[&str]) -> bool {
+        (self.fingerprints.iter().any(|f| f.iter().eq(segments))
+            || self
+                .includes
+                .iter()
+                .any(|i| match_segments(i, segments, Options::TREE.dotglob)))
+            && !self.excluded(segments)
+    }
+}
+
+impl CacheMatcher {
+    /// The matcher for `globs`, relative to the task directory `dir`.
+    pub fn new(dir: &str, globs: &[Glob]) -> Self {
+        Self {
+            own: MatchGroup::new(dir, own(globs)),
+            folded: folded_groups(globs)
+                .map(|group| MatchGroup::new(dir, group))
+                .collect(),
+        }
+    }
+
+    /// Whether `rel`, a slash-separated path relative to `root`, is one the
+    /// walk can list. A folded group's exclusions apply to its own entries;
+    /// the task's own apply to all.
+    pub fn matches(&self, root: &str, rel: &str) -> bool {
+        let path = normalized_segments(&join_pattern(root, rel));
+        let segments: Vec<&str> = path.iter().map(String::as_str).collect();
+        (self.own.lists(&segments) || self.folded.iter().any(|g| g.lists(&segments)))
+            && !self.own.excluded(&segments)
+    }
+}
+
 /// [`cache_globs`] over a single group, starting from the `included` matches.
 fn tree_globs<'a>(
     dir: &str,
@@ -351,34 +440,67 @@ fn rooted_segments(pattern: &str) -> Vec<&str> {
 
 /// Matches pattern segments against a whole path, with the same rules as the
 /// walk: `**` spans zero or more segments (non-dot unless `dotglob`),
-/// wildcards match within one segment, literals match verbatim.
+/// wildcards match within one segment, literals match verbatim. Runs in
+/// pattern × path steps (see [`star_match`]): restores match names an
+/// archive chooses against these patterns.
 fn match_segments<S: AsRef<str>>(pat: &[S], path: &[&str], dotglob: bool) -> bool {
-    match pat.split_first() {
-        None => path.is_empty(),
-        Some((seg, rest)) if seg.as_ref() == "**" => {
-            if match_segments(rest, path, dotglob) {
-                return true;
+    star_match(
+        pat,
+        path,
+        |seg| seg.as_ref() == "**",
+        |name| dotglob || !name.starts_with('.'),
+        |seg, name| {
+            let seg = seg.as_ref();
+            if has_meta(seg) {
+                matches_segment(seg, name, dotglob)
+            } else {
+                seg == *name
             }
-            match path.split_first() {
-                Some((name, tail)) if dotglob || !name.starts_with('.') => {
-                    match_segments(pat, tail, dotglob)
+        },
+    )
+}
+
+/// Whether `toks` matches all of `text`, where a token for which `is_star`
+/// holds spans zero or more items (each passing `star_ok`) and any other
+/// matches exactly one item it `hit`s. Dynamic programming over suffixes, so
+/// time is `toks × text` whatever the stars: backtracking is exponential in
+/// them.
+fn star_match<T, U>(
+    toks: &[T],
+    text: &[U],
+    is_star: impl Fn(&T) -> bool,
+    star_ok: impl Fn(&U) -> bool,
+    hit: impl Fn(&T, &U) -> bool,
+) -> bool {
+    // `next[j]`: whether the tokens after the current one match `text[j..]`.
+    let mut next = vec![false; text.len().saturating_add(1)];
+    if let Some(end) = next.last_mut() {
+        *end = true;
+    }
+    for tok in toks.iter().rev() {
+        let mut cur = vec![false; next.len()];
+        if is_star(tok) {
+            // Fill from the end: `cur[j]` needs `cur[j + 1]`.
+            let mut after = false;
+            for j in (0..cur.len()).rev() {
+                let spans = text.get(j).is_some_and(&star_ok) && after;
+                let here = next.get(j).copied().unwrap_or(false) || spans;
+                if let Some(c) = cur.get_mut(j) {
+                    *c = here;
                 }
-                _ => false,
+                after = here;
+            }
+        } else {
+            for (j, item) in text.iter().enumerate() {
+                let rest = next.get(j.saturating_add(1)).copied().unwrap_or(false);
+                if let Some(c) = cur.get_mut(j) {
+                    *c = rest && hit(tok, item);
+                }
             }
         }
-        Some((seg, rest)) => match path.split_first() {
-            Some((name, tail)) => {
-                let seg = seg.as_ref();
-                let hit = if has_meta(seg) {
-                    matches_segment(seg, name, dotglob)
-                } else {
-                    seg == *name
-                };
-                hit && match_segments(rest, tail, dotglob)
-            }
-            None => false,
-        },
+        next = cur;
     }
+    next.first().copied().unwrap_or(false)
 }
 
 /// Adds or removes `path` from the working sets depending on `negate`.
@@ -564,36 +686,78 @@ fn matches_segment(pattern: &str, name: &str, dotglob: bool) -> bool {
     glob_match(&pat, &text)
 }
 
-/// Recursive glob matcher for a single path segment.
-fn glob_match(pat: &[char], text: &[char]) -> bool {
-    match pat.split_first() {
-        None => text.is_empty(),
-        Some(('*', rest)) => {
-            // `*` matches any run of characters within the segment.
-            if glob_match(rest, text) {
-                return true;
-            }
-            match text.split_first() {
-                Some((_, tail)) => glob_match(pat, tail),
-                None => false,
-            }
-        }
-        Some(('?', rest)) => match text.split_first() {
-            Some((_, tail)) => glob_match(rest, tail),
-            None => false,
-        },
-        Some(('[', rest)) => match text.split_first() {
-            Some((c, tail)) => match match_bracket(rest, *c) {
-                Some(after) => glob_match(after, tail),
-                None => false,
+/// One element of a single-segment glob.
+enum Tok<'a> {
+    /// `*`: any run of characters.
+    Star,
+    /// `?`: any one character.
+    Any,
+    /// `[...]`, the slice just after its `[`.
+    Class(&'a [char]),
+    /// An unterminated `[`, which matches nothing.
+    Never,
+    Lit(char),
+}
+
+/// Split a single-segment glob into [`Tok`]s.
+fn tokens(mut pat: &[char]) -> Vec<Tok<'_>> {
+    let mut out = Vec::new();
+    while let Some((c, rest)) = pat.split_first() {
+        match c {
+            '*' => out.push(Tok::Star),
+            '?' => out.push(Tok::Any),
+            '[' => match bracket_len(rest) {
+                Some(len) => {
+                    out.push(Tok::Class(rest));
+                    pat = rest.get(len..).unwrap_or_default();
+                    continue;
+                }
+                None => {
+                    out.push(Tok::Never);
+                    break;
+                }
             },
-            None => false,
-        },
-        Some((p, rest)) => match text.split_first() {
-            Some((c, tail)) if c == p => glob_match(rest, tail),
-            _ => false,
-        },
+            _ => out.push(Tok::Lit(*c)),
+        }
+        pat = rest;
     }
+    out
+}
+
+/// Glob matcher for a single path segment, in pattern × text steps.
+fn glob_match(pat: &[char], text: &[char]) -> bool {
+    star_match(
+        &tokens(pat),
+        text,
+        |t| matches!(t, Tok::Star),
+        |_| true,
+        |t, c| match t {
+            Tok::Any => true,
+            Tok::Class(class) => match_bracket(class, *c).is_some(),
+            Tok::Lit(l) => l == c,
+            Tok::Star | Tok::Never => false,
+        },
+    )
+}
+
+/// The length of the bracket expression `pat` starts (just after its `[`),
+/// through its closing `]`, or `None` if it has none. [`match_bracket`]'s walk,
+/// which does not depend on the character matched.
+fn bracket_len(pat: &[char]) -> Option<usize> {
+    let negated = matches!(pat.first(), Some('!') | Some('^'));
+    let mut i = usize::from(negated);
+    while let Some(&ch) = pat.get(i) {
+        if ch == ']' && i > usize::from(negated) {
+            return Some(i.saturating_add(1));
+        }
+        let range_end = pat.get(i.saturating_add(2)).filter(|&&e| e != ']');
+        if pat.get(i.saturating_add(1)) == Some(&'-') && range_end.is_some() {
+            i = i.saturating_add(3);
+        } else {
+            i = i.saturating_add(1);
+        }
+    }
+    None
 }
 
 /// Matches a bracket expression `[...]` against `c`. `pat` starts just after
@@ -771,6 +935,102 @@ mod tests {
                 join(&dir, "node_modules/vite/bin/vite.js"),
             ]
         );
+    }
+
+    /// Every regular file or symlink under `dir`, slash-separated and relative.
+    fn tree_files(dir: &str) -> Vec<String> {
+        fn walk(base: &Path, rel: &str, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(base.join(rel)).unwrap().flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let child = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
+                if e.file_type().unwrap().is_dir() {
+                    walk(base, &child, out);
+                } else {
+                    out.push(child);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(Path::new(dir), "", &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn cache_matcher_agrees_with_cache_globs() {
+        let dir = setup_node_modules();
+        write_file(&dir, "dist/app.js", "a");
+        write_file(&dir, "dist/.map/app.js.map", "m");
+        write_file(&dir, "dist/tmp/scratch", "s");
+        write_file(&dir, "gen/a.pb.go", "g");
+        write_file(&dir, "gen/keep.txt", "k");
+        write_file(&dir, "Taskfile.yml", "t");
+        write_file(&dir, ".git/hooks/pre-commit", "h");
+        let cases: Vec<Vec<Glob>> = vec![
+            vec![g("dist/**")],
+            vec![g("dist/**/*"), g_neg("dist/tmp/**")],
+            vec![
+                g_fp("node_modules/**/*", "node_modules/.yarn-state.yml"),
+                g_neg("node_modules/react/**/*"),
+            ],
+            vec![g("gen/*.go"), g("dist/app.js")],
+            // A folded group's exclusion stays in its group; the task's own
+            // applies to everything.
+            vec![
+                grouped(g("gen/*"), 1),
+                grouped(g_neg("gen/keep.txt"), 1),
+                g("gen/keep.txt"),
+                g("dist/**"),
+                g_neg("dist/.map/**"),
+            ],
+        ];
+        for globs in cases {
+            let listed: Vec<String> = cache_globs(&dir, &globs)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.strip_prefix(&format!("{dir}/")).unwrap().to_string())
+                .collect();
+            let matcher = CacheMatcher::new(&dir, &globs);
+            for rel in tree_files(&dir) {
+                assert_eq!(
+                    matcher.matches(&dir, &rel),
+                    listed.contains(&rel),
+                    "{rel} with {globs:?}"
+                );
+            }
+        }
+    }
+
+    /// Names an archive chooses are matched against these patterns: inputs
+    /// that take a backtracking matcher minutes (`**` and `*` runs that never
+    /// match) must stay linear in each. A regression hangs this test.
+    #[test]
+    fn matching_is_polynomial_in_stars() {
+        let root = "/proj";
+        let matcher = CacheMatcher::new(root, &[g("**/a/**/b/**/*.go")]);
+        let mut rel = "a/b/".repeat(2048);
+        rel.push_str("zz");
+        assert!(!matcher.matches(root, &rel));
+        let name = "a".repeat(255);
+        assert!(!matches_segment("*a*a*a*a*a*a*a*a*b", &name, true));
+        assert!(matches_segment("*a*a*a*a*a*a*a*a*", &name, true));
+        assert!(matches_segment("[a-c]*[!x]?", "abcd", true));
+        assert!(!matches_segment("[ab", "a", true));
+    }
+
+    #[test]
+    fn cache_matcher_joins_the_task_dir_onto_patterns() {
+        let root = tmp();
+        let matcher = CacheMatcher::new(&format!("{root}/sub"), &[g("out/**")]);
+        assert!(matcher.matches(&root, "sub/out/x"));
+        assert!(!matcher.matches(&root, "out/x"));
+        // An absolute pattern keeps its `./` when joined; saving drops it.
+        let matcher = CacheMatcher::new(&root, &[g(&format!("{root}/./gen//*.go"))]);
+        assert!(matcher.matches(&root, "gen/a.go"));
     }
 
     #[test]

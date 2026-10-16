@@ -914,11 +914,13 @@ impl Executor {
                 && let Some(url) = cache_url
             {
                 {
+                    let source_value = checker.source_value().to_string();
                     let (ok, meta) = {
                         let (mut scratch, sink) = self.scratch_logger();
                         let r = cache::cache_restore(
                             url,
-                            t.name(),
+                            t,
+                            &source_value,
                             std::path::Path::new(&self.dir),
                             &mut scratch,
                         )

@@ -92,7 +92,33 @@ impl Executor {
             Color::Magenta,
             &format!("task: importing cache from {:?}\n", zip_path.display()),
         );
-        if let Err(e) = archive::extract_archive(zip_path, Path::new(&self.dir)) {
+        // A whole-project archive restores checksum and generated files of any
+        // task, so only sandbox scratch space is out of bounds (and, as for
+        // every restore, `.git`).
+        let tmp = Path::new(&self.temp_dir.fingerprint).join("tmp");
+        let tmp: Option<Vec<String>> = tmp.strip_prefix(&self.dir).ok().map(|r| {
+            r.components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect()
+        });
+        // Case-insensitively: on a case-insensitive filesystem `.TASK/TMP` is
+        // the same directory.
+        let accept = |rel: &str| {
+            let Some(tmp) = &tmp else {
+                return true;
+            };
+            let parts: Vec<&str> = rel.split('/').collect();
+            !(parts.len() >= tmp.len()
+                && parts
+                    .iter()
+                    .zip(tmp)
+                    .all(|(a, b)| a.eq_ignore_ascii_case(b)))
+        };
+        let policy = archive::RestorePolicy {
+            check_meta: None,
+            accept: Some(&accept),
+        };
+        if let Err(e) = archive::extract_archive(zip_path, Path::new(&self.dir), &policy) {
             self.discard_checksums(cleanup);
             return Err(e.into());
         }

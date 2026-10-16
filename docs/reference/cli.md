@@ -74,8 +74,14 @@ task --export-cache state.zip build test
 task --import-cache state.zip
 ```
 
+Import only archives you produced yourself: they can write any project file,
+including Taskfiles, and their saved checksums mark tasks up to date. Never
+import an untrusted CI artifact or download.
+
 Import restores all archive entries, regardless of the tasks named on the
-command line. If extraction fails, Task removes the project's saved checksums
+command line, except that an archive with entries in `.git`, or in the `tmp`
+directory under the temp directory (sandbox scratch space), is refused before
+anything is written. If extraction fails, Task removes the project's saved checksums
 so partially restored outputs do not leave tasks marked up to date. This
 also invalidates tasks outside the archive and respects `TASK_TEMP_DIR`.
 Generated files already extracted remain on disk. If checksum cleanup fails,

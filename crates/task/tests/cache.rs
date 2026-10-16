@@ -329,6 +329,30 @@ fn failed_import_cannot_redirect_checksum_cleanup_through_symlinks() {
     }
 }
 
+// A whole-project import restores any task's files, but not into the sandbox
+// scratch directory under the temp dir, nor into `.git`; such an archive is
+// refused before anything is written.
+#[test]
+fn import_refuses_sandbox_scratch_and_git_entries() {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    for bad in [".task/tmp/run/x", ".TASK/Tmp/x", ".git/config"] {
+        let dir = stage_inline(EXPORT_TASKFILE, "data");
+        let cache = dir.join("cache.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&cache).unwrap());
+        for name in ["output.txt", bad] {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"x").unwrap();
+        }
+        zip.finish().unwrap();
+        let (output, code) = run_env(&dir, &["--import-cache", cache.to_str().unwrap()], &[]);
+        assert_ne!(code, 0, "import of {bad} should fail: {output}");
+        assert!(!dir.join("output.txt").exists(), "{bad}: {output}");
+        assert!(!dir.join(bad).exists(), "{bad}: {output}");
+    }
+}
+
 #[test]
 fn failed_import_invalidates_external_temp_dir() {
     let dir = stage("cache_failed_import");
@@ -412,6 +436,58 @@ fn cache_restore_hit() {
     assert!(
         second.contains("restored from cache"),
         "expected cache restore: {second}"
+    );
+}
+
+// A cache entry is written from the task's generates alone, so one carrying
+// anything else (here the Taskfile and a git hook) is poisoned: it is refused
+// before any file is restored, and the task runs instead.
+#[test]
+fn cache_restore_refuses_files_outside_generates() {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let dir = stage("cache");
+    let cache = cache_dir();
+    let env = [("CACHE_DIR", cache.to_str().unwrap())];
+    let (first, code) = run_env(&dir, &["build"], &env);
+    assert_eq!(code, 0, "first run failed: {first}");
+
+    let entry = std::fs::read_dir(&cache)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let comment = read_zip_comment(&std::fs::read(&entry).unwrap());
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&entry).unwrap());
+    for (name, body) in [
+        ("output.txt", "cached\n"),
+        ("Taskfile.yml", "poisoned"),
+        (".git/hooks/pre-commit", "poisoned"),
+    ] {
+        zip.start_file(name, SimpleFileOptions::default()).unwrap();
+        zip.write_all(body.as_bytes()).unwrap();
+    }
+    zip.set_comment(comment);
+    zip.finish().unwrap();
+
+    let taskfile = std::fs::read_to_string(dir.join("Taskfile.yml")).unwrap();
+    std::fs::remove_file(dir.join("output.txt")).unwrap();
+    std::fs::remove_dir_all(dir.join(".task")).unwrap();
+    let (second, code) = run_env(&dir, &["build"], &env);
+    assert_eq!(code, 0, "second run failed: {second}");
+    assert!(second.contains("rejected"), "{second}");
+    assert!(!second.contains("restored from cache"), "{second}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("Taskfile.yml")).unwrap(),
+        taskfile
+    );
+    assert!(!dir.join(".git").exists());
+    // The task ran rather than restoring the cached copy.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("output.txt")).unwrap(),
+        "hello\n"
     );
 }
 
