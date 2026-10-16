@@ -944,55 +944,56 @@ fn syntax_error_shows_source_snippet() {
 // ---------------------------------------------------------------------------
 
 /// Tasks that reach no task running other tasks, and fold no task excluding
-/// files, keep the identities and checksums 4.8.0 recorded, wherever the
-/// checkout is.
+/// files, keep the identities 4.8.0 recorded, wherever the checkout is; their
+/// checksums are pinned to fingerprint format v1. `plain` renders CHECKSUM in
+/// a command, so its identity follows the checksum.
 #[test]
-fn reference_fingerprints_match_4_8_0() {
+fn reference_fingerprints_are_stable() {
     let pinned = [
         (
             "plain",
-            "27ac80791fdd600e",
-            "3098ea47e50c894fef270f2709cd4ef8\n267aa0cc9178767bc66ff2322e26ac18\n",
+            "3d732301f4ee3b05",
+            "cf3ec8b966e4a78cb649d46671cf3ff5\nca261b66908db25886f8be79bcca3019\n",
         ),
         (
             "folds-leaf",
             "0f91b18950262769",
-            "f0ba7dd36c64b83faf55c43cd3097310\n99aa06d3014798d86001c324468d497f\n",
+            "e18e6bb9607aba945361af60fbf9f27a\nf2f36b292df325ee8abf7808417ca552\n",
         ),
         (
             "leaf",
             "0f28b4ff1bdfde54",
-            "3f08e9d5ef49207a3e998765b39296d2\n99aa06d3014798d86001c324468d497f\n",
+            "029204a226fb72b6451b8318aa300d29\nf2f36b292df325ee8abf7808417ca552\n",
         ),
         (
             "wrapper",
             "0844c9990e58b745",
-            "6f3b564e005ccbf7d66619905429f72\n99aa06d3014798d86001c324468d497f\n",
+            "9c09208094c427ba4bb8962307ddbbed\nf2f36b292df325ee8abf7808417ca552\n",
         ),
         (
             "other-leaf",
             "b86f3a6d485ac5a0",
-            "43eb507538589d112c6a337fd800102\n99aa06d3014798d86001c324468d497f\n",
+            "dfd4009a233b987c1925210176a62d33\nf2f36b292df325ee8abf7808417ca552\n",
         ),
         (
             "mid",
             "f03abb008c682212",
-            "5c8e617ffad423898038f1b803be39ef\n99aa06d3014798d86001c324468d497f\n",
+            "b25d666660aa16bc345a33f9b9d37ce5\nf2f36b292df325ee8abf7808417ca552\n",
         ),
         (
             "top",
             "419d0c7179e81088",
-            "43eb507538589d112c6a337fd800102\n99aa06d3014798d86001c324468d497f\n",
+            "dfd4009a233b987c1925210176a62d33\nf2f36b292df325ee8abf7808417ca552\n",
         ),
         (
             "wrap-flat",
             "64b6415d10c15c97",
-            "b315e30206cf3d1f17e1cc1dcbeeb229\n99aa06d3014798d86001c324468d497f\n",
+            "209c6b46a4d8e694015292f99ba19945\nf2f36b292df325ee8abf7808417ca552\n",
         ),
         (
             "refers-leaf",
             "6751cbd5d0149b97",
-            "a743ce7ce2c4f80af1ad391a8811bcc1\n99aa06d3014798d86001c324468d497f\n",
+            "526c8e0632a5b44c06a68b900de7aa40\nf2f36b292df325ee8abf7808417ca552\n",
         ),
     ];
     for _ in 0..2 {
@@ -1003,7 +1004,7 @@ fn reference_fingerprints_match_4_8_0() {
             if task == "plain" {
                 assert!(
                     out.stdout
-                        .contains("CHECKSUM=3098ea47e50c894fef270f2709cd4ef8\n"),
+                        .contains("CHECKSUM=cf3ec8b966e4a78cb649d46671cf3ff5\n"),
                     "{}",
                     out.combined()
                 );
@@ -1020,12 +1021,36 @@ fn reference_fingerprints_match_4_8_0() {
         let file = checksum_file(&dir, "wrap-ref").unwrap();
         let name = file.file_name().unwrap().to_string_lossy().into_owned();
         assert_ne!(name, "wrap-ref-64dd264baacd1ec0");
-        assert_ne!(
+        // It now reaches what `wrap-flat` lists, so both checksum alike.
+        let flat = checksum_file(&dir, "wrap-flat").unwrap();
+        assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            "ad99388354055c89a01fcfaa38f35131\n99aa06d3014798d86001c324468d497f\n"
+            std::fs::read_to_string(&flat).unwrap()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// A source that is neither a regular file nor a symlink fails the task,
+/// naming it, instead of blocking on it.
+#[cfg(unix)]
+#[test]
+fn fifo_source_is_unsupported() {
+    let dir =
+        scratch("version: '3'\ntasks:\n  build:\n    sources: [pipe]\n    cmds: [echo ran]\n");
+    let status = std::process::Command::new("mkfifo")
+        .arg(dir.join("pipe"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let out = run(&dir, &["build"]);
+    assert!(!out.ok(), "{}", out.combined());
+    assert!(
+        out.combined().contains("pipe: unsupported file type"),
+        "{}",
+        out.combined()
+    );
+    assert!(!out.stdout.contains("ran"), "{}", out.combined());
 }
 
 /// Once a task's references resolved, what renders after them (here a
@@ -1170,7 +1195,7 @@ fn grouped_fingerprints_are_stable() {
         assert_eq!(name, "refs-5102e16695266f97");
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            "5fb7c6c6790b29c7b692ced2731674f8\n3bec5ef4f1206b8b5cffa0f14346d766\n"
+            "43378b7dbbb47fe2daa3dde3251412ff\n62a69eb9701b8d5c48441d320d4593a3\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1604,7 +1629,7 @@ fn groups_are_numbered_as_entries_come() {
         assert_eq!(name, "nested-21ae427803177def");
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            "7b8a670fee96e7a7c1a26c870378c22a\n99aa06d3014798d86001c324468d497f\n"
+            "cac60e0a61ad5eadb708765f1faae251\nf2f36b292df325ee8abf7808417ca552\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

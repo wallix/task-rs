@@ -32,12 +32,12 @@ and locking, setup tasks); v4.0.0 is a full Rust rewrite of that fork.
 
 It stays **drop-in compatible** with Taskfile v3: same schema, CLI flags, exit
 codes and observable behaviour, verified by a black-box suite that ports the
-entire Go test corpus. Fingerprint checksum *values* are byte-identical with the
-Go implementation, though `.task` entries are keyed by each task's identity
-rather than its namespaced name. Included copies with matching compiled build
-inputs share state (diverging from Go's per-namespace files); namespaced task
-references still distinguish copies. See
-[`README.md`](README.md) for the feature tour and the deliberate differences
+entire Go test corpus. Fingerprint checksum *values* use a format of their own
+(v1, see `fingerprint/checksum.rs`), not the Go implementation's, and `.task`
+entries are keyed by each task's identity rather than its namespaced name.
+Included copies with matching compiled build inputs share state (diverging from
+Go's per-namespace files); namespaced task references still distinguish copies.
+See [`README.md`](README.md) for the feature tour and the deliberate differences
 from upstream v3.
 
 ## Architecture
@@ -86,8 +86,9 @@ line it is on:
 
 - **Frozen:** the Taskfile v3 schema, CLI flags and their semantics, exit codes,
   stdout / stderr shape that tests assert on, and the **fingerprint checksum
-  algorithm** — a change there silently invalidates every existing `.task` cache
-  and must be treated as a breaking change, not a refactor.
+  format** — a change there silently invalidates every existing `.task` cache
+  and cache key, so it bumps the format version and is treated as a breaking
+  change, not a refactor.
 - **Deliberately divergent:** the differences already documented in `README.md`
   and `CHANGELOG.md` (removed remote taskfiles and timestamp fingerprinting,
   added `setup` tasks and fingerprint-based `generates`, duplicate-key errors,

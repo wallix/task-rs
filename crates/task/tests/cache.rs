@@ -1601,15 +1601,15 @@ fn checksum_of_a_reference_to_no_sources_is_empty() {
     assert!(out.contains("CHECKSUM=[]\n"), "{out}");
 }
 
-/// A task without references keeps the cache key 4.8.0 derived, which
-/// names its lock on the registry (unreachable here).
+/// A task's cache key, which names its lock on the registry (unreachable
+/// here), is pinned: fingerprint format v1, then the 4.8.0 vars digest.
 #[test]
-fn cache_key_matches_4_8_0() {
+fn cache_key_is_stable() {
     let dir = stage("ref_follows_runs/cachekey");
     let (out, code) = run_env(&dir, &["-v", "cached"], &[]);
     assert_eq!(code, 0, "{out}");
     assert!(
-        out.contains("name=repo%3Acached%3Aae1d365c67d6889b7823c3f1d33f5c7-ff4e049ddfd6f6b6&"),
+        out.contains("name=repo%3Acached%3A54525968ced6b6bdd8814d7b82bd969c-ff4e049ddfd6f6b6&"),
         "{out}"
     );
 }

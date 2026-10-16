@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::ast::{Cmd, Glob, Task};
 use crate::filepathext;
 
-use super::checksum::checksum_files;
+use super::checksum::{Datum, checksum_files};
 use super::glob::{cache_globs, globs};
 
 /// Validates whether a task is up to date by comparing a checksum of its source
@@ -18,7 +18,7 @@ pub struct ChecksumChecker {
     temp_dir: String,
     task: Task,
     sources_globs: Vec<Glob>,
-    src_data: Vec<String>,
+    src_data: Vec<Datum>,
     /// From `task.source_hash` or lazily computed; empty when the task has no
     /// sources.
     source_hash: String,
@@ -77,25 +77,34 @@ impl ChecksumChecker {
         c
     }
 
-    fn build_checksum_data(&self) -> (Vec<Glob>, Vec<String>) {
+    fn build_checksum_data(&self) -> (Vec<Glob>, Vec<Datum>) {
         let dir = self.compute_dir();
         let mut sources = Vec::new();
         let mut data = Vec::new();
         for source in &self.task.sources {
-            if source.glob.starts_with("value:") {
-                data.push(source.glob.clone());
+            if let Some(value) = source.glob.strip_prefix("value:") {
+                data.push(Datum::Value(value.to_string()));
             } else {
                 sources.push(source.clone());
-                data.push(rule("srcrule", &dir, source));
+                data.push(Datum::SrcRule {
+                    group: source.group,
+                    negate: source.negate,
+                    glob: rel_glob(&dir, &source.glob),
+                });
             }
         }
         for (i, cmd) in self.task.raw_cmds.iter().enumerate() {
             data.push(serialize_cmd(i, cmd));
         }
-        for gen_rule in &self.task.generates {
-            data.push(rule("genrule", &dir, gen_rule));
+        for g in &self.task.generates {
+            data.push(Datum::GenRule {
+                group: g.group,
+                negate: g.negate,
+                glob: rel_glob(&dir, &g.glob),
+            });
         }
-        data.sort();
+        // Shown in this order by `--status`; the checksum sorts by encoding.
+        data.sort_by_cached_key(Datum::display);
         (sources, data)
     }
 
@@ -185,7 +194,7 @@ impl ChecksumChecker {
             checksum_file,
             sources_hash: old_sources_hash.to_string(),
             source_files: sources_files,
-            source_data: self.src_data.clone(),
+            source_data: self.src_data.iter().map(Datum::display).collect(),
             generates_hash: old_generates_hash.to_string(),
             generate_files: generates,
             cache_files,
@@ -246,7 +255,7 @@ impl ChecksumChecker {
         self.checksum(&self.task.generates, &[])
     }
 
-    fn checksum(&self, patterns: &[Glob], data: &[String]) -> std::io::Result<String> {
+    fn checksum(&self, patterns: &[Glob], data: &[Datum]) -> std::io::Result<String> {
         let dir = self.compute_dir();
         let sources = globs(&dir, patterns)?;
         checksum_files(&dir, &sources, data)
@@ -268,21 +277,11 @@ impl ChecksumChecker {
     }
 }
 
-/// The checksum data for a glob: `<kind>:<glob>`, `!` before an exclusion's
-/// glob, and the group after the kind for an entry folded in from a list
-/// whose groups matter.
-fn rule(kind: &str, dir: &str, g: &Glob) -> String {
-    let negate = if g.negate { "!" } else { "" };
-    let glob = rel_glob(dir, &g.glob);
-    if g.group == 0 {
-        format!("{kind}:{negate}{glob}")
-    } else {
-        format!("{kind}@{}:{negate}{glob}", g.group)
+fn serialize_cmd(idx: usize, c: &Cmd) -> Datum {
+    Datum::Cmd {
+        index: idx as u64,
+        cmd: c.cmd.clone(),
     }
-}
-
-fn serialize_cmd(idx: usize, c: &Cmd) -> String {
-    format!("cmd[{idx}]:{}", c.cmd)
 }
 
 /// Snapshots each file's length and modification time, keyed by path relative

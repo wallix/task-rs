@@ -10,10 +10,9 @@ need stronger guarantees around incremental builds and CI reuse.
 
 The Rust rewrite preserves the Taskfile v3 schema, CLI flags, exit codes, and
 observable behaviour of the previous Go implementation. Its black-box test
-suite ports the Go test corpus, and its fingerprint checksums are
-byte-compatible with the pre-rewrite WALLIX fork. Checksum filenames now use
-task identity rather than include namespaces, so upgrading rebuilds each task
-once.
+suite ports the Go test corpus. Fingerprint checksums use a format of their
+own, and checksum filenames use task identity rather than include namespaces,
+so upgrading from the Go fork rebuilds each task once.
 
 This is not upstream Task. The fork deliberately removes a few features and
 changes some semantics; review

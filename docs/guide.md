@@ -822,6 +822,10 @@ offending files and skips publishing the task's fingerprint and cache entry for
 that run, so the task is not treated as up to date. Tighten the glob or add an
 `exclude:` for those generated paths.
 
+Each source is fingerprinted by its content, a symlink by its target (it is
+not followed). A source of any other kind, such as a named pipe or a device,
+fails the task.
+
 In situations where you need more flexibility the `status` keyword can be used.
 You can even combine the two. See the documentation for
 [status](#using-programmatic-checks-to-indicate-a-task-is-up-to-date) for an
@@ -860,11 +864,10 @@ Variables that change compiled commands, directories, sources or declared
 `env` values give a task a separate checksum entry. A variable that changes none
 of the hashed inputs does not; include it in `label` to distinguish that case.
 
-Checksum values keep the format used by the Go fork, but filenames differ.
-Upgrading from the name-based filenames rebuilds each task once. Project paths
-in the identity are relative, so exported fingerprints can be imported in a
-different checkout directory. Explicit absolute paths in commands or environment
-values still distinguish tasks.
+Neither checksum values nor filenames match the Go fork: upgrading from it
+rebuilds each task once. Project paths in the identity are relative, so exported
+fingerprints can be imported in a different checkout directory. Explicit
+absolute paths in commands or environment values still distinguish tasks.
 
 :::
 

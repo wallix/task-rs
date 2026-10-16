@@ -9,7 +9,7 @@ mod checksum;
 mod glob;
 mod sources_checksum;
 
-pub use checksum::checksum_files;
+pub use checksum::{Datum, checksum_files};
 pub use glob::{CacheMatcher, cache_globs, glob, globs};
 pub use sources_checksum::{ChecksumChecker, TaskStatus};
 

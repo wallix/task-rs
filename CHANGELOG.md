@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Fingerprints use a new checksum format.** Each file is recorded with its
+  path relative to the task directory, its kind (file or symlink) and its own
+  digest, in path order, and the task's rules by their fields, so adjacent
+  inputs no longer run together, and sources outside the task directory no
+  longer make the checksum depend on the checkout directory's name. Checksums
+  are 32 hex digits and no longer match the Go implementation: every task with
+  `sources` rebuilds and misses the cache once, and one that renders
+  `{{.CHECKSUM}}` in a field its identity covers (commands, their vars, task
+  names in `deps`/`setup` and their vars, preconditions, the cache block) also
+  gets a new checksum file name. A source that is neither a regular file nor a
+  symlink (a named pipe, a device) now fails the task instead of being read, and
+  fingerprinting errors name the file.
+
 ## v4.8.1 - 2026-10-16
 
 - **`sandbox.writes: [{task: X}]` now grants what X and the tasks it runs

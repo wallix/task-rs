@@ -60,9 +60,9 @@ and formatting requirements that apply to all code.
 - **Determinism in the cache path:** fingerprint and task-identity hashes must
   depend only on declared inputs — no iteration over a `HashMap`, no ambient
   environment, no timestamps, no absolute host paths. Use ordered collections
-  (`BTreeMap`, `IndexMap`) or sort before hashing. The checksums are
-  byte-compatible with the Go implementation; changing what goes into one
-  invalidates every existing `.task` cache.
+  (`BTreeMap`, `IndexMap`) or sort before hashing. The checksum format is
+  versioned (`fingerprint/checksum.rs`); changing what goes into one
+  invalidates every existing `.task` cache and cache key, and bumps the version.
 - **Concurrency:** the engine runs tasks in parallel. Anything reached from a
   task body must be safe under concurrent execution, and shared state that
   guards "run once" semantics (`run: once`, setup tasks, distributed locks) must

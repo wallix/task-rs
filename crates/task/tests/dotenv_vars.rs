@@ -169,8 +169,8 @@ fn task_dotenv_with_var_name() {
 }
 
 // Ports Go `TestCmdsVariables`. Runs verbosely and asserts the computed
-// checksum of the sources appears in the output. `{{.CHECKSUM}}` is a 128-bit
-// xxHash3 rendered identically to Go, so the expected value matches exactly.
+// checksum of the sources appears in the output, pinned to fingerprint format
+// v1 (Go's value differs).
 #[test]
 fn cmds_variables() {
     let dir = stage("cmds_vars");
@@ -178,7 +178,7 @@ fn cmds_variables() {
     let o = run(&dir, &["--verbose", "build-checksum"]);
     assert!(o.ok(), "run failed: {}", o.combined());
     assert!(
-        o.combined().contains("44f88b429595ccb250265c2d1eca60a0"),
+        o.combined().contains("f26c0f1d4f157def19fab662470e8ca6"),
         "missing checksum in output: {}",
         o.combined()
     );
