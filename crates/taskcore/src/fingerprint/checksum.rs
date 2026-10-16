@@ -16,11 +16,13 @@ use twox_hash::XxHash3_128;
 
 use crate::filepathext;
 
+use super::pool::{Workers, digest_all};
+
 /// Leads every checksum, so a future format cannot collide with this one.
 const VERSION: &[u8] = b"task-rs/fingerprint/v1\0";
 
 /// The read buffer for file contents.
-const BUF_LEN: usize = 128 * 1024;
+pub(crate) const BUF_LEN: usize = 128 * 1024;
 
 /// A non-file input to a sources checksum. Each is hashed by its fields, so
 /// no two distinct inputs encode alike; [`Datum::display`] is the text
@@ -276,16 +278,27 @@ fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
 }
 
 /// Computes the checksum of `files` (glob results, made relative to `basedir`)
-/// and `data`. The first failing entry in canonical order is the error.
+/// and `data`, digesting the files in parallel. The first failing entry in
+/// canonical order is the error.
 pub fn checksum_files(basedir: &str, files: &[String], data: &[Datum]) -> std::io::Result<String> {
+    checksum_files_with(basedir, files, data, Workers::Auto)
+}
+
+/// [`checksum_files`] on the given threads.
+pub(crate) fn checksum_files_with(
+    basedir: &str,
+    files: &[String],
+    data: &[Datum],
+    workers: Workers,
+) -> std::io::Result<String> {
     let entries = entries(basedir, files);
-    let mut buf = vec![0u8; BUF_LEN];
-    let mut digests = Vec::with_capacity(entries.len());
-    for e in &entries {
-        let (kind, d) = digest(&e.path, &mut buf)?;
-        digests.push((e, kind, d));
-    }
-    Ok(combine(&digests, data))
+    let digests = digest_all(&entries, workers)?;
+    let combined: Vec<(&Entry, Kind, u128)> = entries
+        .iter()
+        .zip(digests)
+        .map(|(e, (kind, d))| (e, kind, d))
+        .collect();
+    Ok(combine(&combined, data))
 }
 
 #[cfg(test)]

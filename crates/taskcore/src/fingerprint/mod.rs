@@ -7,6 +7,7 @@
 
 mod checksum;
 mod glob;
+mod pool;
 mod sources_checksum;
 
 pub use checksum::{Datum, checksum_files};

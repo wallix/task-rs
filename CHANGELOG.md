@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Fingerprinting digests files in parallel,** on at most as many threads as
+  there are CPUs available, shared by every task hashing at the same time. The
+  checksum does not depend on the number of threads.
 - **Fingerprints use a new checksum format.** Each file is recorded with its
   path relative to the task directory, its kind (file or symlink) and its own
   digest, in path order, and the task's rules by their fields, so adjacent
