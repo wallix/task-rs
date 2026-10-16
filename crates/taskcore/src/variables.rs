@@ -474,10 +474,27 @@ pub async fn compiled_task(
             )?;
         }
     }
+    // A template error so far is reported before the templater is replaced
+    // below, which would drop it. Only then: otherwise a cache block error
+    // still comes first, as before.
+    let references = has_from_entries(&orig_task.sources) || has_from_entries(&orig_task.generates);
+    if evaluate_sh_vars
+        && references
+        && let Some(err) = cache.err()
+    {
+        return Err(CompileError::Template(err.clone()));
+    }
     if let Some(resolver) = resolver.filter(|_| evaluate_sh_vars) {
         resolve_globs_from(&mut new, GlobField::Sources, resolver).await?;
         resolve_globs_from(&mut new, GlobField::Generates, resolver).await?;
-        if has_from_entries(&orig_task.sources) && !new.sources.is_empty() {
+        // The resolved entries feed the checksum: sources as files and rules,
+        // generates as rules. Cleared first, as the checker would reuse it;
+        // empty when the references resolved to no sources. Without sources
+        // there was no eager one to replace.
+        let widened =
+            has_from_entries(&orig_task.sources) || has_from_entries(&orig_task.generates);
+        if widened && !orig_task.sources.is_empty() {
+            new.source_hash.clear();
             let mut checker = ChecksumChecker::new(ctx.fingerprint_temp_dir, new.clone());
             let source_hash = checker.source_value().to_string();
             new.cache_checksum = cache_checksum(orig_task, &source_hash)?;
@@ -491,6 +508,7 @@ pub async fn compiled_task(
             );
             new.vars = Some(vars.clone());
             cache = Cache::new(vars.clone());
+            cache.set_dialect(orig_task.dialect);
         }
     }
     // TODO(port): executor wiring — when no resolver is supplied, `from:`

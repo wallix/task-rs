@@ -882,8 +882,11 @@ cache, but two things in `cmds` see only the task's own entries:
 
 - `for: sources` and `for: generates` iterate the task's own entries; the
   folded-in ones are left out.
-- `{{.CHECKSUM}}` hashes the task's own sources, so it does not change when a
-  folded-in file does. The cache block's `{{.CHECKSUM}}` does cover them.
+- `{{.CHECKSUM}}` in `cmds`, `deps` and `setup` hashes the task's own
+  entries, so it does not change when a folded-in file does. Deferred
+  commands, `preconditions` and the cache block see the `{{.CHECKSUM}}` the
+  fingerprint records, which covers them (empty when they resolve to no
+  sources).
 
 #### `sandbox`
 

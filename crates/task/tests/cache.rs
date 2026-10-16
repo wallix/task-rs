@@ -1240,3 +1240,71 @@ fn cache_vk_nested_include_shares_the_lock_key() {
         "both include paths must take one lock"
     );
 }
+
+/// The `CHECKSUM` a task with a `task:` source reference renders after the
+/// references resolved, and so its cache key, follow the referenced task's
+/// sources, and equal the sources hash its fingerprint records.
+#[test]
+fn checksum_follows_referenced_sources() {
+    let dir = stage("ref_follows_runs/checksum");
+    let cache = cache_dir();
+    let env = [("CACHE_DIR", cache.to_str().unwrap())];
+    let checksum = |out: &str| {
+        out.lines()
+            .find_map(|l| l.strip_prefix("CHECKSUM="))
+            .unwrap_or_else(|| panic!("no CHECKSUM in: {out}"))
+            .to_string()
+    };
+    // The sources hashes recorded for `pkg`; its identity follows its cache
+    // URL, which embeds CHECKSUM, so each run records under its own.
+    let recorded = || -> Vec<String> {
+        std::fs::read_dir(dir.join(".task/checksum"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("pkg-"))
+            .map(|e| {
+                let stored = std::fs::read_to_string(e.path()).unwrap();
+                stored.lines().next().unwrap().to_string()
+            })
+            .collect()
+    };
+
+    let (out, code) = run_env(&dir, &["pkg"], &env);
+    assert_eq!(code, 0, "{out}");
+    let first = checksum(&out);
+    assert_eq!(recorded(), std::slice::from_ref(&first));
+    assert!(cache.join(format!("pkg-{first}.zip")).exists(), "{out}");
+
+    // Only the referenced task's source changes.
+    std::fs::write(dir.join("lib/lib.txt"), "changed\n").unwrap();
+    let (out, code) = run_env(&dir, &["pkg"], &env);
+    assert_eq!(code, 0, "{out}");
+    let second = checksum(&out);
+    assert_ne!(first, second, "{out}");
+    assert!(recorded().contains(&second), "{out}");
+    assert!(cache.join(format!("pkg-{second}.zip")).exists(), "{out}");
+    assert_eq!(dir_len(&cache), 2);
+}
+
+/// A reference resolving to no sources leaves the task without a checksum,
+/// rather than with the one its unresolved entry had.
+#[test]
+fn checksum_of_a_reference_to_no_sources_is_empty() {
+    let dir = stage("ref_follows_runs/checksum");
+    let (out, code) = run_env(&dir, &["empty-ref"], &[]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("CHECKSUM=[]\n"), "{out}");
+}
+
+/// A task without references keeps the cache key 4.8.0 derived, which
+/// names its lock on the registry (unreachable here).
+#[test]
+fn cache_key_matches_4_8_0() {
+    let dir = stage("ref_follows_runs/cachekey");
+    let (out, code) = run_env(&dir, &["-v", "cached"], &[]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("name=repo%3Acached%3Aae1d365c67d6889b7823c3f1d33f5c7-ff4e049ddfd6f6b6&"),
+        "{out}"
+    );
+}

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **`{{.CHECKSUM}}` now covers the entries a `from:` or `task:` reference
+  folds in** wherever it is rendered after them: deferred commands,
+  `preconditions` and the cache block, so a cache key now changes when only a
+  referenced task's source does. Tasks with such entries get new cache keys,
+  and miss the cache once; their fingerprints change too where the cache block
+  embeds `{{.CHECKSUM}}`.
+- **A Jinja task with `from:` or `task:` entries renders its `preconditions` as
+  Jinja again,** instead of as Go templates.
+
 ## v4.8.0 - 2026-10-16
 
 - **`sandbox.writes` can name a task.** A `{task: <name>}` entry, with

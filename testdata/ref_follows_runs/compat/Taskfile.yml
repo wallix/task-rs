@@ -1,0 +1,59 @@
+version: '3'
+
+# Identity and checksum values pinned from 4.8.0: none of these reaches a
+# task that runs other tasks, or folds a task that excludes files.
+tasks:
+  plain:
+    sources:
+      - src/*.txt
+      - src/**/*.c
+      - exclude: src/sub/skip.c
+    generates: [out/plain.txt]
+    cmds:
+      - mkdir -p out && cat src/a.txt > out/plain.txt
+      - echo 'CHECKSUM={{.CHECKSUM}}'
+
+  leaf:
+    dir: src
+    sources: [a.txt, '**/*.c']
+    generates: [../out/leaf.txt]
+
+  other-leaf:
+    sources: [src/a.txt, src/b.txt]
+    generates: [out/other.txt]
+
+  folds-leaf:
+    sources:
+      - task: leaf
+      - src/b.txt
+      - exclude: src/sub/skip.c
+    generates:
+      - task: leaf
+    cmds:
+      - 'true'
+
+  wrapper:
+    sources: [from: deps]
+    generates: [from: deps]
+    deps: [leaf, other-leaf]
+
+  mid:
+    sources: [from: cmds]
+    generates: [from: cmds]
+    cmds:
+      - task: other-leaf
+
+  top:
+    sources: [from: deps]
+    generates: [from: deps]
+    deps: [mid]
+
+  # A wrapper over a dep whose reference reaches a task that runs nothing.
+  wrap-flat:
+    sources: [from: deps]
+    deps: [refers-leaf]
+    cmds:
+      - 'true'
+
+  refers-leaf:
+    sources: [{task: leaf}, src/b.txt]

@@ -932,3 +932,134 @@ fn syntax_error_shows_source_snippet() {
          |      ^\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fingerprint compatibility
+// ---------------------------------------------------------------------------
+
+/// Tasks that reach no task running other tasks, and fold no task excluding
+/// files, keep the identities and checksums 4.8.0 recorded, wherever the
+/// checkout is.
+#[test]
+fn reference_fingerprints_match_4_8_0() {
+    let pinned = [
+        (
+            "plain",
+            "27ac80791fdd600e",
+            "3098ea47e50c894fef270f2709cd4ef8\n267aa0cc9178767bc66ff2322e26ac18\n",
+        ),
+        (
+            "folds-leaf",
+            "0f91b18950262769",
+            "f0ba7dd36c64b83faf55c43cd3097310\n99aa06d3014798d86001c324468d497f\n",
+        ),
+        (
+            "leaf",
+            "0f28b4ff1bdfde54",
+            "3f08e9d5ef49207a3e998765b39296d2\n99aa06d3014798d86001c324468d497f\n",
+        ),
+        (
+            "wrapper",
+            "0844c9990e58b745",
+            "6f3b564e005ccbf7d66619905429f72\n99aa06d3014798d86001c324468d497f\n",
+        ),
+        (
+            "other-leaf",
+            "b86f3a6d485ac5a0",
+            "43eb507538589d112c6a337fd800102\n99aa06d3014798d86001c324468d497f\n",
+        ),
+        (
+            "mid",
+            "f03abb008c682212",
+            "5c8e617ffad423898038f1b803be39ef\n99aa06d3014798d86001c324468d497f\n",
+        ),
+        (
+            "top",
+            "419d0c7179e81088",
+            "43eb507538589d112c6a337fd800102\n99aa06d3014798d86001c324468d497f\n",
+        ),
+        (
+            "wrap-flat",
+            "64b6415d10c15c97",
+            "b315e30206cf3d1f17e1cc1dcbeeb229\n99aa06d3014798d86001c324468d497f\n",
+        ),
+        (
+            "refers-leaf",
+            "6751cbd5d0149b97",
+            "a743ce7ce2c4f80af1ad391a8811bcc1\n99aa06d3014798d86001c324468d497f\n",
+        ),
+    ];
+    for _ in 0..2 {
+        let dir = stage("ref_follows_runs/compat");
+        for task in ["plain", "folds-leaf", "wrapper", "top", "wrap-flat"] {
+            let out = run(&dir, &[task]);
+            assert!(out.ok(), "{task}: {}", out.combined());
+            if task == "plain" {
+                assert!(
+                    out.stdout
+                        .contains("CHECKSUM=3098ea47e50c894fef270f2709cd4ef8\n"),
+                    "{}",
+                    out.combined()
+                );
+            }
+        }
+        for (task, identity, content) in pinned {
+            let file = checksum_file(&dir, task).unwrap_or_else(|| panic!("{task}"));
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            assert_eq!(name, format!("{task}-{identity}"));
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), content, "{task}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Once a task's references resolved, what renders after them (here a
+/// precondition) still renders in the task's own dialect.
+#[test]
+fn jinja_after_references_resolved() {
+    let dir = scratch(
+        "version: '3'\ntemplater: jinja\ntasks:\n  test:\n    sources:\n      - task: build\n    preconditions:\n      - sh: test -n '{{ CHECKSUM }}'\n        msg: 'no checksum: {{ CHECKSUM }}'\n    cmds:\n      - echo ran\n\n  build:\n    sources: [b.txt]\n",
+    );
+    write(&dir, "b.txt", "b\n");
+    let out = run(&dir, &["test"]);
+    assert!(out.ok(), "{}", out.combined());
+    assert!(out.stdout.contains("ran\n"), "{}", out.combined());
+}
+
+/// Without references, a cache block error still comes before a template
+/// error in a command, as in 4.8.0.
+#[test]
+fn cache_error_before_template_error_without_references() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  both:\n    sources: [a.txt]\n    cache:\n      vk: 127.0.0.1:9/repo\n      url: file:///tmp/x.zip\n    cmds:\n      - echo '{{.X | nosuchfn}}'\n",
+    );
+    write(&dir, "a.txt", "a\n");
+    for args in [&["both"][..], &["--status", "both"], &["--dry", "both"]] {
+        let out = run(&dir, args);
+        assert_eq!(
+            out.stderr,
+            "task: both: cache: `vk` derives the cache and lock URLs; drop `url` and `lock`\n",
+            "{args:?}"
+        );
+        assert_eq!(out.code, 1, "{args:?}");
+    }
+}
+
+/// A template error in a command is reported, rather than lost when the
+/// references resolve, whether run, under `--status` or `--dry`.
+#[test]
+fn template_error_with_references_is_reported() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  test:\n    sources: [a.txt]\n    generates: [{task: gen}]\n    cmds:\n      - echo '{{.X | nosuchfn}}'\n\n  gen:\n    generates: [out.txt]\n",
+    );
+    write(&dir, "a.txt", "a\n");
+    for args in [&["test"][..], &["--status", "test"], &["--dry", "test"]] {
+        let out = run(&dir, args);
+        assert_eq!(out.code, 1, "{args:?}: {}", out.combined());
+        assert!(
+            out.stderr.contains("unsupported Go construct \"nosuchfn\""),
+            "{args:?}: {}",
+            out.combined()
+        );
+    }
+}
