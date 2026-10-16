@@ -877,6 +877,10 @@ that renders empty, is an error. References are followed through the
 referenced task's own `from:` and `task:` entries; a cycle between them fails
 with `Cyclic dependency detected`.
 
+A folded task's `exclude:` entries remove only that task's own matches, never
+another folded task's or the referring task's. The referring task's own
+`exclude:` entries apply to everything it folds in.
+
 Entries folded in by `from:` or `task:` count for the up-to-date check and the
 cache, but two things in `cmds` see only the task's own entries:
 

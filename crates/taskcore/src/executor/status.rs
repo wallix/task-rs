@@ -137,7 +137,7 @@ impl Executor {
         let mut genrule_entries = Vec::new();
         let mut cmd_entries = Vec::new();
         for d in &st.source_data {
-            if d.starts_with("genrule:") {
+            if d.starts_with("genrule") {
                 genrule_entries.push(d);
             } else if d.starts_with("cmd[") {
                 cmd_entries.push(d);

@@ -1063,3 +1063,100 @@ fn template_error_with_references_is_reported() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Exclusions of folded tasks
+// ---------------------------------------------------------------------------
+
+/// The `file:` lines of `--status` for `task`, relative to `dir`, split into
+/// the sources and generates sections.
+fn status_files(dir: &Path, task: &str) -> (Vec<String>, Vec<String>) {
+    let out = run(dir, &["--status", task]);
+    assert!(out.ok(), "{task}: {}", out.combined());
+    let root = format!("file: {}/", dir.display());
+    let (sources, generates) = out.stdout.split_once("  generates:").unwrap();
+    let files = |s: &str| {
+        s.lines()
+            .filter_map(|l| l.trim().strip_prefix(&root).map(str::to_string))
+            .collect()
+    };
+    (files(sources), files(generates))
+}
+
+/// A folded task's `exclude:` removes its own matches only: not the
+/// referrer's, nor another folded task's, even for the same pattern.
+#[test]
+fn folded_exclusions_are_task_local() {
+    let dir = stage("ref_follows_runs/exclusions");
+    let (sources, generates) = status_files(&dir, "refs");
+    assert_eq!(
+        sources,
+        [
+            "a/a.txt",
+            "b/keep.tmp",
+            "b/skip.tmp",
+            "own.tmp",
+            "shared/s.tmp",
+            "shared/s.txt"
+        ],
+        "{sources:?}"
+    );
+    assert_eq!(generates, ["out/a/y.txt", "out/b/x.log"], "{generates:?}");
+    // The same through `from: deps`.
+    let (sources, _) = status_files(&dir, "wrapper");
+    assert_eq!(
+        sources,
+        ["a/a.txt", "b/keep.tmp", "b/skip.tmp", "shared/s.txt"],
+        "{sources:?}"
+    );
+    // A fingerprint folded in from another task is not excluded either.
+    let (sources, _) = status_files(&dir, "fingerprinted");
+    assert_eq!(sources, ["a/a.txt", "fp/stamp.tmp", "shared/s.txt"]);
+}
+
+/// The referrer's own `exclude:` still removes what it folds in.
+#[test]
+fn own_exclusions_apply_to_folded_entries() {
+    let dir = stage("ref_follows_runs/exclusions");
+    let (sources, _) = status_files(&dir, "trims");
+    assert_eq!(sources, ["b/keep.tmp"], "{sources:?}");
+}
+
+/// The cache archive and the up-to-date check follow the same rule.
+#[test]
+fn folded_exclusions_shape_the_archive_and_the_checksum() {
+    let dir = stage("ref_follows_runs/exclusions");
+    let out = run(&dir, &["--status", "--json", "refs"]).stdout;
+    let (_, cache_files) = out.split_once("\"cache_files\": [").unwrap();
+    let cache_files = cache_files.split_once(']').unwrap().0;
+    assert!(cache_files.contains("out/b/x.log"), "{out}");
+    assert!(!cache_files.contains("out/a/y.log"), "{out}");
+    assert!(run(&dir, &["refs"]).ok());
+    assert!(run(&dir, &["refs"]).combined().contains("up to date"));
+    // A file only another task's exclusion matches is a source.
+    write(&dir.join("b"), "keep.tmp", "changed\n");
+    let third = run(&dir, &["refs"]);
+    assert!(
+        !third.combined().contains("up to date"),
+        "{}",
+        third.combined()
+    );
+}
+
+/// A list whose groups matter keeps one identity and checksum wherever the
+/// checkout is.
+#[test]
+fn grouped_fingerprints_are_stable() {
+    for _ in 0..2 {
+        let dir = stage("ref_follows_runs/exclusions");
+        assert!(run(&dir, &["refs"]).ok());
+        let file = checksum_file(&dir, "refs").unwrap();
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, "refs-5102e16695266f97");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "5fb7c6c6790b29c7b692ced2731674f8\n3bec5ef4f1206b8b5cffa0f14346d766\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

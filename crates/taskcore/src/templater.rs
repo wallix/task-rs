@@ -364,6 +364,7 @@ impl Cache {
                 from: g.from.clone(),
                 task: self.replace(&g.task),
                 vars: g.vars.as_ref().and_then(|v| self.replace_vars(v)),
+                group: g.group,
             })
             .collect()
     }

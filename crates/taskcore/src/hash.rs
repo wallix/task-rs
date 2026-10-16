@@ -316,7 +316,12 @@ fn encode_globs(enc: &mut Encoder, globs: &[ast::Glob]) -> Result<(), HashError>
         enc.str(&g.glob);
         enc.bool(g.negate);
         enc.str(&g.fingerprint);
-        if g.task.is_empty() {
+        if g.group != 0 {
+            // Only in a list whose groups matter (a folded task's exclusions
+            // apply to its own entries), so other lists hash as before.
+            enc.str("\0group");
+            enc.u64(u64::from(g.group));
+        } else if g.task.is_empty() {
             enc.str(&g.from);
         } else {
             // In the `from` slot, so that the encoding of other entries, and
@@ -666,6 +671,31 @@ mod tests {
                 assert_ne!(a, b);
             }
         }
+    }
+
+    // A group is part of the identity only where groups matter: group 0, every
+    // entry of a list whose groups do not, encodes as before.
+    #[test]
+    fn hash_encodes_folded_groups_only() {
+        let mut base = sample_task();
+        base.sources.push(ast::Glob {
+            glob: "/abs/lib/*.c".to_string(),
+            ..Default::default()
+        });
+        let before = hash(&base).unwrap();
+        let mut zero = base.clone();
+        if let Some(g) = zero.sources.last_mut() {
+            g.group = 0;
+        }
+        assert_eq!(hash(&zero).unwrap(), before);
+        let mut one = base.clone();
+        let mut two = base.clone();
+        if let (Some(a), Some(b)) = (one.sources.last_mut(), two.sources.last_mut()) {
+            a.group = 1;
+            b.group = 2;
+        }
+        assert_ne!(hash(&one).unwrap(), before);
+        assert_ne!(hash(&one).unwrap(), hash(&two).unwrap());
     }
 
     #[test]

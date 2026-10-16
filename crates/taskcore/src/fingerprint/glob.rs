@@ -29,8 +29,24 @@ use crate::filepathext;
 /// Expands glob patterns and returns matching files. For generates entries with
 /// a `fingerprint` field, only the fingerprint file is returned (used for
 /// checksum-based up-to-date detection).
+///
+/// Entries folded in from other tasks ([`Glob::group`] above 0) are evaluated
+/// group by group, so a folded task's exclusions remove only its own matches;
+/// the task's own exclusions then apply to the whole result.
 pub fn globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<String>> {
-    let mut included: BTreeSet<String> = BTreeSet::new();
+    let mut folded = BTreeSet::new();
+    for group in folded_groups(globs) {
+        folded.extend(shell_globs(dir, group, BTreeSet::new()));
+    }
+    Ok(shell_globs(dir, own(globs), folded))
+}
+
+/// [`globs`] over a single group, starting from the `included` matches.
+fn shell_globs<'a>(
+    dir: &str,
+    globs: impl Iterator<Item = &'a Glob>,
+    mut included: BTreeSet<String>,
+) -> Vec<String> {
     let mut excluded: BTreeSet<String> = BTreeSet::new();
     let mut patterns = Vec::new();
 
@@ -46,7 +62,7 @@ pub fn globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<String>> {
     }
 
     expand_patterns(&patterns, &mut included, &mut excluded, Options::SHELL);
-    Ok(collect(&included, &excluded))
+    collect(&included, &excluded)
 }
 
 /// Expands glob patterns for cache operations. Unlike [`globs`], it always uses
@@ -54,9 +70,22 @@ pub fn globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<String>> {
 /// all generated files, and it walks in tree mode ([`Options::TREE`]): hidden
 /// entries are included and symlinked directories are stored as the link
 /// rather than traversed. When a `fingerprint` is set the fingerprint file is
-/// also included (it may not match the glob).
+/// also included (it may not match the glob). Groups are evaluated as by
+/// [`globs`].
 pub fn cache_globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<String>> {
-    let mut included: BTreeSet<String> = BTreeSet::new();
+    let mut folded = BTreeSet::new();
+    for group in folded_groups(globs) {
+        folded.extend(tree_globs(dir, group, BTreeSet::new()));
+    }
+    Ok(tree_globs(dir, own(globs), folded))
+}
+
+/// [`cache_globs`] over a single group, starting from the `included` matches.
+fn tree_globs<'a>(
+    dir: &str,
+    globs: impl Iterator<Item = &'a Glob>,
+    mut included: BTreeSet<String>,
+) -> Vec<String> {
     let mut excluded: BTreeSet<String> = BTreeSet::new();
     let mut patterns = Vec::new();
 
@@ -71,7 +100,21 @@ pub fn cache_globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<String>> {
     }
 
     expand_patterns(&patterns, &mut included, &mut excluded, Options::TREE);
-    Ok(collect(&included, &excluded))
+    collect(&included, &excluded)
+}
+
+/// The task's own entries (group 0).
+fn own(globs: &[Glob]) -> impl Iterator<Item = &Glob> {
+    globs.iter().filter(|g| g.group == 0)
+}
+
+/// The entries folded in from other tasks, one iterator per group, in group
+/// order.
+fn folded_groups(globs: &[Glob]) -> impl Iterator<Item = impl Iterator<Item = &Glob>> {
+    let groups: BTreeSet<u32> = globs.iter().map(|g| g.group).filter(|&g| g != 0).collect();
+    groups
+        .into_iter()
+        .map(move |group| globs.iter().filter(move |g| g.group == group))
 }
 
 /// How a walk treats the entries a shell listing would hide.
@@ -620,6 +663,60 @@ mod tests {
 
     fn join(dir: &str, rel: &str) -> String {
         format!("{dir}/{rel}")
+    }
+
+    fn grouped(mut g: Glob, group: u32) -> Glob {
+        g.group = group;
+        g
+    }
+
+    /// A folded group's exclusions cut its own matches only; the task's own
+    /// (group 0) cut every group's, in both walks.
+    #[test]
+    fn groups_scope_exclusions() {
+        let dir = tmp();
+        for f in ["a/x.tmp", "a/x.txt", "b/y.tmp", "own.tmp", "c/z.tmp"] {
+            write_file(&dir, f, f);
+        }
+        let list = [
+            g("own.tmp"),
+            g_neg("c/**"),
+            grouped(g("a/**"), 1),
+            grouped(g_neg("**/*.tmp"), 1),
+            grouped(g("b/**"), 2),
+            grouped(g("c/**"), 2),
+        ];
+        let want = vec![
+            join(&dir, "a/x.txt"),
+            join(&dir, "b/y.tmp"),
+            join(&dir, "own.tmp"),
+        ];
+        assert_eq!(globs(&dir, &list).unwrap(), want);
+        assert_eq!(cache_globs(&dir, &list).unwrap(), want);
+        // The same entries as one list: the exclusion is global.
+        let flat: Vec<Glob> = list.iter().map(|g| grouped(g.clone(), 0)).collect();
+        assert_eq!(globs(&dir, &flat).unwrap(), vec![join(&dir, "a/x.txt")]);
+    }
+
+    /// A fingerprint stands for its group's glob; another group's exclusion
+    /// leaves it alone.
+    #[test]
+    fn groups_scope_exclusions_of_fingerprints() {
+        let dir = tmp();
+        write_file(&dir, "fp/f.txt", "f");
+        write_file(&dir, "fp/stamp.tmp", "s");
+        let list = [
+            grouped(g_neg("**/*.tmp"), 1),
+            grouped(g_fp("fp/**", "fp/stamp.tmp"), 2),
+        ];
+        assert_eq!(
+            globs(&dir, &list).unwrap(),
+            vec![join(&dir, "fp/stamp.tmp")]
+        );
+        assert_eq!(
+            cache_globs(&dir, &list).unwrap(),
+            vec![join(&dir, "fp/f.txt"), join(&dir, "fp/stamp.tmp")]
+        );
     }
 
     #[test]

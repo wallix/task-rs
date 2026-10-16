@@ -86,22 +86,14 @@ impl ChecksumChecker {
                 data.push(source.glob.clone());
             } else {
                 sources.push(source.clone());
-                let mut s = rel_glob(&dir, &source.glob);
-                if source.negate {
-                    s = format!("!{s}");
-                }
-                data.push(format!("srcrule:{s}"));
+                data.push(rule("srcrule", &dir, source));
             }
         }
         for (i, cmd) in self.task.raw_cmds.iter().enumerate() {
             data.push(serialize_cmd(i, cmd));
         }
         for gen_rule in &self.task.generates {
-            let mut s = rel_glob(&dir, &gen_rule.glob);
-            if gen_rule.negate {
-                s = format!("!{s}");
-            }
-            data.push(format!("genrule:{s}"));
+            data.push(rule("genrule", &dir, gen_rule));
         }
         data.sort();
         (sources, data)
@@ -276,6 +268,19 @@ impl ChecksumChecker {
     }
 }
 
+/// The checksum data for a glob: `<kind>:<glob>`, `!` before an exclusion's
+/// glob, and the group after the kind for an entry folded in from a list
+/// whose groups matter.
+fn rule(kind: &str, dir: &str, g: &Glob) -> String {
+    let negate = if g.negate { "!" } else { "" };
+    let glob = rel_glob(dir, &g.glob);
+    if g.group == 0 {
+        format!("{kind}:{negate}{glob}")
+    } else {
+        format!("{kind}@{}:{negate}{glob}", g.group)
+    }
+}
+
 fn serialize_cmd(idx: usize, c: &Cmd) -> String {
     format!("cmd[{idx}]:{}", c.cmd)
 }
@@ -364,6 +369,22 @@ mod tests {
             fingerprint: fingerprint.to_string(),
             ..Default::default()
         }
+    }
+
+    /// Rules carry the group of a folded entry, and only that.
+    #[test]
+    fn rules_carry_folded_groups() {
+        let dir = tmp();
+        let mut excluded = g("lib/*.tmp");
+        excluded.negate = true;
+        excluded.group = 1;
+        let task = new_task(&dir, vec![g("main.c"), excluded], vec![g("out/*")]);
+        let checker = ChecksumChecker::new(tmp(), task);
+        let data = checker.status().unwrap().source_data;
+        assert_eq!(
+            data,
+            ["genrule:out/*", "srcrule:main.c", "srcrule@1:!lib/*.tmp"]
+        );
     }
 
     #[test]

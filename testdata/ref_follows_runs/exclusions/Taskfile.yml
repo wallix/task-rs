@@ -1,0 +1,65 @@
+version: '3'
+
+# A folded task's `exclude:` removes only its own matches; the referrer's own
+# removes from everything it folds in.
+tasks:
+  lib-a:
+    sources:
+      - a/**
+      - shared/**
+      - exclude: '**/*.tmp'
+    generates:
+      - out/a/**
+      - exclude: out/**/*.log
+
+  lib-b:
+    sources: [b/**]
+    generates: [out/b/**]
+
+  lib-shared:
+    sources: [shared/**]
+
+  lib-fp:
+    sources:
+      - glob: fp/**
+        fingerprint: fp/stamp.tmp
+
+  refs:
+    sources:
+      - task: lib-a
+      - task: lib-b
+      - task: lib-shared
+      - own.tmp
+    generates:
+      - task: lib-a
+      - task: lib-b
+    cmds:
+      - 'true'
+
+  wrapper:
+    deps: [lib-a, lib-b]
+    sources: [from: deps]
+    cmds:
+      - 'true'
+
+  trims:
+    sources:
+      - task: lib-b
+      - exclude: b/skip.tmp
+    cmds:
+      - 'true'
+
+  fingerprinted:
+    sources:
+      - task: lib-a
+      - task: lib-fp
+    cmds:
+      - 'true'
+
+  sandboxed:
+    sources:
+      - task: lib-a
+      - task: lib-b
+    sandbox: true
+    cmds:
+      - cat b/keep.tmp

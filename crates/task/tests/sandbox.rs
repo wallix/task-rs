@@ -1008,3 +1008,13 @@ fn generates_outside_the_root_are_left_alone() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[test]
+fn a_file_another_folded_task_excludes_is_readable() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        let dir = stage("ref_follows_runs/exclusions");
+        let r = run_with_env(&dir, &["sandboxed"], &[("TASK_SANDBOX", mode)]);
+        assert!(r.ok(), "{mode}: {}", r.combined());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

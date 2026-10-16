@@ -455,7 +455,7 @@ impl Executor {
             above: Some(CallPath::extend(&None, &call.task, &call.task)),
         };
         let mut t = self
-            .compiled_task_with(call, evaluate_sh_vars, &resolver)
+            .compiled_task_with(call, evaluate_sh_vars, &resolver, false)
             .await?;
         // Like `task:` in sources, only on the full compile, which is what the
         // sandbox policy is built from. Not seeded with this task: a task
@@ -474,11 +474,13 @@ impl Executor {
 
     /// The body of [`Self::compiled_task_inner`], taking the resolver that
     /// expands `from:` globs so a nested expansion can hand down its own path.
+    /// `folded` when compiled for a referrer to fold its globs in.
     async fn compiled_task_with(
         &self,
         call: &Call,
         evaluate_sh_vars: bool,
         resolver: &dyn crate::variables::TaskResolver,
+        folded: bool,
     ) -> Result<Task, ExecutorError> {
         let (orig, wildcards) = self.get_task_with_match(call)?;
 
@@ -518,6 +520,7 @@ impl Executor {
             fingerprint_temp_dir: &self.temp_dir.fingerprint,
             env_precedence: self.env_precedence,
             caches,
+            folded,
         };
         let result = variables::compiled_task(
             &orig,
@@ -2042,7 +2045,7 @@ impl crate::variables::TaskResolver for GlobResolver<'_> {
                 above: Some(CallPath::extend(&self.above, task, task)),
             };
             self.exec
-                .compiled_task_with(&call, true, &inner)
+                .compiled_task_with(&call, true, &inner, true)
                 .await
                 .map_err(|e| match e {
                     // Keep a cycle typed as it unwinds through the outer frames,

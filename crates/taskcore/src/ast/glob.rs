@@ -28,6 +28,11 @@ pub struct Glob {
     pub task: String,
     /// The variables `task` is compiled with.
     pub vars: Option<Vars>,
+    /// Which task's entry it is, once references are resolved: 0 for the
+    /// task's own, then one number per task whose entries were folded in.
+    /// Never parsed. A folded task's exclusions apply to its own group only;
+    /// the task's own (group 0) apply to the whole list.
+    pub group: u32,
 }
 
 impl Glob {

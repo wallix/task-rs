@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **A folded task's `exclude:` entries no longer remove other tasks' files.**
+  In `sources` and `generates`, the exclusions of a task folded in by `from:`
+  or `task:` apply to that task's own entries only; the referring task's own
+  exclusions still apply to everything it folds in. Tasks folding a task that
+  excludes files get new fingerprints and cache keys, and rebuild once.
 - **`{{.CHECKSUM}}` now covers the entries a `from:` or `task:` reference
   folds in** wherever it is rendered after them: deferred commands,
   `preconditions` and the cache block, so a cache key now changes when only a

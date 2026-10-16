@@ -211,6 +211,10 @@ pub struct CompileContext<'a> {
     pub env_precedence: bool,
     /// The taskfile-level named cache models (`caches:`), for `cache.inherit`.
     pub caches: &'a Caches,
+    /// Whether the task is compiled for a referrer to fold its globs in: the
+    /// groups of the entries it folds in itself are then kept apart (see
+    /// [`finish_groups`]).
+    pub folded: bool,
 }
 
 /// Computes the cache key, converting hash errors to compile errors.
@@ -485,8 +489,8 @@ pub async fn compiled_task(
         return Err(CompileError::Template(err.clone()));
     }
     if let Some(resolver) = resolver.filter(|_| evaluate_sh_vars) {
-        resolve_globs_from(&mut new, GlobField::Sources, resolver).await?;
-        resolve_globs_from(&mut new, GlobField::Generates, resolver).await?;
+        resolve_globs_from(&mut new, GlobField::Sources, resolver, ctx.folded).await?;
+        resolve_globs_from(&mut new, GlobField::Generates, resolver, ctx.folded).await?;
         // The resolved entries feed the checksum: sources as files and rules,
         // generates as rules. Cleared first, as the checker would reuse it;
         // empty when the references resolved to no sources. Without sources
@@ -708,10 +712,14 @@ impl GlobField {
 /// Expands `from: deps` / `from: cmds` / `task:` entries of a task's sources or
 /// generates into the same field of the referenced tasks, made absolute against
 /// each child's directory. Ports Go `resolveGlobsFrom`, plus `task:`.
+///
+/// Each folded task's entries get a group of their own (see [`Glob::group`]).
+/// Unless `folded`, the list is then finished by [`finish_groups`].
 async fn resolve_globs_from(
     task: &mut Task,
     field: GlobField,
     resolver: &dyn TaskResolver,
+    folded: bool,
 ) -> Result<(), CompileError> {
     let globs = match field {
         GlobField::Sources => task.sources.clone(),
@@ -722,11 +730,11 @@ async fn resolve_globs_from(
     }
 
     let mut resolved: Vec<Glob> = Vec::with_capacity(globs.len());
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut next_group: u32 = 1;
 
     for g in &globs {
         if !g.is_reference() {
-            dedup_add(g.clone(), &mut resolved, &mut seen);
+            resolved.push(g.clone());
             continue;
         }
         // The tasks whose same field is folded in, as (name, vars) pairs.
@@ -756,11 +764,23 @@ async fn resolve_globs_from(
         for (name, vars) in calls {
             let globs =
                 referenced_globs(task.name(), field.name(), field, &name, &vars, resolver).await?;
-            for abs in globs {
-                dedup_add(abs, &mut resolved, &mut seen);
+            // The child's own entries and those it folded in, numbered here.
+            let mut groups = std::collections::HashMap::new();
+            for mut abs in globs {
+                abs.group = *groups.entry(abs.group).or_insert_with(|| {
+                    let group = next_group;
+                    next_group = next_group.saturating_add(1);
+                    group
+                });
+                resolved.push(abs);
             }
         }
     }
+    let resolved = if folded {
+        dedup(resolved, true)
+    } else {
+        finish_groups(resolved)
+    };
 
     match field {
         GlobField::Sources => task.sources = resolved,
@@ -806,6 +826,7 @@ async fn referenced_globs(
                     .to_string_lossy()
                     .into_owned(),
                 negate: cg.negate,
+                group: cg.group,
                 ..Default::default()
             };
             if !cg.fingerprint.is_empty() {
@@ -880,21 +901,39 @@ fn check_task_references(
     }
 }
 
-/// Appends `g` to `resolved` unless an equal glob (same pattern, negation, and
-/// fingerprint) was already present.
-fn dedup_add(g: Glob, resolved: &mut Vec<Glob>, seen: &mut std::collections::HashSet<String>) {
-    let mut key = g.glob.clone();
-    if g.negate {
-        key = format!("!{key}");
+/// Settles the groups of a resolved list. They matter only when a folded
+/// task's entries exclude something: otherwise every entry joins group 0, which
+/// evaluates, deduplicates and hashes exactly as one flat list.
+pub(crate) fn finish_groups(mut globs: Vec<Glob>) -> Vec<Glob> {
+    let grouped = globs.iter().any(|g| g.group != 0 && g.negate);
+    if !grouped {
+        for g in &mut globs {
+            g.group = 0;
+        }
     }
-    if !g.fingerprint.is_empty() {
-        key.push('\u{0}');
-        key.push_str("fp:");
-        key.push_str(&g.fingerprint);
-    }
-    if seen.insert(key) {
-        resolved.push(g);
-    }
+    dedup(globs, grouped)
+}
+
+/// Keeps the first of equal entries (same pattern, negation and fingerprint,
+/// and the same group when `grouped`), in order.
+fn dedup(globs: Vec<Glob>, grouped: bool) -> Vec<Glob> {
+    let mut seen = std::collections::HashSet::new();
+    globs
+        .into_iter()
+        .filter(|g| {
+            let mut key = g.glob.clone();
+            if g.negate {
+                key = format!("!{key}");
+            }
+            if !g.fingerprint.is_empty() {
+                key.push('\u{0}');
+                key.push_str("fp:");
+                key.push_str(&g.fingerprint);
+            }
+            let group = if grouped { g.group } else { 0 };
+            seen.insert((group, key))
+        })
+        .collect()
 }
 
 /// Whether caching is active for a compiled task: a cache block is present and
@@ -1217,6 +1256,7 @@ mod tests {
             fingerprint_temp_dir: tmp,
             env_precedence: false,
             caches,
+            folded: false,
         }
     }
 
@@ -1701,6 +1741,53 @@ mod tests {
         assert_eq!(
             out.env.unwrap().get("DYN").and_then(|v| v.value.clone()),
             Some(Value::String("from-shell".to_string()))
+        );
+    }
+
+    fn glob(pattern: &str, negate: bool, group: u32) -> Glob {
+        Glob {
+            glob: pattern.to_string(),
+            negate,
+            group,
+            ..Default::default()
+        }
+    }
+
+    /// Without a folded exclusion, groups collapse into one deduplicated list,
+    /// as before they existed; with one, equal entries of different groups
+    /// both stay.
+    #[test]
+    fn finish_groups_collapses_unless_a_folded_task_excludes() {
+        let flat = finish_groups(vec![
+            glob("/r/a", false, 0),
+            glob("/r/x", true, 0),
+            glob("/r/a", false, 1),
+            glob("/r/b", false, 2),
+            glob("/r/b", false, 1),
+        ]);
+        assert_eq!(
+            flat,
+            vec![
+                glob("/r/a", false, 0),
+                glob("/r/x", true, 0),
+                glob("/r/b", false, 0)
+            ]
+        );
+        let grouped = finish_groups(vec![
+            glob("/r/a", false, 0),
+            glob("/r/a", false, 1),
+            glob("/r/x", true, 1),
+            glob("/r/a", false, 2),
+            glob("/r/a", false, 2),
+        ]);
+        assert_eq!(
+            grouped,
+            vec![
+                glob("/r/a", false, 0),
+                glob("/r/a", false, 1),
+                glob("/r/x", true, 1),
+                glob("/r/a", false, 2)
+            ]
         );
     }
 
