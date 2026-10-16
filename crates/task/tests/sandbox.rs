@@ -982,7 +982,7 @@ fn writes_naming_a_task_without_generates_warn() {
         assert!(
             r.stderr.contains(
                 "sandbox: \"writes-nothing\": sandbox.writes {task: probe} grants nothing: \
-                 \"probe\" has no generates"
+                 \"probe\" and the tasks it runs declare no generates or writes"
             ),
             "{mode}: {}",
             r.combined()
@@ -1021,4 +1021,163 @@ fn a_file_another_folded_task_excludes_is_readable() {
         assert!(r.ok(), "{mode}: {}", r.combined());
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// On a fresh tree, a sandboxed task running another, as a nested task
+/// process or with `task:`, needs only `{task: x}` in `sources` and
+/// `writes`: x's deps, x's own `writes` and its dotenv are covered.
+#[test]
+fn a_reference_covers_what_the_task_it_runs_runs() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        for task in ["stage", "stage-in-process"] {
+            let dir = stage("ref_follows_runs/sandbox");
+            let cache = dir.join(".cache-dir");
+            let env = [
+                ("TASK_SANDBOX", mode),
+                ("CACHE_DIR", cache.to_str().unwrap()),
+            ];
+            let r = run_with_env(&dir, &[task], &env);
+            assert!(r.ok(), "{mode} {task}: {}", r.combined());
+            assert!(
+                r.stdout.ends_with("pkg\n"),
+                "{mode} {task}: {}",
+                r.combined()
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join("var/cache/stamp")).unwrap(),
+                "from-dotenv\n",
+                "{mode} {task}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// An imported `writes` directory is writable itself, not its parent;
+/// what is beside it stays out of reach, and so do the files a reached
+/// task's `sandbox.reads` lists.
+#[test]
+fn imported_writes_grant_no_more_than_the_directory() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        for task in ["stage-beside", "stage-secret", "stage-reads"] {
+            let dir = stage("ref_follows_runs/sandbox");
+            let r = run_with_env(&dir, &[task], &[("TASK_SANDBOX", mode)]);
+            assert!(
+                !r.ok(),
+                "{mode} {task}: expected a failure: {}",
+                r.combined()
+            );
+            assert!(
+                r.combined().contains("Permission denied"),
+                "{mode} {task}: {}",
+                r.combined()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// A reached task's `writes` at or above the root is ignored, with a warning
+/// naming where it comes from; one through a symlink is writable.
+#[test]
+fn imported_writes_are_checked_like_the_tasks_own() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        let dir = stage("ref_follows_runs/sandbox");
+        let r = run_with_env(&dir, &["stage-wide"], &[("TASK_SANDBOX", mode)]);
+        assert!(r.ok(), "{mode}: {}", r.combined());
+        let want = format!(
+            "sandbox: \"stage-wide\": sandbox.writes {{task: wide-wrapper}} → deps \"wide\": \
+             writes {:?} is the root directory or above it and is ignored",
+            dir.parent().unwrap().display().to_string()
+        );
+        assert!(r.stderr.contains(&want), "{mode}: {}", r.combined());
+
+        let r = run_with_env(&dir, &["stage-link"], &[("TASK_SANDBOX", mode)]);
+        assert!(r.ok(), "{mode}: {}", r.combined());
+        assert!(dir.join("real/cache/new").exists(), "{mode}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A nested task process gets what its reference grants, which `--verbose`
+/// lists: called with other vars, it writes elsewhere and is denied.
+#[test]
+fn a_nested_task_process_is_granted_what_its_reference_names() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        let dir = stage("ref_follows_runs/sandbox");
+        let r = run_with_env(&dir, &["-v", "stage-lang"], &[("TASK_SANDBOX", mode)]);
+        assert!(r.ok(), "{mode}: {}", r.combined());
+        assert!(
+            r.stderr.contains(
+                "task: [stage-lang] sandbox grants sandbox.writes {task: lang}: generates \
+                 \"gen/fr/*\""
+            ),
+            "{mode}: {}",
+            r.combined()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir = stage("ref_follows_runs/sandbox");
+        let r = run_with_env(
+            &dir,
+            &["stage-lang", "NESTED_L=de"],
+            &[("TASK_SANDBOX", mode)],
+        );
+        assert!(!r.ok(), "{mode}: expected a failure: {}", r.combined());
+        assert!(!dir.join("gen/de").exists(), "{mode}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A `generates` reference selects the referenced task's products: a cache
+/// hit restores those, not what the tasks it runs generate.
+#[test]
+fn a_cache_hit_restores_the_referenced_products_only() {
+    let mode = ENFORCING
+        .into_iter()
+        .find(|m| available(m))
+        .unwrap_or("off");
+    let dir = stage("ref_follows_runs/sandbox");
+    let cache = dir.join(".cache-dir");
+    let env = [
+        ("TASK_SANDBOX", mode),
+        ("CACHE_DIR", cache.to_str().unwrap()),
+    ];
+    let first = run_with_env(&dir, &["stage"], &env);
+    assert!(first.ok(), "{mode}: {}", first.combined());
+    let warm = run_with_env(&dir, &["stage"], &env);
+    assert!(
+        warm.combined().contains("up to date"),
+        "{mode}: {}",
+        warm.combined()
+    );
+    std::fs::remove_dir_all(dir.join("out")).unwrap();
+    std::fs::remove_dir_all(dir.join(".task")).unwrap();
+    let restored = run_with_env(&dir, &["stage"], &env);
+    assert!(restored.ok(), "{mode}: {}", restored.combined());
+    assert!(
+        restored.combined().contains("restored from cache"),
+        "{mode}: {}",
+        restored.combined()
+    );
+    assert!(dir.join("out/pkg/pkg.txt").exists(), "{mode}");
+    assert!(!dir.join("out/lib").exists(), "{mode}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A reached task reading what its dep generates: those sources change
+/// while the referrer runs, which is reported, and no fingerprint recorded.
+#[test]
+fn reached_sources_generated_during_the_run_are_reported() {
+    let dir = stage("ref_follows_runs/sandbox");
+    let r = run_with_env(&dir, &["stage-mid"], &[("TASK_SANDBOX", "off")]);
+    assert!(r.ok(), "{}", r.combined());
+    assert!(
+        r.stderr.contains(
+            "task: WARNING: sources for \"stage-mid\" changed during execution (out/lib/lib.txt)"
+        ),
+        "{}",
+        r.combined()
+    );
+    assert!(checksum_file(&dir, "stage-mid").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
 }

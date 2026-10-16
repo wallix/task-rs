@@ -206,6 +206,12 @@ tasks:
       - task: missing
         if: 'false'
 
+  unknown-writes:
+    sandbox:
+      writes: [{task: u1}]
+    cmds:
+      - echo never
+
   calls-unknown:
     deps: [unknown]
 

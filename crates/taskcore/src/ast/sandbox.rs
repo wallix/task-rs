@@ -22,12 +22,39 @@ pub struct Sandbox {
     /// relative to the task directory. Missing ones are created before the
     /// task runs.
     pub writes: Vec<String>,
-    /// The `task:` entries of `writes` (`task` and `vars` set only): the
-    /// directories that task's `generates` write in are writable too.
+    /// The `task:` entries of `writes` (`task` and `vars` set only): what
+    /// that task and the tasks it runs write in is writable too.
     pub write_tasks: Vec<Glob>,
-    /// The `generates` of each of `write_tasks`, absolute, with the name of
-    /// the task they come from. Filled by the full compile.
-    pub task_generates: Vec<(String, Vec<Glob>)>,
+    /// What each of `write_tasks` grants, with the name of the task it names.
+    /// Filled by the full compile.
+    pub task_grants: Vec<(String, Vec<Grant>)>,
+}
+
+/// An access a `sandbox.writes` task reference grants: one of the tasks it
+/// reaches declares it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Grant {
+    /// Where it comes from, for messages (`sandbox.writes {task: x} → deps
+    /// "y": writes "cache"`).
+    pub what: String,
+    /// The entry as declared, for messages.
+    pub declared: String,
+    /// The path, absolute; empty when the entry grants nothing (an
+    /// exclusion).
+    pub path: String,
+    /// What it grants on the path.
+    pub kind: GrantKind,
+}
+
+/// What a [`Grant`] grants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantKind {
+    /// A `generates` pattern: the directory it writes in is writable.
+    Generates,
+    /// A `sandbox.writes` directory: writable itself.
+    Writes,
+    /// A `dotenv` file: readable.
+    Dotenv,
 }
 
 impl Sandbox {

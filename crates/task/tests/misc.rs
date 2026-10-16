@@ -1405,6 +1405,12 @@ fn a_missing_task_reached_fails_with_the_chain() {
         assert_eq!(out.stderr, sources, "{args:?}");
         assert_eq!(out.code, 200, "{args:?}");
     }
+    let out = run_with_env(&dir, &["unknown-writes"], &[("TASK_SANDBOX", "off")]);
+    assert_eq!(
+        out.stderr,
+        format!("task: unknown-writes: sandbox.writes: {chain}\n")
+    );
+    assert_eq!(out.code, 200);
     let wrapped = format!("task: Failed to run task \"calls-unknown\": {sources}");
     for (args, code) in [
         (&["calls-unknown"][..], 201),

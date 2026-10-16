@@ -1,0 +1,134 @@
+version: '3'
+
+vars:
+  CACHE_DIR:
+    sh: echo "$CACHE_DIR"
+
+# On a fresh tree (no out/, no var/cache/), a sandboxed task running pkg, as a
+# nested task process or with `task:`, needs only `{task: pkg}`: pkg's dep
+# lib, its `writes` and its dotenv are covered too.
+tasks:
+  stage:
+    sources: [{task: pkg}]
+    generates: [{task: pkg}]
+    sandbox:
+      writes: [{task: pkg}]
+    cache:
+      url: 'file://{{.CACHE_DIR}}/stage.zip'
+    cmds:
+      - '"{{.TASK_EXE}}" pkg'
+      - cat out/pkg/pkg.txt
+
+  stage-in-process:
+    sources: [{task: pkg}]
+    sandbox:
+      writes: [{task: pkg}]
+    cmds:
+      - task: pkg
+      - cat out/pkg/pkg.txt
+
+  pkg:
+    sources: [src/pkg.txt]
+    generates: [out/pkg/*]
+    deps: [lib]
+    dotenv: [conf/pkg.env]
+    sandbox:
+      writes: [var/cache]
+    cmds:
+      - mkdir -p out/pkg && cat src/pkg.txt > out/pkg/pkg.txt
+      - echo "$PKG" > var/cache/stamp
+
+  lib:
+    sources: [src/lib.txt]
+    generates: [out/lib/*]
+    cmds:
+      - mkdir -p out/lib && cat src/lib.txt > out/lib/lib.txt
+
+  # var/cache is writable, not var/.
+  stage-beside:
+    sources: [{task: pkg}]
+    sandbox:
+      writes: [{task: pkg}]
+    cmds:
+      - touch var/escape
+
+  # What is beside an imported directory stays out of reach.
+  stage-secret:
+    sources: [{task: pkg}]
+    sandbox:
+      writes: [{task: pkg}]
+    cmds:
+      - cat var/secret.txt
+
+  # A reached task's `sandbox.reads` is not imported.
+  stage-reads:
+    sources: [src/pkg.txt]
+    sandbox:
+      writes: [{task: reads}]
+    cmds:
+      - cat secret/key
+
+  reads:
+    sandbox:
+      reads: [secret/**]
+      writes: [var/cache]
+
+  # A reached task's `writes` at or above the root is ignored.
+  stage-wide:
+    sources: [src/pkg.txt]
+    sandbox:
+      writes: [{task: wide-wrapper}]
+    cmds:
+      - cat src/pkg.txt
+
+  wide-wrapper:
+    deps: [wide]
+
+  wide:
+    sandbox:
+      writes: ['..']
+
+  # A reached task's `writes` through a symlink.
+  stage-link:
+    sources: [src/pkg.txt]
+    sandbox:
+      writes: [{task: linked}]
+    cmds:
+      - task: linked
+
+  linked:
+    sandbox:
+      writes: [link]
+    cmds:
+      - echo x > link/new && cat link/new
+
+  # The nested process must be called as referenced: another L writes
+  # elsewhere.
+  stage-lang:
+    sources: [src/pkg.txt]
+    sandbox:
+      writes: [{task: lang, vars: {L: fr}}]
+    cmds:
+      - '"{{.TASK_EXE}}" lang L={{.NESTED_L | default "fr"}}'
+
+  # gen/ holds a file no task here may read: only gen/<L> is writable.
+  lang:
+    generates: ['gen/{{.L}}/*']
+    cmds:
+      - mkdir -p gen/{{.L}} && echo {{.L}} > gen/{{.L}}/l.txt
+
+  # pkg-mid reads what its dep generates: those files change while the
+  # referrer runs.
+  stage-mid:
+    sources: [{task: pkg-mid}]
+    sandbox:
+      writes: [{task: pkg-mid}]
+    cmds:
+      - task: pkg-mid
+
+  pkg-mid:
+    sources: [src/pkg.txt, out/lib/*]
+    generates: [out/mid/*]
+    deps: [lib]
+    cmds:
+      - mkdir -p out/mid && cat out/lib/lib.txt > out/mid/mid.txt

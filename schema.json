@@ -271,7 +271,7 @@
                   }
                 },
                 "writes": {
-                  "description": "Directories the commands may change freely, relative to the task directory; created if missing. Reads inside them are not restricted. A `task` entry stands for the directories that task's generates write in.",
+                  "description": "Directories the commands may change freely, relative to the task directory; created if missing. Reads inside them are not restricted. A `task` entry stands for the directories that task and the tasks it runs write in (their generates and writes), and makes their dotenv files readable.",
                   "type": "array",
                   "items": {
                     "$ref": "#/definitions/sandbox_write"
@@ -695,7 +695,7 @@
           "type": "object",
           "properties": {
             "task": {
-              "description": "A task whose generates directories (the part of each pattern before its first wildcard, or a file's directory) the commands may change freely. Not fingerprinted.",
+              "description": "A task whose generates directories (the part of each pattern before its first wildcard, or a file's directory) and writes directories the commands may change freely, with those of the tasks it runs; their dotenv files are readable. Not fingerprinted.",
               "type": "string",
               "minLength": 1
             },

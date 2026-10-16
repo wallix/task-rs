@@ -118,9 +118,13 @@ pub struct PolicyInput<'a> {
     /// Output directories paired with warning labels (`generates "bin/*"`).
     /// Made writable like `writable`, unless they would cover the whole root.
     pub generated: Vec<(String, PathBuf)>,
-    /// Output directories of tasks named in `sandbox.writes`, like `generated`.
-    /// No source-overlap warning: the named task controls its output paths.
+    /// Output directories of tasks named in `sandbox.writes` and of those they
+    /// run, like `generated`. No source-overlap warning: the named task
+    /// controls its output paths.
     pub referenced: Vec<(String, PathBuf)>,
+    /// The `sandbox.writes` directories of those tasks, paired with warning
+    /// labels: like `writable`, without a source-overlap warning.
+    pub imported: Vec<(String, PathBuf)>,
     /// The system temporary directory, which commands use unless it contains
     /// the root or is inside it.
     pub system_tmp: PathBuf,
@@ -163,10 +167,17 @@ impl Policy {
         let mut warnings = Vec::new();
         let mut writable = HashSet::new();
         // What each directory is, and what to do about it, for the warning.
-        let declared = input.writable.iter().map(|dir| {
-            let fix = "list the directories beneath it that the commands change";
-            (dir, "sandbox.writes", fix)
-        });
+        let fix = "list the directories beneath it that the commands change";
+        let declared = input
+            .writable
+            .iter()
+            .map(|dir| (dir, "sandbox.writes", fix))
+            .chain(
+                input
+                    .imported
+                    .iter()
+                    .map(|(what, dir)| (dir, what.as_str(), fix)),
+            );
         let temp_dir = (
             &input.temp_dir,
             "the task temp directory (TASK_TEMP_DIR)",
@@ -681,6 +692,7 @@ mod tests {
                 .map(|p| (format!("generates {p:?}"), root.join(p)))
                 .collect(),
             referenced: Vec::new(),
+            imported: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: root.join(".task/tmp"),
         })
@@ -720,6 +732,7 @@ mod tests {
                 ("parent".to_string(), root.join("..")),
             ],
             referenced: Vec::new(),
+            imported: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: root.join(".task/tmp"),
         })
@@ -752,6 +765,7 @@ mod tests {
             temp_dir: root.join(".task"),
             generated: vec![("out".to_string(), dir)],
             referenced: Vec::new(),
+            imported: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: root.join(".task/tmp"),
         })
@@ -783,6 +797,7 @@ mod tests {
             temp_dir: root.join(".task"),
             generated: Vec::new(),
             referenced: Vec::new(),
+            imported: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: root.join(".task/tmp"),
         })
@@ -805,6 +820,7 @@ mod tests {
             temp_dir: root.clone(),
             generated: Vec::new(),
             referenced: Vec::new(),
+            imported: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: root.join("tmp/run"),
         })
@@ -829,6 +845,7 @@ mod tests {
             temp_dir: root.join(".task"),
             generated: Vec::new(),
             referenced: Vec::new(),
+            imported: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: root.join(".task/tmp/run"),
         })
@@ -888,6 +905,7 @@ mod tests {
             temp_dir: root.join(".task"),
             generated: Vec::new(),
             referenced: Vec::new(),
+            imported: Vec::new(),
             system_tmp: root.join("tmp"),
             private_tmp: root.join(".task/tmp/run"),
         })
@@ -901,6 +919,7 @@ mod tests {
             temp_dir: root.join(".task"),
             generated: Vec::new(),
             referenced: Vec::new(),
+            imported: Vec::new(),
             system_tmp: PathBuf::from("/"),
             private_tmp: root.join(".task/tmp/other"),
         })
@@ -916,6 +935,7 @@ mod tests {
             temp_dir: root.join(".task"),
             generated: Vec::new(),
             referenced: Vec::new(),
+            imported: Vec::new(),
             system_tmp: apart.clone(),
             private_tmp: root.join(".task/tmp/none"),
         })
@@ -934,6 +954,7 @@ mod tests {
             temp_dir: root.join(".task"),
             generated: Vec::new(),
             referenced: Vec::new(),
+            imported: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: private_tmp.to_path_buf(),
         })
@@ -972,6 +993,7 @@ mod tests {
             temp_dir: root.join(".task"),
             generated,
             referenced: vec![("i18n".to_string(), root.join("po"))],
+            imported: Vec::new(),
             system_tmp: std::env::temp_dir(),
             private_tmp: root.join(".task/tmp"),
         };

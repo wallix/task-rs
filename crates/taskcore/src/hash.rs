@@ -757,11 +757,13 @@ mod tests {
                 }])),
                 ..Default::default()
             });
-            s.task_generates.push((
+            s.task_grants.push((
                 "lib".to_string(),
-                vec![ast::Glob {
-                    glob: "/abs/lib/out/*".to_string(),
-                    ..Default::default()
+                vec![ast::Grant {
+                    what: "sandbox.writes {task: lib}".to_string(),
+                    declared: "out/*".to_string(),
+                    path: "/abs/lib/out/*".to_string(),
+                    kind: ast::GrantKind::Generates,
                 }],
             ));
         }

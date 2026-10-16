@@ -1012,48 +1012,84 @@ tasks:
 The sandbox also covers the tasks the commands call, through `task:` in `cmds`
 or a nested `task` process (a script running `task rust:build`). Those write
 their own `generates`, so a `writes` entry can name a task: `{task: X}`, with
-optional `vars` as a dependency call, makes the directories X's `generates`
-write in writable, as they are for X itself. Reads inside them are not
-restricted either, but one that also holds sources draws no warning (a
+optional `vars` as a dependency call, grants what X and every task X runs (as
+a `task:` entry of `sources` finds them) declare:
+
+- the directories their `generates` write in (with their own `from:` and
+  `task:` generates entries), as they are for X itself. A pattern writes in
+  its part before the first wildcard (`target/**/*` in `target/`), a plain
+  file path in its directory (`bin/app` in `bin/`);
+- their own `sandbox.writes` directories, those directories themselves (not
+  their parents), created beforehand. One at or above the root directory is
+  ignored with a warning naming the task that declares it, as for the task's
+  own;
+- their `dotenv` files, readable (not fingerprinted), which a nested `task`
+  process reads. A directory whose files are all readable stays writable as
+  usual.
+
+Their `sandbox.reads` are not granted. Reads inside the granted directories are
+not restricted either, but one that also holds sources draws no warning (a
 translation catalog compiled next to its `.po` file): where X writes is X's to
-change, and a sandboxed X warns about its own `generates`. A pattern writes in its part
-before the first wildcard (`target/**/*` in `target/`), a plain file path in
-its directory (`bin/app` in `bin/`). The name resolves like a `task:` entry of
-`sources`, through X's own `from:` and `task:` generates entries; an unknown
-name, or one that renders empty, is an error. The entry grants access
-only: it changes neither the task's fingerprint nor its cache key. One whose
-task has no `generates` grants nothing, with a warning.
+change, and a sandboxed X warns about its own `generates`. The grants apply to
+every command of the task, not only to the call of X, and calls behind an
+`if:` count too. An unknown name, or one that renders empty, is an error. The
+entry grants access only: it changes neither the task's fingerprint nor its
+cache key. One whose tasks declare no `generates` or `writes` grants nothing,
+with a warning. `--verbose` lists each grant with the calls it comes from
+(`sandbox.writes {task: X} → deps "Y": writes "cache"`); a denial names only
+the command that was denied.
 
 The entry's `vars` must render the same `generates` as the call the commands
 make: the `vars` of a `task:` command, or the `VAR=value` arguments of a nested
 `task X VAR=value`. The caller's own command-line variables apply to the
 reference, the nested process's arguments do not. A mismatch makes another
-directory writable, and the sandbox denies the callee's writes.
+directory writable, and the sandbox usually denies the callee's writes.
 
 A task that runs X also depends on X's inputs, so it lists them in its own
 `sources` with `- task: X`, which makes them, and those of the tasks X runs,
-readable and fingerprints them.
-`sandbox.reads` takes no `task:` entry for that: inputs read without being
-fingerprinted would leave a stale up-to-date result or cache entry.
+readable and fingerprints them. `sandbox.reads` takes no `task:` entry for
+that: inputs read without being fingerprinted would leave a stale up-to-date
+result or cache entry.
+
+A nested `task` process is found as if it were called with `task:` from the
+same Taskfile. What it does differently is not followed: it inherits the
+command's environment, dotenv values and working directory, compiles its
+variables anew, gets no prompted values, and sees the files earlier commands
+left. The declarations must match what it does. A divergence can show as a
+denial or as a fingerprint that misses an input, or go unnoticed, for instance
+when it reads another file inside a granted `writes` directory, which is
+neither restricted nor fingerprinted. A nested run of another Taskfile (`-d`,
+`-t`) is not followed at all; list what it reads and writes explicitly. The
+sources of X's deps that X itself reads once they are generated (X's
+`sources` matching a dep's `generates`) change while the task runs, which is
+reported, and no fingerprint or cache entry is recorded.
 
 ```yaml
 tasks:
   debstage:
     sources:
       - debian/**
-      - task: rust:build
-      - task: i18n:build
+      - task: package
         vars: { LANG: fr }
     generates: [debian/tmp/**/*]
     sandbox:
       writes:
         - build/tmp
-        - task: rust:build
-        - task: i18n:build
+        - task: package
           vars: { LANG: fr }
     cmds:
-      # runs `task rust:build` and `task i18n:build LANG=fr`
+      # runs `task package LANG=fr`
       - debian/rules binary
+
+  # Its deps' sources, generates and writes are covered too.
+  package:
+    deps:
+      - rust:build
+      - task: i18n:build
+        vars: { LANG: '{{.LANG}}' }
+    generates: [dist/*.tar]
+    cmds:
+      - tar cf dist/app-{{.LANG}}.tar target/release/app po/{{.LANG}}.mo
 ```
 
 #### `platforms`

@@ -1515,6 +1515,27 @@ impl Executor {
                 .iter()
                 .map(|f| filepathext::smart_join(&dir_str, f)),
         );
+        // What the tasks `sandbox.writes` names declare, and those they run.
+        let grants: Vec<&crate::ast::Grant> = sandbox
+            .task_grants
+            .iter()
+            .flat_map(|(_, grants)| grants)
+            .filter(|g| !g.path.is_empty())
+            .collect();
+        readable.extend(
+            grants
+                .iter()
+                .filter(|g| g.kind == crate::ast::GrantKind::Dotenv)
+                .map(|g| std::path::PathBuf::from(&g.path)),
+        );
+        let imported: Vec<(String, std::path::PathBuf)> = grants
+            .iter()
+            .filter(|g| g.kind == crate::ast::GrantKind::Writes)
+            .map(|g| {
+                let what = format!("{}: writes", g.what);
+                (what, std::path::PathBuf::from(&g.path))
+            })
+            .collect();
 
         let writable: Vec<std::path::PathBuf> = sandbox
             .writes
@@ -1530,39 +1551,57 @@ impl Executor {
             .iter()
             .map(|g| (format!("generates {:?}", g.glob), g))
             .collect();
-        let mut referenced = Vec::new();
-        for (task, globs) in &sandbox.task_generates {
-            let writing: Vec<_> = globs
-                .iter()
-                .filter(|g| !g.negate && !g.glob.is_empty())
-                .collect();
-            if writing.is_empty() {
+        for (task, grants) in &sandbox.task_grants {
+            let writing = grants.iter().any(|g| {
+                !g.path.is_empty()
+                    && matches!(
+                        g.kind,
+                        crate::ast::GrantKind::Generates | crate::ast::GrantKind::Writes
+                    )
+            });
+            if !writing {
                 self.logger().borrow_mut().warnf(&format!(
                     "sandbox: {:?}: sandbox.writes {{task: {task}}} grants nothing: {task:?} \
-                     has no generates\n",
+                     and the tasks it runs declare no generates or writes\n",
                     t.name()
                 ));
             }
-            for g in writing {
-                let shown = std::path::Path::new(&g.glob)
-                    .strip_prefix(root)
-                    .map_or_else(|_| g.glob.clone(), |p| p.to_string_lossy().into_owned());
-                let what = format!("sandbox.writes {{task: {task}}}: generates {shown:?}");
-                referenced.push((what, g));
-            }
         }
-        let dirs = |globs: Vec<(String, &crate::ast::Glob)>| {
-            globs
-                .into_iter()
-                .filter(|(_, g)| !g.negate && !g.glob.is_empty())
-                .map(|(what, g)| {
-                    let dir = generated_dir(&filepathext::smart_join(&dir_str, &g.glob));
-                    (what, dir)
-                })
-                .collect()
-        };
-        let generated = dirs(own);
-        let referenced = dirs(referenced);
+        let referenced: Vec<(String, std::path::PathBuf)> = grants
+            .iter()
+            .filter(|g| g.kind == crate::ast::GrantKind::Generates)
+            .map(|g| {
+                let shown = std::path::Path::new(&g.path)
+                    .strip_prefix(root)
+                    .map_or_else(|_| g.path.clone(), |p| p.to_string_lossy().into_owned());
+                let what = format!("{}: generates {shown:?}", g.what);
+                (what, generated_dir(std::path::Path::new(&g.path)))
+            })
+            .collect();
+        for g in &grants {
+            let what = match g.kind {
+                crate::ast::GrantKind::Generates => "generates",
+                crate::ast::GrantKind::Writes => "writes",
+                crate::ast::GrantKind::Dotenv => "dotenv",
+            };
+            self.logger().borrow_mut().verbose_errf(
+                Color::Magenta,
+                &format!(
+                    "task: [{}] sandbox grants {}: {what} {:?}\n",
+                    t.name(),
+                    g.what,
+                    g.declared
+                ),
+            );
+        }
+        let generated = own
+            .into_iter()
+            .filter(|(_, g)| !g.negate && !g.glob.is_empty())
+            .map(|(what, g)| {
+                let dir = generated_dir(&filepathext::smart_join(&dir_str, &g.glob));
+                (what, dir)
+            })
+            .collect();
 
         // A directory per run, locked while it lives (see `Policy::build`), so
         // that concurrent ones never clear each other's; removed once the task
@@ -1589,6 +1628,7 @@ impl Executor {
                 temp_dir,
                 generated,
                 referenced,
+                imported,
                 system_tmp: std::env::temp_dir(),
                 private_tmp,
             })

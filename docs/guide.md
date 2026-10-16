@@ -902,10 +902,11 @@ of every task it runs (`setup`, `deps`, `task:` commands); see
 [`cache`](reference/schema.md#cache).
 
 A task called from a sandboxed one, with `task:` or as a nested `task` process
-from a script, writes its `generates` under the caller's sandbox. Name it in
-`sandbox.writes` (`writes: [{task: rust:build}]`) to make those directories
-writable, and in `sources` to make its inputs readable; see
-[`sandbox`](reference/schema.md#sandbox).
+from a script, writes its `generates` under the caller's sandbox, and so do the
+tasks it runs. Name it in `sandbox.writes` (`writes: [{task: rust:build}]`) to
+grant write access to their `generates` and `writes` directories and read
+access to their dotenv files. Name it in `sources` to make their inputs
+readable; see [`sandbox`](reference/schema.md#sandbox).
 
 To find every undeclared input in one run, report the accesses without denying
 them. An up-to-date task or remote cache hit runs no commands, so the sandbox

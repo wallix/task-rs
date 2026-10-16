@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`sandbox.writes: [{task: X}]` now grants what X and the tasks it runs
+  write:** their `generates` and `sandbox.writes` directories, and reading their
+  dotenv files, so a sandboxed task running X, with `task:` or as a nested
+  `task X`, needs no other entry for them. Their `sandbox.reads` are not
+  granted.
 - **A `task:` entry in `sources` now covers what the task runs.** `{task: X}`
   also takes in the sources of the tasks X runs through `setup`, `deps` and
   `task:` commands (including `for:` loops and deferred calls), transitively,

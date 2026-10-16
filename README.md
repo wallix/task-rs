@@ -315,7 +315,7 @@ v3 are intentional.
 - `sandbox:` restricts a task's commands to its declared sources inside the
   root directory (Linux only: Landlock, or a seccomp fallback), to catch
   inputs missing from `sources`; `sandbox.writes` can name a called task whose
-  outputs its commands write.
+  outputs, and those of the tasks it runs, its commands write.
 
 ### Changed
 

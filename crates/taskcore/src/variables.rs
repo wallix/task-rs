@@ -450,9 +450,9 @@ pub async fn compiled_task(
         // Only a task about to run needs these grants, but resolved on every
         // full compile, sandboxing on or off, so bad references fail alike.
         if writes {
-            let generates = reach.writes(&new).await?;
+            let grants = reach.writes(&new).await?;
             if let Some(s) = &mut new.sandbox {
-                s.task_generates = generates;
+                s.task_grants = grants;
             }
         }
         // The resolved entries feed the checksum: sources as files and rules,
@@ -531,7 +531,7 @@ async fn compile_run(
             reads: cache.replace_globs(&s.reads),
             writes: cache.replace_vec(&s.writes),
             write_tasks: cache.replace_globs(&s.write_tasks),
-            task_generates: Vec::new(),
+            task_grants: Vec::new(),
         }),
         dirs: cache.replace_vec(&orig_task.dirs),
         set: orig_task.set.clone(),

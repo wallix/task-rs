@@ -2,10 +2,10 @@
 //! `sandbox.writes` reaches.
 //!
 //! A *state* is a call: the task it resolves to, its wildcard captures and the
-//! call's vars. A `task:` entry reaches its state in *run* mode in `sources`:
-//! the state's own entries, and those of every state its `setup`, `deps` and
-//! `task:` commands (deferred ones included) reach in turn. In `generates` and
-//! `sandbox.writes` it reaches it in *field* mode: the state's generates only,
+//! call's vars. A `task:` entry reaches its state in *run* mode in `sources`
+//! and `sandbox.writes`: the state's own entries, and those of every state its
+//! `setup`, `deps` and `task:` commands (deferred ones included) reach in turn.
+//! In `generates` it reaches it in *field* mode: the state's entries only,
 //! with the references among them followed. `from: deps` and `from: cmds`
 //! reach the direct targets in field mode.
 //!
@@ -22,7 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::ast::{Cmd, Glob, Task, Var, Vars};
+use crate::ast::{Cmd, Glob, Grant, GrantKind, Task, Var, Vars};
 use crate::filepathext;
 use crate::templater::{Cache, TemplaterError};
 use crate::variables::{CompileError, DeferredCall, ReachedTask, ReferenceLimit, TaskResolver};
@@ -157,6 +157,7 @@ type Group = Rc<std::cell::Cell<u32>>;
 enum Item {
     /// An entry, with the group to number it in (`None`: as is).
     Emit(Glob, Option<Group>),
+    Grant(Grant),
     Visit(Visit),
 }
 
@@ -242,13 +243,13 @@ impl<'a> Reach<'a> {
         Ok(crate::variables::finish_groups(out))
     }
 
-    /// The generates of each `sandbox.writes` task reference of `task`, with
-    /// those of its own `generates` references, absolute. One walk per
-    /// reference.
+    /// What each `sandbox.writes` task reference of `task` grants: the
+    /// generates (field mode) of every state in its run closure, their
+    /// `sandbox.writes` directories and dotenv files. One walk per reference.
     pub(crate) async fn writes(
         &mut self,
         task: &Task,
-    ) -> Result<Vec<(String, Vec<Glob>)>, CompileError> {
+    ) -> Result<Vec<(String, Vec<Grant>)>, CompileError> {
         let refs = task
             .sandbox
             .as_ref()
@@ -262,13 +263,13 @@ impl<'a> Reach<'a> {
             let stack = vec![Item::Visit(Visit {
                 name: r.task.clone(),
                 vars,
-                mode: Mode::Field,
+                mode: Mode::Run,
                 by_run: false,
                 chain,
             })];
             let mut grants = Vec::new();
             self.drain(&mut walk, stack, |item| {
-                if let Item::Emit(g, _) = item {
+                if let Item::Grant(g) = item {
                     grants.push(g);
                 }
             })
@@ -356,6 +357,10 @@ impl<'a> Reach<'a> {
         // its calls, in declaration order.
         let mut items = Vec::new();
         if v.mode == Mode::Run {
+            if walk.kind == Kind::Writes {
+                write_grants(&mut items, t, &reached.raw, &v.chain)
+                    .map_err(|e| self.reached_error(walk, &v.chain, None, e))?;
+            }
             self.run_edges(&mut items, t, &reached.raw, &v.chain)
                 .map_err(|e| self.reached_error(walk, &v.chain, None, e))?;
         }
@@ -453,7 +458,7 @@ impl<'a> Reach<'a> {
                 if root {
                     items.push(Item::Emit(g.clone(), None));
                 } else {
-                    items.push(self.literal(g, &dir, &group));
+                    items.push(self.literal(kind, g, &dir, &group, chain));
                 }
                 continue;
             }
@@ -504,8 +509,9 @@ impl<'a> Reach<'a> {
         Ok(())
     }
 
-    /// A reached state's literal entry, absolute against its directory.
-    fn literal(&self, g: &Glob, dir: &str, group: &Group) -> Item {
+    /// A reached state's literal entry, absolute against its directory: a
+    /// glob for the glob walks, a grant for the writes walk.
+    fn literal(&self, kind: Kind, g: &Glob, dir: &str, group: &Group, chain: &Chain) -> Item {
         let join = |p: &str| {
             filepathext::smart_join(dir, p)
                 .to_string_lossy()
@@ -519,7 +525,21 @@ impl<'a> Reach<'a> {
         if !g.fingerprint.is_empty() {
             abs.fingerprint = join(&g.fingerprint);
         }
-        Item::Emit(abs, Some(Rc::clone(group)))
+        if kind != Kind::Writes {
+            return Item::Emit(abs, Some(Rc::clone(group)));
+        }
+        // An exclusion, or an empty pattern, grants nothing.
+        let grants = !g.negate && !g.glob.is_empty();
+        Item::Grant(Grant {
+            what: format!(
+                "{} {}",
+                crate::variables::SANDBOX_WRITES,
+                labels(chain).join(" → ")
+            ),
+            declared: g.glob.clone(),
+            path: if grants { abs.glob } else { String::new() },
+            kind: GrantKind::Generates,
+        })
     }
 
     /// The calls running `t` makes, in declaration order: `setup`, `deps`,
@@ -602,6 +622,66 @@ impl<'a> Reach<'a> {
             )),
         }
     }
+}
+
+/// The `sandbox.writes` directories and dotenv files of a state reached in
+/// run mode by the writes walk, then its own `sandbox.writes` references, in
+/// declaration order.
+fn write_grants(
+    items: &mut Vec<Item>,
+    t: &Task,
+    raw: &Task,
+    chain: &Chain,
+) -> Result<(), CompileError> {
+    let what = format!(
+        "{} {}",
+        crate::variables::SANDBOX_WRITES,
+        labels(chain).join(" → ")
+    );
+    let dir = t.compute_dir().to_string_lossy().into_owned();
+    let join = |p: &str| {
+        filepathext::smart_join(&dir, p)
+            .to_string_lossy()
+            .into_owned()
+    };
+    if let Some(s) = &t.sandbox {
+        for w in &s.writes {
+            items.push(Item::Grant(Grant {
+                what: what.clone(),
+                declared: w.clone(),
+                path: join(w),
+                kind: GrantKind::Writes,
+            }));
+        }
+    }
+    for f in &t.dotenv {
+        items.push(Item::Grant(Grant {
+            what: what.clone(),
+            declared: f.clone(),
+            path: join(f),
+            kind: GrantKind::Dotenv,
+        }));
+    }
+    let raw_refs = raw.sandbox.as_ref().map_or(&[][..], |s| &s.write_tasks);
+    for (i, r) in t.sandbox.iter().flat_map(|s| &s.write_tasks).enumerate() {
+        if r.task.is_empty() {
+            return Err(CompileError::EmptyTaskReference {
+                task: t.name().to_string(),
+                field: crate::variables::SANDBOX_WRITES.to_string(),
+                template: raw_refs.get(i).map(|r| r.task.clone()).unwrap_or_default(),
+            });
+        }
+        let vars = r.vars.clone().unwrap_or_default();
+        let label = format!("{} {{task: {}}}", crate::variables::SANDBOX_WRITES, r.task);
+        items.push(Item::Visit(Visit {
+            chain: hop(chain, label, &r.task, &vars),
+            name: r.task.clone(),
+            vars,
+            mode: Mode::Run,
+            by_run: false,
+        }));
+    }
+    Ok(())
 }
 
 /// Whether a task has `from:` or `task:` entries in `sources` or `generates`:
