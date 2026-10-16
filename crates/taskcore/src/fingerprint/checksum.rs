@@ -9,6 +9,7 @@
 //! security digest. Changing anything that goes into it invalidates every
 //! saved fingerprint and cache key, so bump the version tag when doing so.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 
@@ -291,6 +292,52 @@ pub(crate) fn checksum_files_with(
     data: &[Datum],
     workers: Workers,
 ) -> std::io::Result<String> {
+    Ok(snapshot_files(basedir, files, data, workers)?.hash)
+}
+
+/// A checksum and the digest of each entry it covers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    /// The checksum.
+    pub hash: String,
+    /// Each entry's tag, key, kind and digest, in canonical order.
+    entries: Vec<(u8, String, Kind, u128)>,
+}
+
+impl Snapshot {
+    /// Sorted keys of entries added, removed or changed in content or link
+    /// target between `self` and `other`. Excludes files only touched or
+    /// changed and then restored to their previous content.
+    pub fn changed(&self, other: &Snapshot) -> Vec<String> {
+        let index = |s: &Snapshot| -> BTreeMap<(u8, String), (Kind, u128)> {
+            s.entries
+                .iter()
+                .map(|(tag, key, kind, d)| ((*tag, key.clone()), (*kind, *d)))
+                .collect()
+        };
+        let (a, b) = (index(self), index(other));
+        let mut out: BTreeSet<String> = BTreeSet::new();
+        for (k, v) in &a {
+            if b.get(k) != Some(v) {
+                out.insert(k.1.clone());
+            }
+        }
+        for k in b.keys() {
+            if !a.contains_key(k) {
+                out.insert(k.1.clone());
+            }
+        }
+        out.into_iter().collect()
+    }
+}
+
+/// Computes the [`Snapshot`] of `files` and `data` on the given threads.
+pub(crate) fn snapshot_files(
+    basedir: &str,
+    files: &[String],
+    data: &[Datum],
+    workers: Workers,
+) -> std::io::Result<Snapshot> {
     let entries = entries(basedir, files);
     let digests = digest_all(&entries, workers)?;
     let combined: Vec<(&Entry, Kind, u128)> = entries
@@ -298,7 +345,12 @@ pub(crate) fn checksum_files_with(
         .zip(digests)
         .map(|(e, (kind, d))| (e, kind, d))
         .collect();
-    Ok(combine(&combined, data))
+    let hash = combine(&combined, data);
+    let entries = combined
+        .into_iter()
+        .map(|(e, kind, d)| (e.tag, e.key.clone(), kind, d))
+        .collect();
+    Ok(Snapshot { hash, entries })
 }
 
 #[cfg(test)]
@@ -497,6 +549,26 @@ mod tests {
         fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(b"\xfe"), &link).unwrap();
         assert_ne!(h1, sum(&dir, &["l"], &[]));
+    }
+
+    #[test]
+    fn snapshots_name_changed_entries() {
+        let dir = tmp();
+        write_file(&dir, "a", "1");
+        write_file(&dir, "b", "2");
+        write_file(&dir, "c", "3");
+        let snap = |names: &[&str]| {
+            let files: Vec<String> = names.iter().map(|f| join(&dir, f)).collect();
+            snapshot_files(&dir, &files, &[], Workers::Auto).unwrap()
+        };
+        let before = snap(&["a", "b", "c"]);
+        // Touched with the same content: not named.
+        write_file(&dir, "a", "1");
+        write_file(&dir, "b", "changed");
+        write_file(&dir, "d", "4");
+        let after = snap(&["a", "b", "d"]);
+        assert_eq!(before.changed(&after), ["b", "c", "d"]);
+        assert!(before.changed(&before).is_empty());
     }
 
     #[test]

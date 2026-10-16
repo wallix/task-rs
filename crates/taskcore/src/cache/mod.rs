@@ -513,12 +513,12 @@ fn meta_from_annotations(ann: &std::collections::BTreeMap<String, String>) -> Ca
     }
 }
 
-/// Export a task's generated files to the cache. `temp_dir` is the fingerprint
-/// state directory; the task's up-to-date status and file list are derived from
-/// it. A no-op when the task is not up-to-date or has no generated files.
+/// Export a task's generated files to the cache, with the hashes the run just
+/// `recorded` as up to date. A no-op when the task has no generated files.
 pub async fn cache_save(
     url: &CacheUrl,
     task: &Task,
+    recorded: &crate::fingerprint::Recorded,
     dir: &Path,
     guarded: &Guarded<'_>,
     logger: &mut Logger,
@@ -530,8 +530,15 @@ pub async fn cache_save(
     // verifies against it.
     let entry_task = task.local_name();
     let mut checker = ChecksumChecker::new(temp_dir, task.clone());
-    let st = match checker.status() {
-        Ok(st) if st.up_to_date && !st.cache_files.is_empty() => st,
+    // The hashes the run just recorded, not a fresh reading.
+    let st = match checker.cache_files() {
+        Ok(cache_files) if !cache_files.is_empty() => crate::fingerprint::TaskStatus {
+            up_to_date: true,
+            sources_hash: recorded.sources.clone(),
+            generates_hash: recorded.generates.clone(),
+            cache_files,
+            ..Default::default()
+        },
         Ok(_) => return,
         Err(e) => {
             logger.errf(

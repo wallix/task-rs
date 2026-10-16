@@ -10,9 +10,9 @@ mod glob;
 mod pool;
 mod sources_checksum;
 
-pub use checksum::{Datum, checksum_files};
+pub use checksum::{Datum, Snapshot, checksum_files};
 pub use glob::{CacheMatcher, cache_globs, glob, globs};
-pub use sources_checksum::{ChecksumChecker, TaskStatus};
+pub use sources_checksum::{ChecksumChecker, PostRun, Recorded, TaskStatus};
 
 #[cfg(test)]
 mod testutil {

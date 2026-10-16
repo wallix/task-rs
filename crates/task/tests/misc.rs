@@ -608,6 +608,24 @@ login server=bar user=bar";
     );
 }
 
+/// The drift warning names the sources whose content changed, not those the
+/// run only touched.
+#[test]
+fn drift_warning_names_content_changes_only() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  build:\n    sources: ['*.txt']\n    cmds:\n      - touch input.txt\n      - printf out >> generated.txt\n",
+    );
+    write(&dir, "input.txt", "in");
+    let out = run(&dir, &["build"]);
+    assert!(out.ok(), "{}", out.combined());
+    assert!(
+        out.combined()
+            .contains("changed during execution (generated.txt);"),
+        "{}",
+        out.combined()
+    );
+}
+
 /// Appending to a matched source changes it on every run. The warning names
 /// the file, and the unpublished fingerprint keeps the task out of date.
 #[test]

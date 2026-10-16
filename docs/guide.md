@@ -818,9 +818,9 @@ tasks:
 
 If a task's own commands write files that its `sources` glob also matches, the
 sources checksum changes during the run. Task then prints a warning naming the
-offending files and skips publishing the task's fingerprint and cache entry for
-that run, so the task is not treated as up to date. Tighten the glob or add an
-`exclude:` for those generated paths.
+files whose content changed and skips publishing the task's fingerprint and
+cache entry for that run, so the task is not treated as up to date. Tighten the
+glob or add an `exclude:` for those generated paths.
 
 Each source is fingerprinted by its content, a symlink by its target (it is
 not followed). A source of any other kind, such as a named pipe or a device,

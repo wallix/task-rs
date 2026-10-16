@@ -1,6 +1,5 @@
 //! The checksum-based up-to-date checker.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::Serialize;
@@ -8,8 +7,9 @@ use serde::Serialize;
 use crate::ast::{Cmd, Glob, Task};
 use crate::filepathext;
 
-use super::checksum::{Datum, checksum_files};
+use super::checksum::{Datum, Snapshot, checksum_files, snapshot_files};
 use super::glob::{cache_globs, globs};
+use super::pool::Workers;
 
 /// Validates whether a task is up to date by comparing a checksum of its source
 /// files against a stored value. It is bound to a single task and precomputes
@@ -22,15 +22,26 @@ pub struct ChecksumChecker {
     /// From `task.source_hash` or lazily computed; empty when the task has no
     /// sources.
     source_hash: String,
-    /// A snapshot of the sources checksum taken at `is_up_to_date` time (before
-    /// execution). `sources_changed` compares it against a fresh disk
-    /// computation to detect drift.
-    pre_exec_disk_hash: String,
-    /// A per-file snapshot (relative path -> (len, mtime nanos)) taken at the
-    /// same time, so `changed_sources` can name the files that drifted. Best
-    /// effort attribution for the warning; `pre_exec_disk_hash` remains the
-    /// authoritative drift check.
-    pre_exec_files: BTreeMap<String, (u64, u128)>,
+    /// The sources as `is_up_to_date` read them, before execution: what a
+    /// [`PostRun`] is compared against to detect drift and name its files.
+    pre_exec: Option<Snapshot>,
+}
+
+/// The sources and generates as read once after a run, by
+/// [`ChecksumChecker::post_run`]: what the drift check compares and what
+/// [`ChecksumChecker::publish`] records, so neither is read again.
+#[derive(Debug)]
+pub struct PostRun {
+    sources: Option<Snapshot>,
+    /// Kept as a result: an unreadable generate fails only a publish.
+    generates: std::io::Result<String>,
+}
+
+/// The hashes a successful run recorded, for the cache entry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recorded {
+    pub sources: String,
+    pub generates: String,
 }
 
 /// The full fingerprint state for a task, including which parts are up to date.
@@ -68,8 +79,7 @@ impl ChecksumChecker {
             task,
             sources_globs: Vec::new(),
             src_data: Vec::new(),
-            pre_exec_disk_hash: String::new(),
-            pre_exec_files: BTreeMap::new(),
+            pre_exec: None,
         };
         let (globs, data) = c.build_checksum_data();
         c.sources_globs = globs;
@@ -115,12 +125,9 @@ impl ChecksumChecker {
             return Ok(false);
         }
 
-        // Share one source list between the checksum and drift snapshot.
-        let dir = self.compute_dir();
-        let source_files = globs(&dir, &self.sources_globs)?;
-        let current_sources_hash = checksum_files(&dir, &source_files, &self.src_data)?;
-        self.pre_exec_disk_hash = current_sources_hash.clone();
-        self.pre_exec_files = stat_map(&dir, &source_files);
+        let sources = self.sources_snapshot()?;
+        let current_sources_hash = sources.hash.clone();
+        self.pre_exec = Some(sources);
 
         let checksum_file = self.checksum_file_path()?;
         let stored = std::fs::read_to_string(&checksum_file).unwrap_or_default();
@@ -131,42 +138,58 @@ impl ChecksumChecker {
         Ok(old_sources_hash == current_sources_hash && old_generates_hash == new_generates_hash)
     }
 
-    /// Reports whether source files were modified during task execution by
-    /// comparing the disk snapshot taken at [`ChecksumChecker::is_up_to_date`]
-    /// time against the current state.
-    pub fn sources_changed(&self) -> std::io::Result<bool> {
-        if self.pre_exec_disk_hash.is_empty() {
-            return Ok(false);
+    /// Reads the sources and generates once after the run, for
+    /// [`ChecksumChecker::drifted`] and [`ChecksumChecker::publish`]. Without
+    /// sources there is nothing to read. A sources error is returned; a
+    /// generates one is kept for the publish.
+    pub fn post_run(&self) -> std::io::Result<PostRun> {
+        if self.task.sources.is_empty() {
+            return Ok(PostRun {
+                sources: None,
+                generates: Ok(String::new()),
+            });
         }
-        let current = self.sources_checksum()?;
-        Ok(current != self.pre_exec_disk_hash)
+        let sources = self.sources_snapshot()?;
+        Ok(PostRun {
+            sources: Some(sources),
+            generates: self.generates_checksum(),
+        })
     }
 
-    /// Names the source files that were added, removed, or modified since the
-    /// pre-execution snapshot, relative to the task directory and sorted. Used
-    /// to point the warning at the generated files a too-broad `sources:` glob
-    /// picked up. Best effort: an empty result does not disprove drift, which
-    /// [`ChecksumChecker::sources_changed`] alone decides.
-    pub fn changed_sources(&self) -> std::io::Result<Vec<String>> {
-        // Mirror `sources_changed`: with no snapshot, name nothing rather than
-        // treat every current file as newly added.
-        if self.task.sources.is_empty() || self.pre_exec_disk_hash.is_empty() {
-            return Ok(Vec::new());
+    /// Reports whether the sources changed during the run: `post` differs
+    /// from what [`ChecksumChecker::is_up_to_date`] read. Never without that
+    /// reading (`--force`).
+    pub fn drifted(&self, post: &PostRun) -> bool {
+        match (&self.pre_exec, &post.sources) {
+            (Some(pre), Some(now)) => pre.hash != now.hash,
+            _ => false,
         }
-        let dir = self.compute_dir();
-        let now = stat_map(&dir, &globs(&dir, &self.sources_globs)?);
-        let mut changed: BTreeSet<String> = BTreeSet::new();
-        for (path, meta) in &now {
-            if self.pre_exec_files.get(path) != Some(meta) {
-                changed.insert(path.clone());
-            }
+    }
+
+    /// Names the sources added, removed or whose content changed during the
+    /// run, relative to the task directory and sorted, to point the drift
+    /// warning at them. Content-based, not an atomic view of the tree: an
+    /// empty result does not disprove drift, which
+    /// [`ChecksumChecker::drifted`] alone decides.
+    pub fn changed_sources(&self, post: &PostRun) -> Vec<String> {
+        match (&self.pre_exec, &post.sources) {
+            (Some(pre), Some(now)) => pre.changed(now),
+            _ => Vec::new(),
         }
-        for path in self.pre_exec_files.keys() {
-            if !now.contains_key(path) {
-                changed.insert(path.clone());
-            }
-        }
-        Ok(changed.into_iter().collect())
+    }
+
+    /// Records `post` as up to date and returns what it recorded; `None`
+    /// without sources. Fails on a generates error `post` kept.
+    pub fn publish(&self, post: PostRun) -> std::io::Result<Option<Recorded>> {
+        let Some(sources) = post.sources else {
+            return Ok(None);
+        };
+        let recorded = Recorded {
+            sources: sources.hash,
+            generates: post.generates?,
+        };
+        self.write_state(&recorded.sources, &recorded.generates)?;
+        Ok(Some(recorded))
     }
 
     /// Returns the full fingerprint state for the task.
@@ -219,13 +242,31 @@ impl ChecksumChecker {
 
         let new_sources_hash = self.sources_checksum()?;
         let new_generates_hash = self.generates_checksum()?;
+        self.write_state(&new_sources_hash, &new_generates_hash)
+    }
 
+    /// [`ChecksumChecker::set_up_to_date`] with the generates hash just
+    /// computed by the caller: the sources are read afresh.
+    pub fn set_up_to_date_with_generates(&self, generates: &str) -> std::io::Result<()> {
+        if self.task.sources.is_empty() {
+            return Ok(());
+        }
+        let sources = self.sources_checksum()?;
+        self.write_state(&sources, generates)
+    }
+
+    fn write_state(&self, sources: &str, generates: &str) -> std::io::Result<()> {
         let checksum_dir = Path::new(&self.temp_dir).join("checksum");
         let _ = std::fs::create_dir_all(&checksum_dir);
         std::fs::write(
             self.checksum_file_path()?,
-            format!("{new_sources_hash}\n{new_generates_hash}\n"),
+            format!("{sources}\n{generates}\n"),
         )
+    }
+
+    /// The files a cache entry for the task archives.
+    pub fn cache_files(&self) -> std::io::Result<Vec<String>> {
+        cache_globs(&self.compute_dir(), &self.task.generates)
     }
 
     /// Removes the stored checksum after a failed run so the next invocation
@@ -247,7 +288,13 @@ impl ChecksumChecker {
     }
 
     fn sources_checksum(&self) -> std::io::Result<String> {
-        self.checksum(&self.sources_globs, &self.src_data)
+        Ok(self.sources_snapshot()?.hash)
+    }
+
+    fn sources_snapshot(&self) -> std::io::Result<Snapshot> {
+        let dir = self.compute_dir();
+        let files = globs(&dir, &self.sources_globs)?;
+        snapshot_files(&dir, &files, &self.src_data, Workers::Auto)
     }
 
     /// Computes the current generates hash from disk.
@@ -282,30 +329,6 @@ fn serialize_cmd(idx: usize, c: &Cmd) -> Datum {
         index: idx as u64,
         cmd: c.cmd.clone(),
     }
-}
-
-/// Snapshots each file's length and modification time, keyed by path relative
-/// to `dir`. Cheap metadata used only to attribute drift to specific files;
-/// unreadable entries are skipped. `symlink_metadata` stats the link itself
-/// rather than its target, and an mtime bump without a content change can name
-/// a file the run only touched. Both are acceptable for best-effort
-/// attribution — the content hash, not this map, decides drift.
-fn stat_map(dir: &str, files: &[String]) -> BTreeMap<String, (u64, u128)> {
-    let mut map = BTreeMap::new();
-    for f in files {
-        let Ok(meta) = std::fs::symlink_metadata(f) else {
-            continue;
-        };
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let key = filepathext::rel_str(dir, f).unwrap_or_else(|| f.clone());
-        map.insert(key, (meta.len(), mtime));
-    }
-    map
 }
 
 /// Returns `glob` relative to `dir` so checksums are stable across workspace
@@ -484,13 +507,14 @@ mod tests {
         let mut checker2 = ChecksumChecker::new(&tmp_dir, task.clone());
         assert!(checker2.is_up_to_date().unwrap());
         // No drift after the snapshot was taken.
-        assert!(!checker2.sources_changed().unwrap());
+        assert!(!checker2.drifted(&checker2.post_run().unwrap()));
 
         // Modify the source: out of date, and drift detected relative to the
         // snapshot taken above, naming the changed file.
         write_file(&dir, "src.txt", "two");
-        assert!(checker2.sources_changed().unwrap());
-        assert_eq!(checker2.changed_sources().unwrap(), vec!["src.txt"]);
+        let post = checker2.post_run().unwrap();
+        assert!(checker2.drifted(&post));
+        assert_eq!(checker2.changed_sources(&post), vec!["src.txt"]);
         let mut checker3 = ChecksumChecker::new(&tmp_dir, task.clone());
         assert!(!checker3.is_up_to_date().unwrap());
 
@@ -518,10 +542,88 @@ mod tests {
         std::fs::remove_file(join(&dir, "b.txt")).unwrap();
         write_file(&dir, "c.txt", "three");
 
-        assert!(checker.sources_changed().unwrap());
+        let post = checker.post_run().unwrap();
+        assert!(checker.drifted(&post));
         assert_eq!(
-            checker.changed_sources().unwrap(),
+            checker.changed_sources(&post),
             vec!["a.txt", "b.txt", "c.txt"]
+        );
+    }
+
+    /// What the run read after the commands is what gets recorded.
+    #[test]
+    fn publish_records_the_post_run_reading() {
+        let dir = tmp();
+        let tmp_dir = tmp();
+        write_file(&dir, "src.txt", "one");
+        write_file(&dir, "out.txt", "built");
+        let task = new_task(&dir, vec![g("src.txt")], vec![g("out.txt")]);
+        let mut checker = ChecksumChecker::new(&tmp_dir, task.clone());
+        assert!(!checker.is_up_to_date().unwrap());
+        let post = checker.post_run().unwrap();
+        assert!(!checker.drifted(&post));
+        // Changed after the reading: not what is recorded.
+        write_file(&dir, "out.txt", "later");
+        let recorded = checker.publish(post).unwrap().unwrap();
+        assert_eq!(recorded.sources, checker.sources_checksum().unwrap());
+        assert_ne!(recorded.generates, checker.generates_checksum().unwrap());
+        let stored = std::fs::read_to_string(checker.checksum_file_path().unwrap()).unwrap();
+        assert_eq!(
+            stored,
+            format!("{}\n{}\n", recorded.sources, recorded.generates)
+        );
+    }
+
+    /// Without an up-to-date check (`--force`) there is no drift to see, and
+    /// the post-run reading is recorded as a fresh one.
+    #[test]
+    fn forced_run_publishes_without_a_snapshot() {
+        let dir = tmp();
+        let tmp_dir = tmp();
+        write_file(&dir, "src.txt", "one");
+        let task = new_task(&dir, vec![g("src.txt")], vec![]);
+        let checker = ChecksumChecker::new(&tmp_dir, task.clone());
+        let post = checker.post_run().unwrap();
+        assert!(!checker.drifted(&post));
+        assert!(checker.changed_sources(&post).is_empty());
+        checker.publish(post).unwrap().unwrap();
+        assert!(
+            ChecksumChecker::new(&tmp_dir, task)
+                .is_up_to_date()
+                .unwrap()
+        );
+    }
+
+    /// An unreadable generate fails the publish, and only the publish.
+    #[cfg(unix)]
+    #[test]
+    fn generates_error_is_kept_for_the_publish() {
+        let dir = tmp();
+        let tmp_dir = tmp();
+        write_file(&dir, "src.txt", "one");
+        let fifo = std::ffi::CString::new(join(&dir, "out.p")).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let task = new_task(&dir, vec![g("src.txt")], vec![g("out.p")]);
+        let checker = ChecksumChecker::new(&tmp_dir, task);
+        let post = checker.post_run().unwrap();
+        assert!(!checker.drifted(&post));
+        let err = checker.publish(post).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn restore_records_the_generates_it_verified() {
+        let dir = tmp();
+        let tmp_dir = tmp();
+        write_file(&dir, "src.txt", "one");
+        let task = new_task(&dir, vec![g("src.txt")], vec![]);
+        let checker = ChecksumChecker::new(&tmp_dir, task);
+        checker.set_up_to_date_with_generates("gen").unwrap();
+        let stored = std::fs::read_to_string(checker.checksum_file_path().unwrap()).unwrap();
+        assert_eq!(
+            stored,
+            format!("{}\ngen\n", checker.sources_checksum().unwrap())
         );
     }
 
@@ -532,8 +634,11 @@ mod tests {
         let task = new_task(&dir, vec![], vec![]);
         let mut checker = ChecksumChecker::new(tmp_dir, task);
         assert!(!checker.is_up_to_date().unwrap());
-        // set_up_to_date and on_error are no-ops with no sources.
+        // set_up_to_date, publish and on_error are no-ops with no sources.
         assert!(checker.set_up_to_date().is_ok());
+        let post = checker.post_run().unwrap();
+        assert!(!checker.drifted(&post));
+        assert_eq!(checker.publish(post).unwrap(), None);
         assert!(checker.on_error().is_ok());
     }
 

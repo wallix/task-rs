@@ -1072,12 +1072,20 @@ impl Executor {
         }
 
         if !self.dry {
-            // Skip the fingerprint and the cache upload, exactly as for sources
-            // that changed underneath us.
+            // Sources and generates are read once: the drift check compares
+            // that reading, and the fingerprint and cache entry record it. A
+            // lost lock skips both, exactly as for sources that changed
+            // underneath us.
+            let post = if lock_lost {
+                None
+            } else {
+                Some(checker.post_run()?)
+            };
+            let drifted = post.as_ref().is_some_and(|p| checker.drifted(p));
             if lock_lost {
                 let _ = checker.on_error();
-            } else if checker.sources_changed()? {
-                let changed = checker.changed_sources().unwrap_or_default();
+            } else if let Some(post) = post.as_ref().filter(|_| drifted) {
+                let changed = checker.changed_sources(post);
                 let files = if changed.is_empty() {
                     String::new()
                 } else {
@@ -1093,16 +1101,18 @@ impl Executor {
                     ),
                 );
                 let _ = checker.on_error();
-            } else {
-                checker.set_up_to_date()?;
+            } else if let Some(post) = post {
+                let recorded = checker.publish(post)?;
                 if cache_active
                     && !source_hash.is_empty()
                     && let Some(url) = cache_url
+                    && let Some(recorded) = recorded
                 {
                     let (mut scratch, sink) = self.scratch_logger();
                     cache::cache_save(
                         url,
                         t,
+                        &recorded,
                         std::path::Path::new(&self.dir),
                         &cache::Guarded {
                             temp_dir: &self.temp_dir.fingerprint,
@@ -2068,7 +2078,9 @@ impl Executor {
                 ),
             ))));
         }
-        checker.set_up_to_date()?;
+        // The generates were just read; the sources are read again, as the
+        // restore may have written some.
+        checker.set_up_to_date_with_generates(&current)?;
         Ok(())
     }
 }

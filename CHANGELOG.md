@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **A run reads its sources and generates once after its commands.** The
+  drift check, the saved fingerprint and the cache entry all use that one
+  reading, instead of reading the files up to three more times. The drift
+  warning now names the sources whose content changed, rather than those whose
+  size or modification time did.
 - **Fingerprinting digests files in parallel,** on at most as many threads as
   there are CPUs available, shared by every task hashing at the same time. The
   checksum does not depend on the number of threads.
