@@ -409,7 +409,7 @@ tasks:
     cmds:
       - echo never
 
-  # A cycle in the referenced task's own generates.
+  # A cycle in the referenced task's own generates: no error.
   writes-cycle:
     sandbox:
       writes: [{task: writes-cycle-gen}]

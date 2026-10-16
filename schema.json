@@ -730,7 +730,7 @@
           "enum": ["deps", "cmds"]
         },
         "task": {
-          "description": "Include the same field (sources or generates) of this task, which need not be a dependency or be called. Takes no other key than 'vars'.",
+          "description": "Include this task's entries, which need not be a dependency or be called: in sources, those of the task and of every task it runs (setup, deps, task: commands); in generates, the task's own. Takes no other key than 'vars'.",
           "type": "string"
         },
         "vars": {

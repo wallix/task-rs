@@ -249,9 +249,10 @@ tasks:
 ```
 
 Use `from: cmds` instead when the related tasks are invoked through `cmds`,
-and `- task: <name>` (with optional `vars`) to copy the entries of one task
-that is neither a dependency nor called, such as a test task reusing its build
-task's sources.
+and `- task: <name>` (with optional `vars`) for a task that is neither a
+dependency nor called, such as a test task reusing its build task's sources:
+in `sources` it also covers the tasks that task runs, in `generates` it copies
+that task's products only.
 Literal globs and inherited entries can be combined, and duplicates are removed
 automatically.
 

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **A `task:` entry in `sources` now covers what the task runs.** `{task: X}`
+  also takes in the sources of the tasks X runs through `setup`, `deps` and
+  `task:` commands (including `for:` loops and deferred calls), transitively,
+  with the vars those calls pass, so a task running X no longer lists X's
+  dependencies. In `generates` it still copies X's own entries, and `from:`
+  still copies its direct targets'. Such tasks, and wrappers reaching them, get
+  new fingerprints and cache keys, and rebuild once. Calls behind an `if:`
+  count too, so a missing task there fails with exit code 200, naming the
+  calls leading to it; a deferred call depending on `EXIT_CODE`, or on
+  `{{.CHECKSUM}}` in a task with `from:` or `task:` entries of its own, must
+  be listed explicitly; a recursion whose end the references cannot see stops
+  at 256 calls of one task, or 1000 calls in all, with exit code 204. A cycle
+  between references is no longer an error.
 - **`from: cmds` now reads templated deferred calls,** as they run after a
   success, instead of looking up their unrendered name; one depending on
   `EXIT_CODE`, or on `{{.CHECKSUM}}` in a task with `from:` or `task:` entries

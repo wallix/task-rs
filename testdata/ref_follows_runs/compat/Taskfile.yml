@@ -57,3 +57,18 @@ tasks:
 
   refers-leaf:
     sources: [{task: leaf}, src/b.txt]
+
+  # Changed: the reference of a dep folded in now covers what its target
+  # runs (leaf).
+  wrap-ref:
+    sources: [from: deps]
+    deps: [ref-runner]
+    cmds:
+      - 'true'
+
+  ref-runner:
+    sources: [{task: runner}]
+
+  runner:
+    sources: [src/b.txt]
+    deps: [leaf]

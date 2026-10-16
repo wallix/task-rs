@@ -63,3 +63,12 @@ tasks:
     sandbox: true
     cmds:
       - cat b/keep.tmp
+
+  # The groups are numbered as their entries come: lib-a's, then outer's.
+  nested:
+    sources: [{task: outer}]
+    cmds:
+      - 'true'
+
+  outer:
+    sources: [{task: lib-a}, b/**]

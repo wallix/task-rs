@@ -212,14 +212,17 @@ impl ExecutorError {
             {
                 200
             }
+            // The class of the call counter: a reference reaching too many
+            // calls, as a run would make too many.
+            Self::Compile(e) if matches!(**e, CompileError::ReferenceLimit(_)) => 204,
             Self::TaskRun { .. } | Self::Exec(_) | Self::SandboxDenied { .. } => 201,
             Self::TaskInternal { .. } => 202,
             Self::TaskNameConflict { .. } => 203,
+            Self::Compile(e) if matches!(**e, CompileError::TaskNameConflict { .. }) => 203,
             // Same class as the call counter it pre-empts, so Go's code for
             // that failure is kept. In practice a cycle found while running has
             // a caller above it and reaches the process wrapped in `TaskRun`,
-            // which exits 201; 204 surfaces when the cycle is found while
-            // compiling `from:` globs, before any task is running.
+            // which exits 201.
             Self::TaskCalledTooManyTimes { .. } | Self::CyclicDependency { .. } => 204,
             Self::Cancelled => 205,
             Self::Requires(_) => 206,
@@ -278,13 +281,7 @@ impl From<CompilerError> for ExecutorError {
 }
 impl From<CompileError> for ExecutorError {
     fn from(e: CompileError) -> Self {
-        // A cycle found while compiling `from:` globs is the same failure as one
-        // found on the call path, so it surfaces as the same error rather than
-        // as a generic compile failure with Go's "unknown" exit code.
-        match e {
-            CompileError::Cycle { path } => Self::CyclicDependency { path },
-            other => Self::Compile(Box::new(other)),
-        }
+        Self::Compile(Box::new(e))
     }
 }
 impl From<RequiresError> for ExecutorError {

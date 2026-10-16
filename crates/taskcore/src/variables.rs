@@ -6,10 +6,11 @@
 //! task's dynamic env vars, reads `dotenv` files, computes the source checksum
 //! (`CHECKSUM`), and expands `for` loops over cmds and deps.
 //!
-//! Ports the templating half of Go `variables.go`. The `resolveGlobsFrom`
-//! expansion and the cached-generates-path validation depend on recursively
-//! compiling *other* tasks (Executor territory) and are wired through the
-//! optional [`TaskResolver`]; when none is provided those steps are skipped.
+//! Ports the templating half of Go `variables.go`. The `from:` and `task:`
+//! entries of `sources`, `generates` and `sandbox.writes` reach *other* tasks
+//! (Executor territory): they are resolved through the optional
+//! [`TaskResolver`] (see [`crate::reach`]); when none is provided that step is
+//! skipped.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -26,21 +27,48 @@ use crate::logger::Logger;
 use crate::templater::{Cache, TemplaterError};
 use crate::yaml::Value;
 
-/// Resolves `from:` entries in `sources`/`generates` by compiling the tasks
-/// they reference. The executor's `GlobResolver` implements this;
-/// `compiled_task` calls it to
-/// expand wrapper tasks that inherit their children's globs.
+/// Finds and compiles the tasks `from:` and `task:` entries reach. The
+/// executor's `GlobResolver` implements this; `compiled_task` calls it to
+/// resolve those entries (see [`crate::reach`]).
 pub trait TaskResolver {
-    /// Compiles the task named by a dep/cmd call, returning its fully-resolved
-    /// form so its `sources`/`generates` can be read. Async, since compilation
-    /// may evaluate dynamic (`sh:`) variables; the returned future is boxed so
-    /// the trait stays object-safe and the recursion (a wrapper task's `from:`
-    /// deps may themselves use `from:`) can be expressed.
-    fn compiled_task_for_globs<'a>(
+    /// The task a call name runs; a [`CompileError::TaskNotFound`] when there
+    /// is none.
+    fn resolve(&self, name: &str) -> Result<ResolvedCall, CompileError>;
+
+    /// Compiles a call as running it would, up to its `setup` and `deps`,
+    /// leaving its references unresolved ([`reached_task`]). Async, since
+    /// compilation may evaluate dynamic (`sh:`) variables; the returned
+    /// future is boxed so the trait stays object-safe.
+    fn compile_call<'a>(
         &'a self,
-        task: &'a str,
+        name: &'a str,
         vars: &'a Vars,
-    ) -> Pin<Box<dyn Future<Output = Result<Task, CompileError>> + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<ReachedTask, CompileError>> + 'a>>;
+
+    /// The call the task being compiled was made with, when known: a
+    /// reference reaching that call again adds only what it runs.
+    fn root(&self) -> Option<(&str, &Vars)>;
+}
+
+/// The task a call name resolves to, before it is compiled.
+#[derive(Clone, Debug)]
+pub struct ResolvedCall {
+    /// The task's key.
+    pub task: String,
+    /// The wildcard captures of the name.
+    pub captures: Vec<String>,
+    /// The task's `platforms:`, which a run checks before compiling it.
+    pub platforms: Vec<crate::ast::Platform>,
+}
+
+/// A task compiled for a reference to reach it.
+#[derive(Clone, Debug)]
+pub struct ReachedTask {
+    /// Compiled by [`reached_task`].
+    pub task: Task,
+    /// As declared, so that a `task:` entry whose name rendered empty is told
+    /// from a glob.
+    pub raw: Task,
 }
 
 /// An error raised while compiling a task.
@@ -73,26 +101,45 @@ pub enum CompileError {
     /// Compiling a task referenced by a `from:` clause failed.
     FromTask(String),
     /// The resolver found no task by the name a `from:` or `task:` entry
-    /// references. [`resolve_globs_from`] replaces it with
+    /// references. [`crate::reach`] replaces it with
     /// [`Self::ReferencedTaskNotFound`], which names the referrer.
     TaskNotFound {
         /// The referenced task name.
         name: String,
     },
-    /// A `from:` or `task:` entry in sources/generates references a task that
-    /// does not exist.
+    /// A `from:` or `task:` entry in sources/generates/sandbox.writes reaches
+    /// a task that does not exist.
     ReferencedTaskNotFound {
         /// The task whose entry it is.
         task: String,
-        /// The field (`sources` or `generates`).
+        /// The field (`sources`, `generates` or `sandbox.writes`).
         field: String,
-        /// The referenced task name.
+        /// The missing task name.
         name: String,
+        /// How the entry reached it, outermost first, the missing call last;
+        /// one step or none for the entry itself.
+        via: Vec<String>,
     },
+    /// A reference reaches more calls than [`crate::reach`] follows.
+    ReferenceLimit(Box<ReferenceLimit>),
     /// A deferred `task:` call a reference reaches depends on what only the
-    /// run knows (`EXIT_CODE`), or on a `CHECKSUM` covering the task's own
-    /// references.
+    /// run knows (`EXIT_CODE`), or on a `CHECKSUM` covering the reached
+    /// task's own references.
     DeferredCallUnsupported(Box<DeferredCall>),
+    /// A name a reference reaches matches the aliases of several tasks.
+    TaskNameConflict {
+        /// The task whose entry it is.
+        task: String,
+        /// The field.
+        field: String,
+        /// How the entry reached the name, outermost first, it last; one step
+        /// for the entry itself.
+        via: Vec<String>,
+        /// The name.
+        call: String,
+        /// The tasks whose alias it is.
+        task_names: Vec<String>,
+    },
     /// A `task:` entry in sources/generates rendered to an empty name.
     EmptyTaskReference {
         /// The task whose entry it is.
@@ -101,11 +148,6 @@ pub enum CompileError {
         field: String,
         /// The unrendered `task:` value.
         template: String,
-    },
-    /// Tasks referenced by `from:` clauses compile each other in a cycle.
-    Cycle {
-        /// The dependency path, outermost task first, ending with the repeat.
-        path: Vec<String>,
     },
     /// A cache block names a `vk` registry and also spells out `url` or `lock`.
     CacheVkWithUrl {
@@ -135,6 +177,24 @@ pub enum CompileError {
         /// The project root directory.
         root: String,
     },
+}
+
+/// The details of [`CompileError::ReferenceLimit`].
+#[derive(Debug)]
+pub struct ReferenceLimit {
+    /// The task whose entry it is.
+    pub task: String,
+    /// The field.
+    pub field: String,
+    /// The entry (`{task: x}`).
+    pub entry: String,
+    /// The task reached too many times; `None` when the walk as a whole
+    /// reached too many calls.
+    pub name: Option<String>,
+    /// The limit passed.
+    pub limit: usize,
+    /// The calls leading to the last one, innermost first.
+    pub calls: Vec<String>,
 }
 
 /// The details of [`CompileError::DeferredCallUnsupported`].
@@ -172,8 +232,51 @@ impl std::fmt::Display for CompileError {
             Self::Glob(message) => write!(f, "task: glob expansion failed: {message}"),
             Self::FromTask(message) => write!(f, "{message}"),
             Self::TaskNotFound { name } => write!(f, "task: Task {name:?} does not exist"),
-            Self::ReferencedTaskNotFound { task, field, name } => {
-                write!(f, "task: {task}: {field}: task {name:?} does not exist")
+            Self::ReferencedTaskNotFound {
+                task,
+                field,
+                name,
+                via,
+            } => {
+                if via.len() > 1 {
+                    let via = via.join(" → ");
+                    write!(
+                        f,
+                        "task: {task}: {field}: {via}: task {name:?} does not exist"
+                    )
+                } else {
+                    write!(f, "task: {task}: {field}: task {name:?} does not exist")
+                }
+            }
+            Self::ReferenceLimit(e) => {
+                let ReferenceLimit {
+                    task,
+                    field,
+                    entry,
+                    name,
+                    limit,
+                    calls,
+                } = &**e;
+                let what = match name {
+                    Some(name) => format!("more than {limit} calls of {name:?}"),
+                    None => format!("more than {limit} task calls"),
+                };
+                // The innermost few and the outermost.
+                let shown: Vec<&str> = match calls.split_last() {
+                    Some((outer, inner)) if inner.len() > 3 => inner
+                        .iter()
+                        .take(3)
+                        .map(String::as_str)
+                        .chain(["…", outer.as_str()])
+                        .collect(),
+                    _ => calls.iter().map(String::as_str).collect(),
+                };
+                write!(
+                    f,
+                    "task: {task}: {field}: {entry}: {what} reached ({}): list the targets \
+                     explicitly, or reference a task that does not recurse",
+                    shown.join(" ← ")
+                )
             }
             Self::DeferredCallUnsupported(e) => {
                 let DeferredCall {
@@ -203,6 +306,24 @@ impl std::fmt::Display for CompileError {
                      on {why}: list its targets with explicit `task:` entries"
                 )
             }
+            Self::TaskNameConflict {
+                task,
+                field,
+                via,
+                call,
+                task_names,
+            } => {
+                let via = if via.len() > 1 {
+                    format!("{}: ", via.join(" → "))
+                } else {
+                    String::new()
+                };
+                write!(
+                    f,
+                    "task: {task}: {field}: {via}multiple tasks ({}) match the alias {call:?}",
+                    task_names.join(", ")
+                )
+            }
             Self::EmptyTaskReference {
                 task,
                 field,
@@ -211,9 +332,6 @@ impl std::fmt::Display for CompileError {
                 f,
                 "task: {task}: {field}: `task: {template}` rendered to an empty task name"
             ),
-            Self::Cycle { path } => {
-                write!(f, "task: Cyclic dependency detected: {}", path.join(" -> "))
-            }
             Self::CacheVkWithUrl { task } => write!(
                 f,
                 "task: {task}: cache: `vk` derives the cache and lock URLs; drop `url` and `lock`"
@@ -260,10 +378,6 @@ pub struct CompileContext<'a> {
     pub env_precedence: bool,
     /// The taskfile-level named cache models (`caches:`), for `cache.inherit`.
     pub caches: &'a Caches,
-    /// Whether the task is compiled for a referrer to fold its globs in: the
-    /// groups of the entries it folds in itself are then kept apart (see
-    /// [`finish_groups`]).
-    pub folded: bool,
 }
 
 /// Computes the cache key, converting hash errors to compile errors.
@@ -282,13 +396,123 @@ fn cache_checksum(orig_task: &Task, source_hash: &str) -> Result<String, Compile
 /// already resolved by [`Compiler::get_variables`].
 pub async fn compiled_task(
     orig_task: &Task,
-    mut vars: Vars,
+    vars: Vars,
     evaluate_sh_vars: bool,
     ctx: &CompileContext<'_>,
     compiler: &Compiler,
     logger: &mut Logger,
     resolver: Option<&dyn TaskResolver>,
 ) -> Result<Task, CompileError> {
+    let (mut new, mut vars, mut cache) =
+        compile_run(orig_task, vars, evaluate_sh_vars, ctx, compiler, logger).await?;
+
+    // Resolve `from:` and `task:` entries in sources/generates/sandbox.writes,
+    // recomputing the checksum if sources or generates were extended. Not
+    // without `sh:` vars: a name templated from one renders empty, and no
+    // fast-compile consumer (platforms, requires, deps, prompt, summary) reads
+    // the globs.
+    if evaluate_sh_vars {
+        // A `task:` name that renders empty would otherwise read as a plain
+        // glob matching the task dir.
+        check_task_references(&new, "sources", &orig_task.sources, &new.sources)?;
+        check_task_references(&new, "generates", &orig_task.generates, &new.generates)?;
+        if let (Some(orig), Some(rendered)) = (&orig_task.sandbox, &new.sandbox) {
+            check_task_references(
+                &new,
+                SANDBOX_WRITES,
+                &orig.write_tasks,
+                &rendered.write_tasks,
+            )?;
+        }
+    }
+    let writes = new
+        .sandbox
+        .as_ref()
+        .is_some_and(|s| !s.write_tasks.is_empty());
+    let references = has_from_entries(&new.sources) || has_from_entries(&new.generates);
+    // A template error so far is reported before the templater is replaced
+    // below, which would drop it. Only then: otherwise a cache block error
+    // still comes first, as before.
+    if evaluate_sh_vars
+        && (references || writes)
+        && let Some(err) = cache.err()
+    {
+        return Err(CompileError::Template(err.clone()));
+    }
+    if let Some(resolver) = resolver.filter(|_| evaluate_sh_vars && (references || writes)) {
+        let mut reach = crate::reach::Reach::new(resolver, &new);
+        if has_from_entries(&new.sources) {
+            new.sources = reach.globs(&new, orig_task, false).await?;
+        }
+        if has_from_entries(&new.generates) {
+            new.generates = reach.globs(&new, orig_task, true).await?;
+        }
+        // Only a task about to run needs these grants, but resolved on every
+        // full compile, sandboxing on or off, so bad references fail alike.
+        if writes {
+            let generates = reach.writes(&new).await?;
+            if let Some(s) = &mut new.sandbox {
+                s.task_generates = generates;
+            }
+        }
+        // The resolved entries feed the checksum: sources as files and rules,
+        // generates as rules. Cleared first, as the checker would reuse it;
+        // empty when the references resolved to no sources. Without sources
+        // there was no eager one to replace.
+        let widened =
+            has_from_entries(&orig_task.sources) || has_from_entries(&orig_task.generates);
+        if widened && !orig_task.sources.is_empty() {
+            new.source_hash.clear();
+            let mut checker = ChecksumChecker::new(ctx.fingerprint_temp_dir, new.clone());
+            let source_hash = checker.source_value().to_string();
+            new.cache_checksum = cache_checksum(orig_task, &source_hash)?;
+            new.source_hash = source_hash.clone();
+            vars.set(
+                "CHECKSUM".to_string(),
+                Var {
+                    value: Some(Value::String(source_hash)),
+                    ..Default::default()
+                },
+            );
+            new.vars = Some(vars.clone());
+            cache = Cache::new(vars.clone());
+            cache.set_dialect(orig_task.dialect);
+        }
+    }
+
+    finish_compile(orig_task, new, evaluate_sh_vars, ctx, cache)
+}
+
+/// Compiles a task a `from:` or `task:` entry reaches, as running it would up
+/// to its `setup` and `deps`, the steps that decide what it runs: variables
+/// (`sh:` ones included), dotenv, env, the `CHECKSUM` of its own entries,
+/// commands and `for:` loops. Its references, preconditions and cache block
+/// are left alone, so only template errors there do not fail it.
+pub async fn reached_task(
+    orig_task: &Task,
+    vars: Vars,
+    ctx: &CompileContext<'_>,
+    compiler: &Compiler,
+    logger: &mut Logger,
+) -> Result<Task, CompileError> {
+    let (new, _, cache) = compile_run(orig_task, vars, true, ctx, compiler, logger).await?;
+    if let Some(err) = cache.err() {
+        return Err(CompileError::Template(err.clone()));
+    }
+    Ok(new)
+}
+
+/// The part of [`compiled_task`] a run needs to know what it runs: everything
+/// up to `setup` and `deps`. Returns the task, its vars (`CHECKSUM` included)
+/// and the templater holding them.
+async fn compile_run(
+    orig_task: &Task,
+    mut vars: Vars,
+    evaluate_sh_vars: bool,
+    ctx: &CompileContext<'_>,
+    compiler: &Compiler,
+    logger: &mut Logger,
+) -> Result<(Task, Vars, Cache), CompileError> {
     // Substitute captured wildcards from a `MATCH` var into the task name.
     let full_name = compute_full_name(orig_task, &vars);
 
@@ -508,71 +732,18 @@ pub async fn compiled_task(
         orig_task.location.as_ref(),
         &mut cache,
     )?;
+    Ok((new, vars, cache))
+}
 
-    // Expand `from:` and `task:` entries in sources/generates via the resolver,
-    // recomputing the checksum if sources were extended. Not without `sh:`
-    // vars: a name templated from one renders empty, and no fast-compile
-    // consumer (platforms, requires, deps, prompt, summary) reads the globs.
-    if evaluate_sh_vars {
-        // A `task:` name that renders empty would otherwise read as a plain
-        // glob matching the task dir.
-        check_task_references(&new, "sources", &orig_task.sources, &new.sources)?;
-        check_task_references(&new, "generates", &orig_task.generates, &new.generates)?;
-        if let (Some(orig), Some(rendered)) = (&orig_task.sandbox, &new.sandbox) {
-            check_task_references(
-                &new,
-                SANDBOX_WRITES,
-                &orig.write_tasks,
-                &rendered.write_tasks,
-            )?;
-        }
-    }
-    // A template error so far is reported before the templater is replaced
-    // below, which would drop it. Only then: otherwise a cache block error
-    // still comes first, as before.
-    let references = has_from_entries(&orig_task.sources) || has_from_entries(&orig_task.generates);
-    if evaluate_sh_vars
-        && references
-        && let Some(err) = cache.err()
-    {
-        return Err(CompileError::Template(err.clone()));
-    }
-    if let Some(resolver) = resolver.filter(|_| evaluate_sh_vars) {
-        let has_refs =
-            has_from_entries(&orig_task.sources) || has_from_entries(&orig_task.generates);
-        let how = Folding {
-            folded: ctx.folded,
-            has_refs,
-        };
-        resolve_globs_from(&mut new, GlobField::Sources, resolver, how).await?;
-        resolve_globs_from(&mut new, GlobField::Generates, resolver, how).await?;
-        // The resolved entries feed the checksum: sources as files and rules,
-        // generates as rules. Cleared first, as the checker would reuse it;
-        // empty when the references resolved to no sources. Without sources
-        // there was no eager one to replace.
-        let widened =
-            has_from_entries(&orig_task.sources) || has_from_entries(&orig_task.generates);
-        if widened && !orig_task.sources.is_empty() {
-            new.source_hash.clear();
-            let mut checker = ChecksumChecker::new(ctx.fingerprint_temp_dir, new.clone());
-            let source_hash = checker.source_value().to_string();
-            new.cache_checksum = cache_checksum(orig_task, &source_hash)?;
-            new.source_hash = source_hash.clone();
-            vars.set(
-                "CHECKSUM".to_string(),
-                Var {
-                    value: Some(Value::String(source_hash)),
-                    ..Default::default()
-                },
-            );
-            new.vars = Some(vars.clone());
-            cache = Cache::new(vars.clone());
-            cache.set_dialect(orig_task.dialect);
-        }
-    }
-    // TODO(port): executor wiring — when no resolver is supplied, `from:`
-    // entries in sources/generates are left unexpanded.
-
+/// The rest of [`compiled_task`], once references are resolved:
+/// preconditions, the cache block and the checks on it.
+fn finish_compile(
+    orig_task: &Task,
+    mut new: Task,
+    evaluate_sh_vars: bool,
+    ctx: &CompileContext<'_>,
+    mut cache: Cache,
+) -> Result<Task, CompileError> {
     // Resolve preconditions.
     if !orig_task.preconditions.is_empty() {
         let mut preconditions = Vec::with_capacity(orig_task.preconditions.len());
@@ -748,202 +919,8 @@ fn has_from_entries(globs: &[Glob]) -> bool {
     globs.iter().any(Glob::is_reference)
 }
 
-/// How [`resolve_globs_from`] folds a task's references in.
-#[derive(Clone, Copy)]
-struct Folding {
-    /// The task is folded into a referrer in turn (see [`CompileContext`]).
-    folded: bool,
-    /// The task has `from:` or `task:` entries in `sources` or `generates`.
-    has_refs: bool,
-}
-
-/// Selects which glob list of a task `resolve_globs_from` operates on.
-#[derive(Clone, Copy)]
-enum GlobField {
-    Sources,
-    Generates,
-}
-
-impl GlobField {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Sources => "sources",
-            Self::Generates => "generates",
-        }
-    }
-}
-
-/// Expands `from: deps` / `from: cmds` / `task:` entries of a task's sources or
-/// generates into the same field of the referenced tasks, made absolute against
-/// each child's directory. Ports Go `resolveGlobsFrom`, plus `task:`.
-///
-/// Each folded task's entries get a group of their own (see [`Glob::group`]).
-/// Unless `folded`, the list is then finished by [`finish_groups`].
-async fn resolve_globs_from(
-    task: &mut Task,
-    field: GlobField,
-    resolver: &dyn TaskResolver,
-    how: Folding,
-) -> Result<(), CompileError> {
-    let globs = match field {
-        GlobField::Sources => task.sources.clone(),
-        GlobField::Generates => task.generates.clone(),
-    };
-    if !has_from_entries(&globs) {
-        return Ok(());
-    }
-
-    let mut resolved: Vec<Glob> = Vec::with_capacity(globs.len());
-    let mut next_group: u32 = 1;
-
-    for g in &globs {
-        if !g.is_reference() {
-            resolved.push(g.clone());
-            continue;
-        }
-        // The tasks whose same field is folded in, as (name, vars) pairs.
-        let calls: Vec<(String, Vars)> = match g.from.as_str() {
-            _ if !g.task.is_empty() => {
-                vec![(g.task.clone(), g.vars.clone().unwrap_or_default())]
-            }
-            "deps" => task
-                .deps
-                .iter()
-                .map(|d| (d.task.clone(), d.vars.clone().unwrap_or_default()))
-                .collect(),
-            "cmds" => crate::reach::cmd_calls(task, how.has_refs).map_err(|e| match e {
-                CompileError::DeferredCallUnsupported(mut e) => {
-                    e.task = task.name().to_string();
-                    e.field = field.name().to_string();
-                    CompileError::DeferredCallUnsupported(e)
-                }
-                other => other,
-            })?,
-            other => {
-                return Err(CompileError::UnsupportedFrom {
-                    task: task.task.clone(),
-                    field: field.name().to_string(),
-                    from: other.to_string(),
-                });
-            }
-        };
-        for (name, vars) in calls {
-            let globs =
-                referenced_globs(task.name(), field.name(), field, &name, &vars, resolver).await?;
-            // The child's own entries and those it folded in, numbered here.
-            let mut groups = std::collections::HashMap::new();
-            for mut abs in globs {
-                abs.group = *groups.entry(abs.group).or_insert_with(|| {
-                    let group = next_group;
-                    next_group = next_group.saturating_add(1);
-                    group
-                });
-                resolved.push(abs);
-            }
-        }
-    }
-    let resolved = if how.folded {
-        dedup(resolved, true)
-    } else {
-        finish_groups(resolved)
-    };
-
-    match field {
-        GlobField::Sources => task.sources = resolved,
-        GlobField::Generates => task.generates = resolved,
-    }
-    Ok(())
-}
-
-/// Resolves `field` of task `name` with `vars`, including its references.
-/// Globs are absolute against that task's directory so referrers in other
-/// directories resolve them correctly. Errors identify the referring task
-/// and field through `referrer` and `label`.
-async fn referenced_globs(
-    referrer: &str,
-    label: &str,
-    field: GlobField,
-    name: &str,
-    vars: &Vars,
-    resolver: &dyn TaskResolver,
-) -> Result<Vec<Glob>, CompileError> {
-    let ct = resolver
-        .compiled_task_for_globs(name, vars)
-        .await
-        .map_err(|e| match e {
-            CompileError::TaskNotFound { name } => CompileError::ReferencedTaskNotFound {
-                task: referrer.to_string(),
-                field: label.to_string(),
-                name,
-            },
-            other => other,
-        })?;
-    let child_dir = ct.compute_dir().to_string_lossy().into_owned();
-    let child_globs = match field {
-        GlobField::Sources => &ct.sources,
-        GlobField::Generates => &ct.generates,
-    };
-    Ok(child_globs
-        .iter()
-        .filter(|cg| !cg.is_reference())
-        .map(|cg| {
-            let mut abs = Glob {
-                glob: filepathext::smart_join(&child_dir, &cg.glob)
-                    .to_string_lossy()
-                    .into_owned(),
-                negate: cg.negate,
-                group: cg.group,
-                ..Default::default()
-            };
-            if !cg.fingerprint.is_empty() {
-                abs.fingerprint = filepathext::smart_join(&child_dir, &cg.fingerprint)
-                    .to_string_lossy()
-                    .into_owned();
-            }
-            abs
-        })
-        .collect())
-}
-
 /// The field name `sandbox.writes` errors carry.
-const SANDBOX_WRITES: &str = "sandbox.writes";
-
-/// Resolves `sandbox.writes` task references into their generates, stored in
-/// [`crate::ast::Sandbox::task_generates`], outside fingerprints and cache keys.
-///
-/// Separate from [`compiled_task`]: only a task about to run needs these
-/// grants. Resolving them for tasks compiled for their globs would add
-/// compiles and could report false cycles.
-///
-/// Runs on every full compile, even with sandboxing off. Like task references
-/// in sources, it compiles referenced tasks and evaluates their `sh:` vars,
-/// so bad references fail consistently.
-pub async fn resolve_sandbox_writes(
-    task: &mut Task,
-    resolver: &dyn TaskResolver,
-) -> Result<(), CompileError> {
-    let Some(refs) = task.sandbox.as_ref().map(|s| s.write_tasks.clone()) else {
-        return Ok(());
-    };
-    let mut resolved = Vec::new();
-    for r in &refs {
-        let vars = r.vars.clone().unwrap_or_default();
-        let globs = referenced_globs(
-            task.name(),
-            SANDBOX_WRITES,
-            GlobField::Generates,
-            &r.task,
-            &vars,
-            resolver,
-        )
-        .await?;
-        resolved.push((r.task.clone(), globs));
-    }
-    if let Some(s) = &mut task.sandbox {
-        s.task_generates = resolved;
-    }
-    Ok(())
-}
+pub(crate) const SANDBOX_WRITES: &str = "sandbox.writes";
 
 /// Rejects task names that render empty. `replace_globs` preserves entry
 /// order, so `orig` and `rendered` correspond entry for entry.
@@ -1322,7 +1299,6 @@ mod tests {
             fingerprint_temp_dir: tmp,
             env_precedence: false,
             caches,
-            folded: false,
         }
     }
 
@@ -1855,6 +1831,77 @@ mod tests {
                 glob("/r/a", false, 2)
             ]
         );
+    }
+
+    /// Counts the compiles a full compile asks for.
+    struct Counting(std::cell::Cell<usize>);
+
+    impl TaskResolver for Counting {
+        fn resolve(&self, name: &str) -> Result<ResolvedCall, CompileError> {
+            Ok(ResolvedCall {
+                task: name.to_string(),
+                captures: Vec::new(),
+                platforms: Vec::new(),
+            })
+        }
+
+        fn compile_call<'a>(
+            &'a self,
+            name: &'a str,
+            _vars: &'a Vars,
+        ) -> Pin<Box<dyn Future<Output = Result<ReachedTask, CompileError>> + 'a>> {
+            self.0.set(self.0.get() + 1);
+            let task = Task {
+                task: name.to_string(),
+                ..Default::default()
+            };
+            Box::pin(async move {
+                Ok(ReachedTask {
+                    raw: task.clone(),
+                    task,
+                })
+            })
+        }
+
+        fn root(&self) -> Option<(&str, &Vars)> {
+            None
+        }
+    }
+
+    /// A task without references compiles no other task, sandboxed or not.
+    #[tokio::test]
+    async fn no_reference_no_compile() {
+        let orig = Task {
+            task: "build".to_string(),
+            sources: vec![glob("src/**", false, 0)],
+            generates: vec![glob("out/*", false, 0)],
+            deps: vec![Dep {
+                task: "dep".to_string(),
+                ..Default::default()
+            }],
+            sandbox: Some(crate::ast::Sandbox {
+                writes: vec!["cache".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let env = Vars::new();
+        let c = compiler();
+        let mut logger = silent_logger();
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let counting = Counting(std::cell::Cell::new(0));
+        compiled_task(
+            &orig,
+            Vars::new(),
+            true,
+            &ctx(&env, &tmp),
+            &c,
+            &mut logger,
+            Some(&counting),
+        )
+        .await
+        .unwrap();
+        assert_eq!(counting.0.get(), 0);
     }
 
     #[test]

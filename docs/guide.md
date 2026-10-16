@@ -897,7 +897,8 @@ task's own `deps`. Linux only. See [`sandbox`](reference/schema.md#sandbox)
 for `reads` and `writes`.
 
 A task that reads another task's inputs can list `- task: <name>` in its
-`sources` to copy that task's sources instead of repeating them; see
+`sources` instead of repeating them: it covers that task's sources and those
+of every task it runs (`setup`, `deps`, `task:` commands); see
 [`cache`](reference/schema.md#cache).
 
 A task called from a sandboxed one, with `task:` or as a nested `task` process

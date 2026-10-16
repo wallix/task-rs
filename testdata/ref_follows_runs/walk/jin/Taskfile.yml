@@ -1,0 +1,50 @@
+version: '3'
+templater: jinja
+
+tasks:
+  side:
+    deps:
+      - task: ':show'
+        vars: {V: '{% raw %}{{ "a" }}{#b#}{% endraw %}'}
+
+  # CHECKSUM, as a run renders it, in this dialect.
+  checksums:
+    sources: [{task: ck}]
+    cmds:
+      - 'true'
+
+  ck:
+    sources: [src/ck.txt]
+    deps:
+      - task: ck-var
+        vars: {C: '{{ CHECKSUM }}'}
+      - 'ck-name-{{ CHECKSUM }}'
+    cmds:
+      - defer: {task: ck-defer, vars: {C: '{{ CHECKSUM }}'}}
+
+  ck-var:
+    sources: ['out/jin-ck-var-{{ C }}.txt']
+    cmds:
+      - mkdir -p out && echo x > 'out/jin-ck-var-{{ C }}.txt'
+
+  'ck-name-*':
+    sources: ['out/jin-ck-name-{{ MATCH[0] }}.txt']
+    cmds:
+      - mkdir -p out && echo x > 'out/jin-ck-name-{{ MATCH[0] }}.txt'
+
+  ck-defer:
+    sources: ['out/jin-ck-defer-{{ C }}.txt']
+    cmds:
+      - mkdir -p out && echo x > 'out/jin-ck-defer-{{ C }}.txt'
+
+  gen-checksum:
+    sources: [{task: on-gen-checksum}]
+    cmds:
+      - 'true'
+
+  on-gen-checksum:
+    sources: [src/x.txt]
+    generates: [{task: ':z'}]
+    cmds:
+      - defer: {task: 'ck-name-{{ CHECKSUM }}'}
+      - 'true'

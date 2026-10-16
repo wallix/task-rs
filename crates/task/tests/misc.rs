@@ -288,10 +288,11 @@ fn task_reference_to_unknown_task() {
             "task: wrapper: generates: task \"missing\" does not exist\n",
             200,
         ),
-        // The innermost referrer is named.
+        // The referrer is named, with the way to the missing task.
         (
             "outer",
-            "task: test: sources: task \"missing\" does not exist\n",
+            "task: outer: sources: {task: test} → sources {task: missing}: task \"missing\" \
+             does not exist\n",
             200,
         ),
         // Under a running task, wrapped like a missing dep.
@@ -321,19 +322,24 @@ fn task_reference_empty_name() {
     assert_eq!(out.code, 1);
 }
 
-/// References that reach their own task fail as a cyclic dependency.
+/// References that reach their own task are no error: each task's entries
+/// count once.
 #[test]
 fn task_reference_cycle() {
     let dir = scratch(
-        "version: '3'\ntasks:\n  self:\n    sources:\n      - task: self\n    cmds:\n      - 'true'\n\n  a:\n    sources:\n      - task: b\n    cmds:\n      - 'true'\n\n  b:\n    sources:\n      - task: a\n    cmds:\n      - 'true'\n",
+        "version: '3'\ntasks:\n  self:\n    sources:\n      - task: self\n      - s.txt\n    cmds:\n      - 'true'\n\n  a:\n    sources:\n      - task: b\n      - a.txt\n    cmds:\n      - 'true'\n\n  b:\n    sources:\n      - task: a\n      - b.txt\n    cmds:\n      - 'true'\n",
     );
-    for (task, want) in [
-        ("self", "task: Cyclic dependency detected: self -> self\n"),
-        ("a", "task: Cyclic dependency detected: a -> b -> a\n"),
-    ] {
+    for f in ["s.txt", "a.txt", "b.txt"] {
+        write(&dir, f, "x\n");
+    }
+    for (task, files) in [("self", &["s.txt"][..]), ("a", &["a.txt", "b.txt"][..])] {
         let out = run(&dir, &[task]);
-        assert_eq!(out.stderr, want, "{task}");
-        assert_eq!(out.code, 204, "{task}");
+        assert!(out.ok(), "{task}: {}", out.combined());
+        let status = run(&dir, &["--status", task]).stdout;
+        for f in files {
+            let line = status_file(&dir.join(f));
+            assert_eq!(status.matches(&line).count(), 1, "{task}:\n{status}");
+        }
     }
 }
 
@@ -1009,6 +1015,15 @@ fn reference_fingerprints_match_4_8_0() {
             assert_eq!(name, format!("{task}-{identity}"));
             assert_eq!(std::fs::read_to_string(&file).unwrap(), content, "{task}");
         }
+        // A wrapper folding a dep whose reference now reaches more: changed.
+        assert!(run(&dir, &["wrap-ref"]).ok());
+        let file = checksum_file(&dir, "wrap-ref").unwrap();
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        assert_ne!(name, "wrap-ref-64dd264baacd1ec0");
+        assert_ne!(
+            std::fs::read_to_string(&file).unwrap(),
+            "ad99388354055c89a01fcfaa38f35131\n99aa06d3014798d86001c324468d497f\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -1183,4 +1198,408 @@ fn from_cmds_renders_deferred_calls() {
          list its targets with explicit `task:` entries\n"
     );
     assert_eq!(out.code, 1);
+}
+
+// ---------------------------------------------------------------------------
+// A `task:` reference covers what the task runs
+// ---------------------------------------------------------------------------
+
+/// The sources `--status` lists for `task`, relative to `dir`.
+fn sources_of(dir: &Path, task: &str) -> Vec<String> {
+    status_files(dir, task).0
+}
+
+/// The `srcrule:` entries of `task`, files that may not exist included.
+fn rules_of(dir: &Path, args: &[&str]) -> Vec<String> {
+    let out = run(dir, args);
+    assert!(out.ok(), "{args:?}: {}", out.combined());
+    let root = format!("{}/", dir.display());
+    // `srcrule:<glob>`, or `srcrule@<group>:<glob>` kept as `@<group>:<glob>`.
+    out.stdout
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("srcrule"))
+        .map(|r| {
+            let (group, glob) = r.split_once(':').unwrap();
+            let glob = glob.strip_prefix(&root).unwrap_or(glob);
+            if group.is_empty() {
+                glob.to_string()
+            } else {
+                format!("{group}:{glob}")
+            }
+        })
+        .collect()
+}
+
+/// `setup`, `deps`, `task:` commands (`for:` over a list and over an `sh:`
+/// var, deferred ones too): all their sources count, and only theirs.
+#[test]
+fn a_task_reference_covers_what_the_task_runs() {
+    let dir = stage("ref_follows_runs/walk");
+    let want = [
+        "own.txt",
+        "src/c.txt",
+        "src/d.txt",
+        "src/f-a.txt",
+        "src/f-b.txt",
+        "src/g-p.txt",
+        "src/g-q.txt",
+        "src/s.txt",
+        "src/x.txt",
+        "src/z.txt",
+    ];
+    assert_eq!(sources_of(&dir, "edges"), want);
+    assert!(run(&dir, &["edges"]).ok());
+    write(&dir, "unrelated.txt", "changed\n");
+    let second = run(&dir, &["edges"]);
+    assert!(
+        second.combined().contains("up to date"),
+        "{}",
+        second.combined()
+    );
+    // A dep of the referenced task: stale.
+    write(&dir.join("src"), "d.txt", "changed\n");
+    let third = run(&dir, &["edges"]);
+    assert!(
+        !third.combined().contains("up to date"),
+        "{}",
+        third.combined()
+    );
+}
+
+/// The value each `lang` task prints when the wrapper runs.
+fn printed(out: &str, key: &str) -> String {
+    out.lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}=")))
+        .unwrap_or_else(|| panic!("no {key} in: {out}"))
+        .to_string()
+}
+
+/// Vars reach each call as a run passes them: the reference's, a dep's own
+/// overriding them, the command line's; names from `sh:` vars, aliases,
+/// wildcards and included tasks resolve as a run resolves them.
+#[test]
+fn a_task_reference_passes_vars_as_a_run_does() {
+    let dir = stage("ref_follows_runs/walk");
+    for extra in [&[][..], &["L=de"][..]] {
+        let _ = std::fs::remove_dir_all(dir.join(".task"));
+        let ran = run(&dir, &[&["run-langs"][..], extra].concat());
+        assert!(ran.ok(), "{}", ran.combined());
+        let mut want: Vec<String> = ["lang", "lang-own"]
+            .iter()
+            .map(|k| format!("src/lang/{}/m.txt", printed(&ran.stdout, k)))
+            .collect();
+        want.sort();
+        let status = status_files_with(&dir, &[&["langs"][..], extra].concat());
+        assert_eq!(status, want, "{extra:?}");
+    }
+    assert_eq!(
+        sources_of(&dir, "named"),
+        [
+            "inc/inc.txt",
+            "src/aliased.txt",
+            "src/by-sh.txt",
+            "src/w-foo.txt"
+        ]
+    );
+}
+
+/// [`sources_of`] with more arguments.
+fn status_files_with(dir: &Path, args: &[&str]) -> Vec<String> {
+    let args = [&["--status"][..], args].concat();
+    let out = run(dir, &args);
+    assert!(out.ok(), "{args:?}: {}", out.combined());
+    let root = format!("file: {}/", dir.display());
+    let (sources, _) = out.stdout.split_once("  generates:").unwrap();
+    sources
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix(&root).map(str::to_string))
+        .collect()
+}
+
+/// `CHECKSUM` in a dep's vars, in a dep's name and in a deferred call's vars
+/// renders as the run renders it, in both dialects: the files the run
+/// creates under those names are the reached sources.
+#[test]
+fn checksum_in_reached_calls_renders_as_a_run_does() {
+    let dir = stage("ref_follows_runs/walk");
+    for (prefix, file) in [("", ""), ("jin:", "jin-")] {
+        let ran = run(&dir, &[&format!("{prefix}ck")]);
+        assert!(ran.ok(), "{}", ran.combined());
+        let sources = sources_of(&dir, &format!("{prefix}checksums"));
+        for kind in ["ck-defer", "ck-name", "ck-var"] {
+            let want = format!("out/{file}{kind}-");
+            assert!(
+                sources.iter().any(|s| s.starts_with(&want)),
+                "{prefix}{kind}: {sources:?}"
+            );
+        }
+        assert_eq!(sources.len(), 4, "{sources:?}");
+    }
+}
+
+/// Identical var text from a Go and from a Jinja caller is rendered again
+/// in each caller's dialect: two calls.
+#[test]
+fn a_reached_call_is_keyed_by_the_dialect_of_its_vars() {
+    let dir = stage("ref_follows_runs/walk");
+    assert_eq!(
+        rules_of(&dir, &["--status", "dialects"]),
+        ["src/v-a.txt", "src/v-a{#b#}.txt"]
+    );
+}
+
+/// A deferred call is followed as it runs on success; one depending on the
+/// exit code, or on a `CHECKSUM` its task's references change, is refused.
+#[test]
+fn deferred_calls_are_followed() {
+    let dir = stage("ref_follows_runs/walk");
+    // `from: cmds` renders it too.
+    assert_eq!(sources_of(&dir, "deferred"), ["src/z.txt"]);
+    for (task, want) in [
+        (
+            "deferred-exit-code",
+            "task: deferred-exit-code: sources: {task: on-exit}: \"on-exit\"'s deferred call \
+             \"z\" depends on EXIT_CODE: list its targets with explicit `task:` entries\n",
+        ),
+        (
+            "deferred-checksum",
+            "task: deferred-checksum: sources: {task: on-checksum}: \"on-checksum\"'s deferred \
+             call \"z\" depends on CHECKSUM, which covers \"on-checksum\"'s own references only \
+             once they are resolved: list its targets with explicit `task:` entries\n",
+        ),
+    ] {
+        let out = run(&dir, &[task]);
+        assert_eq!(out.stderr, want, "{task}");
+        assert_eq!(out.code, 1, "{task}");
+    }
+}
+
+/// A command call whose name renders empty runs nothing, as in a run; a dep
+/// whose name does is a missing task, as in a run.
+#[test]
+fn empty_names_in_reached_calls() {
+    let dir = stage("ref_follows_runs/walk");
+    assert_eq!(sources_of(&dir, "empty-cmd"), ["src/z.txt"]);
+    let out = run(&dir, &["empty-dep"]);
+    assert_eq!(
+        out.stderr,
+        "task: empty-dep: sources: {task: deps-empty} → deps \"\": task \"\" does not exist\n"
+    );
+    assert_eq!(out.code, 200);
+}
+
+/// A missing task reached at any depth, even behind an `if:`, fails alike
+/// when run, under `--status` and `--dry`, naming the way to it; under a
+/// caller, wrapped as a failed run unless `--exit-code`.
+#[test]
+fn a_missing_task_reached_fails_with_the_chain() {
+    let dir = stage("ref_follows_runs/walk");
+    let chain = "{task: u1} → deps \"u0\" → cmds \"missing\": task \"missing\" does not exist";
+    let sources = format!("task: unknown: sources: {chain}\n");
+    for args in [
+        &["unknown"][..],
+        &["--status", "unknown"],
+        &["--dry", "unknown"],
+    ] {
+        let out = run(&dir, args);
+        assert_eq!(out.stderr, sources, "{args:?}");
+        assert_eq!(out.code, 200, "{args:?}");
+    }
+    let wrapped = format!("task: Failed to run task \"calls-unknown\": {sources}");
+    for (args, code) in [
+        (&["calls-unknown"][..], 201),
+        (&["-x", "calls-unknown"], 200),
+    ] {
+        let out = run(&dir, args);
+        assert_eq!(out.stderr, wrapped, "{args:?}");
+        assert_eq!(out.code, code, "{args:?}");
+    }
+}
+
+/// A task-level `platforms:` excluding the host prunes a task the reached
+/// one runs, with what it runs; a command's `platforms:` does not stop a
+/// `task:` call, as in a run.
+#[cfg(not(windows))]
+#[test]
+fn platforms_prune_reached_calls_as_a_run_does() {
+    let dir = stage("ref_follows_runs/walk");
+    assert_eq!(sources_of(&dir, "platforms"), ["src/here.txt"]);
+}
+
+/// A task reached along two paths counts once, in a stable order.
+#[test]
+fn a_diamond_counts_once() {
+    let dir = stage("ref_follows_runs/walk");
+    assert_eq!(
+        sources_of(&dir, "diamond"),
+        ["src/d.txt", "src/left.txt", "src/right.txt"]
+    );
+    let first = run(&dir, &["--status", "diamond"]).stdout;
+    assert_eq!(run(&dir, &["--status", "diamond"]).stdout, first);
+}
+
+/// A task calling itself with other vars covers each; a deps cycle under a
+/// reference fails only when run; a recursion the walk cannot see the end
+/// of hits the cap, at exactly 256 calls of one task.
+#[test]
+fn recursion_under_a_reference() {
+    let dir = stage("ref_follows_runs/walk");
+    assert_eq!(
+        sources_of(&dir, "both-langs"),
+        ["src/lang/en/m.txt", "src/lang/fr/m.txt"]
+    );
+    assert_eq!(sources_of(&dir, "refs-a-cycle"), ["src/c.txt"]);
+    let cycle = run(&dir, &["cyc-a"]);
+    assert!(
+        cycle.stderr.contains("Cyclic dependency detected"),
+        "{}",
+        cycle.combined()
+    );
+    assert_eq!(cycle.code, 201);
+
+    let x255 = format!("FROM={}", "x".repeat(255));
+    assert!(run(&dir, &["countdown", &x255]).ok());
+    let x256 = format!("{x255}x");
+    let out = run(&dir, &["countdown", &x256]);
+    assert_eq!(out.code, 204, "{}", out.combined());
+    assert!(
+        out.stderr.starts_with(
+            "task: countdown: sources: {task: count}: more than 256 calls of \"count\" reached \
+             (count N= ← count N=x ← count N=xx ← … ← count N=xxxxx"
+        ),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.ends_with(
+            "): list the targets explicitly, or reference a task that does not recurse\n"
+        ),
+        "{}",
+        out.stderr
+    );
+    let out = run(&dir, &["forever"]);
+    assert_eq!(out.code, 204, "{}", out.combined());
+    assert!(!out.stdout.contains("never"), "{}", out.combined());
+    // Under a caller, wrapped as a failed run unless `--exit-code`.
+    for (args, code) in [
+        (&["calls-forever"][..], 201),
+        (&["-x", "calls-forever"], 204),
+    ] {
+        let out = run(&dir, args);
+        assert_eq!(out.code, code, "{args:?}: {}", out.combined());
+        assert!(
+            out.stderr.starts_with(
+                "task: Failed to run task \"calls-forever\": task: forever: sources: {task: \
+                 count-up}: more than 256 calls"
+            ),
+            "{}",
+            out.stderr
+        );
+    }
+}
+
+/// A reached task's `exclude:` removes neither its deps' files nor the
+/// referrer's.
+#[test]
+fn a_reached_tasks_exclusions_stay_its_own() {
+    let dir = stage("ref_follows_runs/walk");
+    assert_eq!(
+        sources_of(&dir, "run-excludes"),
+        ["own.txt", "src/d.txt", "src/x.txt"]
+    );
+}
+
+/// A task excluded on this platform that a reached task runs is left out,
+/// uncompiled, whichever reference comes first; one a reference names is in.
+#[cfg(not(windows))]
+#[test]
+fn platform_pruning_does_not_depend_on_order() {
+    let dir = stage("ref_follows_runs/walk");
+    for task in ["pruned-first", "pruned-last"] {
+        assert_eq!(
+            sources_of(&dir, task),
+            ["src/elsewhere.txt", "src/here.txt"],
+            "{task}"
+        );
+    }
+    assert_eq!(sources_of(&dir, "pruned-sh"), ["src/here.txt"]);
+}
+
+/// A deferred call using CHECKSUM in a task with references in `generates`
+/// is refused too, in both dialects: its final CHECKSUM covers them.
+#[test]
+fn deferred_checksum_with_generates_references_is_refused() {
+    let dir = stage("ref_follows_runs/walk");
+    for prefix in ["", "jin:"] {
+        let out = run(&dir, &[&format!("{prefix}gen-checksum")]);
+        assert_eq!(out.code, 1, "{prefix}: {}", out.combined());
+        assert!(
+            out.stderr.contains(&format!(
+                "\"{prefix}on-gen-checksum\"'s deferred call \"{prefix}ck-name-"
+            )),
+            "{prefix}: {}",
+            out.stderr
+        );
+    }
+}
+
+/// A reference cycle with no files leaves no checksum, and no error.
+#[test]
+fn a_reference_cycle_without_files_has_no_checksum() {
+    let dir = stage("ref_follows_runs/walk");
+    let out = run(&dir, &["self-only"]);
+    assert!(out.ok(), "{}", out.combined());
+    assert!(out.stdout.contains("CHECKSUM=[]\n"), "{}", out.combined());
+}
+
+/// An alias two tasks share, reached by a reference, is as ambiguous as when
+/// run: exit code 203, wrapped under a caller unless `--exit-code`.
+#[test]
+fn an_ambiguous_alias_reached_keeps_its_exit_code() {
+    let dir = stage("ref_follows_runs/walk");
+    // Run directly: as ever.
+    let out = run(&dir, &["dup"]);
+    assert_eq!(
+        out.stderr,
+        "task: Multiple tasks (dup-a, dup-b) match the alias \"dup\"\n"
+    );
+    assert_eq!(out.code, 203);
+    let conflict = "task: conflict: sources: {task: calls-dup} → deps \"dup\": multiple tasks \
+                    (dup-a, dup-b) match the alias \"dup\"\n";
+    for (args, code, wrapped) in [
+        (&["conflict"][..], 203, false),
+        (&["calls-conflict"], 201, true),
+        (&["-x", "calls-conflict"], 203, true),
+    ] {
+        let out = run(&dir, args);
+        let want = if wrapped {
+            format!("task: Failed to run task \"calls-conflict\": {conflict}")
+        } else {
+            conflict.to_string()
+        };
+        assert_eq!(out.stderr, want, "{args:?}");
+        assert_eq!(out.code, code, "{args:?}");
+    }
+}
+
+/// Groups are numbered in the order their entries come, here the reached
+/// task's before the one reaching it, and the identity follows.
+#[test]
+fn groups_are_numbered_as_entries_come() {
+    for _ in 0..2 {
+        let dir = stage("ref_follows_runs/exclusions");
+        assert_eq!(
+            rules_of(&dir, &["--status", "nested"]),
+            ["@1:!**/*.tmp", "@1:a/**", "@1:shared/**", "@2:b/**"]
+        );
+        assert!(run(&dir, &["nested"]).ok());
+        let file = checksum_file(&dir, "nested").unwrap();
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, "nested-21ae427803177def");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "7b8a670fee96e7a7c1a26c870378c22a\n99aa06d3014798d86001c324468d497f\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

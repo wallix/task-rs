@@ -23,7 +23,7 @@ use crate::sandbox::{
 };
 use crate::slicesext;
 use crate::templater::Cache as TemplaterCache;
-use crate::variables::{self, CompileContext};
+use crate::variables::{self, CompileContext, CompileError};
 use crate::yaml::Value;
 
 use super::{
@@ -447,40 +447,19 @@ impl Executor {
         call: &Call,
         evaluate_sh_vars: bool,
     ) -> Result<Task, ExecutorError> {
-        let resolver = GlobResolver {
-            exec: self,
-            // Seeded with this task, so a cycle reads from the task whose globs
-            // started the expansion and a task whose `from:` reaches itself is
-            // caught on the first hop.
-            above: Some(CallPath::extend(&None, &call.task, &call.task)),
-        };
-        let mut t = self
-            .compiled_task_with(call, evaluate_sh_vars, &resolver, false)
-            .await?;
-        // Like `task:` in sources, only on the full compile, which is what the
-        // sandbox policy is built from. Not seeded with this task: a task
-        // compiled for its globs never resolves its `sandbox.writes`, so a
-        // reference back to this one closes no loop (and a cycle in the
-        // referenced tasks' own generates is still caught).
-        if evaluate_sh_vars {
-            let writes = GlobResolver {
-                exec: self,
-                above: None,
-            };
-            crate::variables::resolve_sandbox_writes(&mut t, &writes).await?;
-        }
-        Ok(t)
+        let resolver = GlobResolver { exec: self, call };
+        self.compiled_task_with(call, evaluate_sh_vars, Some(&resolver))
+            .await
     }
 
-    /// The body of [`Self::compiled_task_inner`], taking the resolver that
-    /// expands `from:` globs so a nested expansion can hand down its own path.
-    /// `folded` when compiled for a referrer to fold its globs in.
+    /// The body of [`Self::compiled_task_inner`]: the full compile, resolving
+    /// references through `resolver`, or without one the compile of a task a
+    /// reference reaches ([`variables::reached_task`]).
     async fn compiled_task_with(
         &self,
         call: &Call,
         evaluate_sh_vars: bool,
-        resolver: &dyn crate::variables::TaskResolver,
-        folded: bool,
+        resolver: Option<&dyn crate::variables::TaskResolver>,
     ) -> Result<Task, ExecutorError> {
         let (orig, wildcards) = self.get_task_with_match(call)?;
 
@@ -520,18 +499,22 @@ impl Executor {
             fingerprint_temp_dir: &self.temp_dir.fingerprint,
             env_precedence: self.env_precedence,
             caches,
-            folded,
         };
-        let result = variables::compiled_task(
-            &orig,
-            vars,
-            evaluate_sh_vars,
-            &ctx,
-            &compiler,
-            &mut scratch,
-            Some(resolver),
-        )
-        .await;
+        let result = match resolver {
+            Some(resolver) => {
+                variables::compiled_task(
+                    &orig,
+                    vars,
+                    evaluate_sh_vars,
+                    &ctx,
+                    &compiler,
+                    &mut scratch,
+                    Some(resolver),
+                )
+                .await
+            }
+            None => variables::reached_task(&orig, vars, &ctx, &compiler, &mut scratch).await,
+        };
         self.flush_scratch(&sink);
         Ok(result?)
     }
@@ -1995,83 +1978,87 @@ impl Executor {
     }
 }
 
-/// Lets `variables::compiled_task` expand `from: deps`/`from: cmds` globs by
-/// recursively compiling the referenced tasks. Async because compilation may
-/// evaluate dynamic variables.
-///
-/// This recursion runs *during* compilation, before `run_task_on` can consult
-/// the call path, so it needs its own guard: two tasks that list each other
-/// under `deps:` and both take `sources: [{from: deps}]` would otherwise
-/// compile each other until the stack overflowed.
-///
-/// The guard is the path carried by this value, not state on the executor.
-/// Compiling a dynamic (`sh:`) variable yields, so two tasks expanding globs
-/// over a shared dep interleave; a single stack on the executor would see the
-/// other's entry and report a cycle that does not exist, pop the wrong entry,
-/// and keep a stale one when `join_all_failfast` drops a suspended sibling.
+/// Lets `variables::compiled_task` resolve `from:` and `task:` entries: finds
+/// the tasks they reach and compiles them, without resolving theirs, so
+/// compiles never recurse ([`crate::reach`] walks them).
 struct GlobResolver<'a> {
     exec: &'a Executor,
-    /// The tasks being compiled above this one, innermost first. Keyed by name
-    /// alone: a repeat here is a task whose globs need its own globs.
-    above: Ancestors,
+    /// The call being compiled.
+    call: &'a Call,
 }
 
 impl crate::variables::TaskResolver for GlobResolver<'_> {
-    fn compiled_task_for_globs<'a>(
+    fn resolve(&self, name: &str) -> Result<crate::variables::ResolvedCall, CompileError> {
+        let call = Call {
+            task: name.to_string(),
+            ..Default::default()
+        };
+        match self.exec.find_matching_tasks(&call) {
+            Ok(matching) => match matching.first() {
+                Some(m) => Ok(crate::variables::ResolvedCall {
+                    task: m.task.task.clone(),
+                    captures: m.wildcards.clone(),
+                    platforms: m.task.platforms.clone(),
+                }),
+                None => Err(CompileError::TaskNotFound {
+                    name: name.to_string(),
+                }),
+            },
+            Err(e) => Err(to_compile_error(e)),
+        }
+    }
+
+    fn compile_call<'a>(
         &'a self,
-        task: &'a str,
+        name: &'a str,
         vars: &'a crate::ast::Vars,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Task, crate::variables::CompileError>> + 'a>,
+        Box<
+            dyn std::future::Future<Output = Result<crate::variables::ReachedTask, CompileError>>
+                + 'a,
+        >,
     > {
         Box::pin(async move {
-            if let Some(above) = &self.above
-                && above.contains(task)
-            {
-                // Reported from the task whose globs started the expansion, the
-                // same convention the call-path guard uses.
-                return Err(crate::variables::CompileError::Cycle {
-                    path: above.to_path_through(task),
-                });
-            }
             let call = Call {
-                task: task.to_string(),
+                task: name.to_string(),
                 vars: vars.clone(),
                 silent: false,
                 indirect: true,
             };
-            let inner = GlobResolver {
-                exec: self.exec,
-                above: Some(CallPath::extend(&self.above, task, task)),
-            };
-            self.exec
-                .compiled_task_with(&call, true, &inner, true)
+            let raw = self.exec.get_task(&call).map_err(to_compile_error)?;
+            let task = self
+                .exec
+                .compiled_task_with(&call, true, None)
                 .await
-                .map_err(|e| match e {
-                    // Keep a cycle typed as it unwinds through the outer frames,
-                    // so it still reaches the process as a cyclic-dependency
-                    // error rather than as an opaque compile failure.
-                    ExecutorError::CyclicDependency { path } => {
-                        crate::variables::CompileError::Cycle { path }
-                    }
-                    // Typed, so the referrer can name itself in the message
-                    // and the process exits with the task-not-found code.
-                    ExecutorError::TaskNotFound { task_name, .. } => {
-                        crate::variables::CompileError::TaskNotFound { name: task_name }
-                    }
-                    // A reference deeper down that names no task: kept as is,
-                    // naming the innermost referrer.
-                    ExecutorError::Compile(e)
-                        if matches!(
-                            *e,
-                            crate::variables::CompileError::ReferencedTaskNotFound { .. }
-                        ) =>
-                    {
-                        *e
-                    }
-                    other => crate::variables::CompileError::FromTask(other.to_string()),
-                })
+                .map_err(to_compile_error)?;
+            Ok(crate::variables::ReachedTask { task, raw })
         })
+    }
+
+    fn root(&self) -> Option<(&str, &crate::ast::Vars)> {
+        Some((&self.call.task, &self.call.vars))
+    }
+}
+
+/// An error finding or compiling a task a reference reaches, kept typed where
+/// a run would exit with its own code.
+fn to_compile_error(e: ExecutorError) -> CompileError {
+    match e {
+        // So the referrer can name itself in the message, and the process
+        // exits with the task-not-found code.
+        ExecutorError::TaskNotFound { task_name, .. } => {
+            CompileError::TaskNotFound { name: task_name }
+        }
+        // Named from the referrer by the walk.
+        ExecutorError::TaskNameConflict { call, task_names } => CompileError::TaskNameConflict {
+            task: String::new(),
+            field: String::new(),
+            via: Vec::new(),
+            call,
+            task_names,
+        },
+        ExecutorError::Compile(e) => *e,
+        other => CompileError::FromTask(other.to_string()),
     }
 }
 

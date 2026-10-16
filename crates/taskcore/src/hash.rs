@@ -63,6 +63,30 @@ pub fn cache_checksum(task: &ast::Task, source_hash: &str) -> Result<String, Has
     Ok(format!("{source_hash}-{hex}"))
 }
 
+/// The key of a call a `task:` or `from:` reference reaches: the task it
+/// resolves to, its wildcard captures, then the call's vars in declaration
+/// order, each with its dialect, which the callee renders it in. No vars and
+/// an empty map are the same call. Never persisted.
+pub(crate) fn call_key(
+    task: &str,
+    captures: &[String],
+    vars: &ast::Vars,
+) -> Result<Vec<u8>, HashError> {
+    let mut enc = Encoder::new();
+    enc.str(task);
+    encode_str_slice(&mut enc, captures);
+    enc.len(vars.len());
+    for (key, var) in vars.all() {
+        enc.str(key);
+        encode_var(&mut enc, var)?;
+        enc.tag(match var.dialect {
+            ast::Dialect::Go => 0,
+            ast::Dialect::Jinja => 1,
+        });
+    }
+    Ok(enc.finish())
+}
+
 /// Encodes `vars` as a length-prefixed list. `None` and an empty map encode
 /// identically so a root task without include vars matches an included copy
 /// with an empty map.

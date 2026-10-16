@@ -1,0 +1,361 @@
+version: '3'
+
+includes:
+  inc:
+    taskfile: inc
+    dir: inc
+  jin:
+    taskfile: jin
+    dir: .
+
+tasks:
+  # 1. What running x runs, through every kind of call.
+  edges:
+    sources: [{task: x}, own.txt]
+    cmds:
+      - 'true'
+
+  x:
+    vars:
+      L:
+        sh: echo p q
+    sources: [src/x.txt]
+    setup: [s]
+    deps: [d]
+    cmds:
+      - task: c
+      - task: 'f-{{.ITEM}}'
+        for: [a, b]
+      - task: 'g-{{.ITEM}}'
+        for: {var: L}
+      - defer: {task: z}
+      - echo x
+
+  s: {sources: [src/s.txt]}
+  d: {sources: [src/d.txt]}
+  c: {sources: [src/c.txt]}
+  f-a: {sources: [src/f-a.txt]}
+  f-b: {sources: [src/f-b.txt]}
+  g-p: {sources: [src/g-p.txt]}
+  g-q: {sources: [src/g-q.txt]}
+  z: {sources: [src/z.txt]}
+
+  # 2. Vars flow as a run passes them.
+  langs:
+    sources: [{task: lang-wrapper, vars: {L: fr}}]
+    cmds:
+      - 'true'
+
+  # Runs what `langs` references, as it references it.
+  run-langs:
+    cmds:
+      - task: lang-wrapper
+        vars: {L: fr}
+
+  lang-wrapper:
+    deps:
+      - task: lang
+        vars: {L: '{{.L}}'}
+      - task: lang-own
+        vars: {L: '{{.L}}'}
+
+  lang:
+    sources: ['src/lang/{{.L}}/**']
+    cmds:
+      - echo 'lang={{.L}}'
+
+  lang-own:
+    vars:
+      L: own
+    sources: ['src/lang/{{.L}}/**']
+    cmds:
+      - echo 'lang-own={{.L}}'
+
+  named:
+    sources: [{task: names}]
+    cmds:
+      - 'true'
+
+  names:
+    vars:
+      DEP:
+        sh: echo by-sh
+    deps:
+      - '{{.DEP}}'
+      - an-alias
+      - w-foo
+      - inc:entry
+
+  by-sh: {sources: [src/by-sh.txt]}
+  aliased:
+    aliases: [an-alias]
+    sources: [src/aliased.txt]
+  'w-*':
+    sources: ['src/w-{{index .MATCH 0}}.txt']
+
+  # 3. CHECKSUM, as a run renders it.
+  checksums:
+    sources: [{task: ck}]
+    cmds:
+      - 'true'
+
+  ck:
+    sources: [src/ck.txt]
+    deps:
+      - task: ck-var
+        vars: {C: '{{.CHECKSUM}}'}
+      - 'ck-name-{{.CHECKSUM}}'
+    cmds:
+      - defer: {task: ck-defer, vars: {C: '{{.CHECKSUM}}'}}
+
+  ck-var:
+    sources: ['out/ck-var-{{.C}}.txt']
+    cmds:
+      - mkdir -p out && echo x > 'out/ck-var-{{.C}}.txt'
+
+  'ck-name-*':
+    sources: ['out/ck-name-{{index .MATCH 0}}.txt']
+    cmds:
+      - mkdir -p out && echo x > 'out/ck-name-{{index .MATCH 0}}.txt'
+
+  ck-defer:
+    sources: ['out/ck-defer-{{.C}}.txt']
+    cmds:
+      - mkdir -p out && echo x > 'out/ck-defer-{{.C}}.txt'
+
+  # 4. Deferred calls.
+  deferred:
+    vars: {T: z}
+    sources: [from: cmds]
+    cmds:
+      - defer: {task: '{{.T}}'}
+      - 'true'
+
+  deferred-exit-code:
+    sources: [{task: on-exit}]
+    cmds:
+      - 'true'
+
+  on-exit:
+    cmds:
+      - defer: {task: z, vars: {E: '{{.EXIT_CODE}}'}}
+      - 'true'
+
+  deferred-checksum:
+    sources: [{task: on-checksum}]
+    cmds:
+      - 'true'
+
+  on-checksum:
+    sources: [{task: z}]
+    cmds:
+      - defer: {task: z, vars: {C: '{{.CHECKSUM}}'}}
+      - 'true'
+
+  # Its references are in generates: its final CHECKSUM is not the eager
+  # one either.
+  gen-checksum:
+    sources: [{task: on-gen-checksum}]
+    cmds:
+      - 'true'
+
+  on-gen-checksum:
+    sources: [src/x.txt]
+    generates: [{task: z}]
+    cmds:
+      - defer: {task: 'ck-name-{{.CHECKSUM}}'}
+      - 'true'
+
+  # A reference cycle with no files: no error, no checksum.
+  self-only:
+    sources: [{task: self-only}]
+    cmds:
+      - defer: echo 'CHECKSUM=[{{.CHECKSUM}}]'
+      - 'true'
+
+  # 5. Empty names.
+  empty-cmd:
+    sources: [{task: calls-empty}]
+    cmds:
+      - 'true'
+
+  calls-empty:
+    cmds:
+      - task: '{{.NOPE}}'
+      - task: z
+
+  empty-dep:
+    sources: [{task: deps-empty}]
+    cmds:
+      - echo never
+
+  deps-empty:
+    deps: ['{{.NOPE}}']
+
+  # 6. Unknown names, behind `if:` too.
+  unknown:
+    sources: [{task: u1}]
+    cmds:
+      - echo never
+
+  u1:
+    deps: [u0]
+
+  u0:
+    cmds:
+      - task: missing
+        if: 'false'
+
+  calls-unknown:
+    deps: [unknown]
+
+  # 7. Platforms.
+  platforms:
+    sources: [{task: on-platforms}]
+    cmds:
+      - 'true'
+
+  on-platforms:
+    deps: [elsewhere]
+    cmds:
+      - task: here
+        platforms: [windows]
+
+  elsewhere:
+    platforms: [windows]
+    sources: [src/elsewhere.txt]
+    deps: [missing]
+
+  here: {sources: [src/here.txt]}
+
+  # A task excluded here, which a reached task runs: left out whatever the
+  # order, but a reference naming it includes it.
+  pruned-first:
+    sources: [{task: runs-elsewhere}, {task: elsewhere-ok}]
+    cmds:
+      - 'true'
+
+  pruned-last:
+    sources: [{task: elsewhere-ok}, {task: runs-elsewhere}]
+    cmds:
+      - 'true'
+
+  runs-elsewhere: {deps: [elsewhere-ok], sources: [src/here.txt]}
+
+  elsewhere-ok:
+    platforms: [windows]
+    sources: [src/elsewhere.txt]
+
+  # Left out without being compiled: its `sh:` var would fail.
+  pruned-sh:
+    sources: [{task: runs-bad-elsewhere}]
+    cmds:
+      - 'true'
+
+  runs-bad-elsewhere: {deps: [bad-elsewhere], sources: [src/here.txt]}
+
+  bad-elsewhere:
+    platforms: [windows]
+    vars:
+      BAD:
+        sh: exit 3
+    sources: [src/elsewhere.txt]
+
+  # An alias two tasks share, reached: as ambiguous as when run.
+  conflict:
+    sources: [{task: calls-dup}]
+    cmds:
+      - echo never
+
+  calls-dup: {deps: [dup]}
+  dup-a: {aliases: [dup]}
+  dup-b: {aliases: [dup]}
+  calls-conflict: {deps: [conflict]}
+
+  # 8. Diamonds.
+  diamond:
+    sources: [{task: left}, {task: right}]
+    cmds:
+      - 'true'
+
+  left: {deps: [d], sources: [src/left.txt]}
+  right: {deps: [d], sources: [src/right.txt]}
+
+  # The same var text from each dialect: rendered again by the callee in
+  # the caller's dialect, so two different calls.
+  dialects:
+    sources: [{task: go-side}, {task: 'jin:side'}]
+    cmds:
+      - 'true'
+
+  go-side:
+    vars:
+      TPL:
+        sh: printf '%s%s' '{' '{ "a" }}{#b#}'
+    deps:
+      - task: show
+        vars: {V: '{{.TPL}}'}
+
+  show:
+    sources: ['src/v-{{.V}}.txt']
+    cmds:
+      - echo 'V={{.V}}'
+
+  # 9. Recursion.
+  both-langs:
+    sources: [{task: rec, vars: {L: fr}}]
+    cmds:
+      - 'true'
+
+  rec:
+    sources: ['src/lang/{{.L}}/**']
+    cmds:
+      - task: rec
+        vars: {L: en}
+
+  # A deps cycle under a reference: the reference is fine.
+  refs-a-cycle:
+    sources: [{task: cyc-a}]
+    cmds:
+      - 'true'
+
+  cyc-a: {deps: [cyc-b], sources: [src/c.txt]}
+  cyc-b: {deps: [cyc-a]}
+
+  # As many calls of count as FROM has characters, plus one: count stops
+  # where it calls itself again with the same N.
+  countdown:
+    sources: [{task: count, vars: {N: '{{.FROM}}'}}]
+    cmds:
+      - 'true'
+
+  count:
+    cmds:
+      - task: count
+        vars: {N: '{{trimSuffix "x" .N}}'}
+        if: '{{ne .N ""}}'
+
+  # Guarded by its `if:`, which the walk does not evaluate: unbounded.
+  forever:
+    sources: [{task: count-up, vars: {N: x}}]
+    cmds:
+      - echo never
+
+  calls-forever:
+    deps: [forever]
+
+  count-up:
+    cmds:
+      - task: count-up
+        vars: {N: '{{.N}}x'}
+        if: '{{lt (len .N) 3}}'
+
+  # 10. An exclusion in a task run.
+  run-excludes:
+    sources: [{task: excluding}, own.txt]
+    cmds:
+      - 'true'
+
+  excluding:
+    deps: [d]
+    sources: [src/x.txt, exclude: '**/d.txt', exclude: own.txt]

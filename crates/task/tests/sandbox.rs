@@ -893,12 +893,6 @@ fn writes_naming_a_bad_task_fail() {
             "task: writes-empty-task-name: sandbox.writes: `task: {{.UNSET}}` rendered to an \
              empty task name",
         ),
-        (
-            "writes-cycle",
-            204,
-            "task: Cyclic dependency detected: writes-cycle-gen -> writes-cycle-wrapper -> \
-             writes-cycle-gen",
-        ),
     ] {
         for mode in ["off", "landlock"] {
             let dir = stage("sandbox");
@@ -910,6 +904,16 @@ fn writes_naming_a_bad_task_fail() {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
+}
+
+/// A cycle in the referenced tasks' generates is no error.
+#[test]
+fn writes_naming_a_task_whose_generates_cycle_run() {
+    let dir = stage("sandbox");
+    let r = run_with_env(&dir, &["writes-cycle"], &[("TASK_SANDBOX", "off")]);
+    assert!(r.ok(), "{}", r.combined());
+    assert!(r.stdout.contains("never"), "{}", r.combined());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

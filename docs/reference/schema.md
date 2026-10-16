@@ -469,8 +469,8 @@ tasks:
 Use `setup` for operations that must complete before the parent's source
 fingerprint can be computed, such as code generation, version stamping, or
 fetching external inputs. Setup task outputs are **not** merged into the
-parent's fingerprint; use `sources` / `generates` with `from: deps` on the
-parent if you need that.
+parent's fingerprint, and `from: deps` does not read `setup`; name the setup
+task in the parent's `sources` (`- task: generate-version`) if you need that.
 
 ```yaml
 tasks:
@@ -854,11 +854,18 @@ whose name or `vars` mention `{{.EXIT_CODE}}`, or `{{.CHECKSUM}}` in a task
 with `from:` or `task:` entries itself, is an error, as is one whose template
 fails to render (a run would ignore it): list its targets explicitly.
 
-A `task:` entry copies the same field of one named task, which need not be a
-dependency or be called. It takes optional `vars`, as a dependency call does,
-and nothing else. The referenced task does not run. Use it to keep a task that
-reads another task's inputs (tests, linters, packaging) in step with that
-task's `sources`, which `sandbox` otherwise reports as soon as they drift:
+A `task:` entry names one task, which need not be a dependency or be called.
+It takes optional `vars`, as a dependency call does, and nothing else. The
+referenced task does not run. In `sources`, it stands for what running that
+task would read: its `sources`, and those of every task it runs through
+`setup`, `deps` and `task:` commands (`for:` loops and deferred calls
+included), transitively, each with the vars that call passes. In `generates`
+it copies the named task's `generates` only, its products, so a cache entry
+holds those and not the intermediates the tasks it runs leave. `from: deps`
+and `from: cmds` copy the same field of the direct dependencies or called
+tasks, one level. Use `task:` to keep a task that reads another task's inputs
+(tests, linters, packaging) in step with that task's `sources`, which
+`sandbox` otherwise reports as soon as they drift:
 
 ```yaml
 tasks:
@@ -879,12 +886,32 @@ tasks:
 In an included Taskfile, the name resolves like a `deps` entry: within the
 include, or from the root with a leading `:`. A name that does not exist, or
 that renders empty, is an error. References are followed through the
-referenced task's own `from:` and `task:` entries; a cycle between them fails
-with `Cyclic dependency detected`.
+referenced tasks' own `from:` and `task:` entries. Each task counts once with
+the same vars, so a cycle between references is no error; one called with
+other vars counts again (a task calling itself for another language covers
+both).
+
+What a task runs is found without running anything, conservatively: an `if:`
+on a task or command, `requires`, prompts and a command's `platforms:` are
+ignored, so a call they would skip still counts, and a task it names must
+exist (exit code 200, naming the referring task and the calls leading to the
+missing one). Only a task-level `platforms:` excluding the host leaves out a
+task that would be run, with what it runs, and without compiling it; a task a
+`task:` entry names is included whatever its `platforms:`. A `task:` command
+whose name renders empty runs nothing, and counts for nothing. A deferred call
+counts as it runs after a success; one whose name or `vars` mention
+`{{.EXIT_CODE}}`, or `{{.CHECKSUM}}` in a task that has `task:` or `from:`
+entries in its own `sources` or `generates`, is an error, as is one whose
+template fails to render, which a run would ignore: list its targets with
+their own `task:` entries. A recursion whose end depends on what the walk does
+not evaluate (an `if:`) stops at 256 calls of one task, or 1000 calls in all,
+with exit code 204. The `sh:` variables of the tasks reached run as for a run,
+unsandboxed.
 
 A folded task's `exclude:` entries remove only that task's own matches, never
-another folded task's or the referring task's. The referring task's own
-`exclude:` entries apply to everything it folds in.
+those of the tasks it runs or folds in, another folded task's or the referring
+task's. The referring task's own `exclude:` entries apply to everything it
+folds in.
 
 Entries folded in by `from:` or `task:` count for the up-to-date check and the
 cache, but two things in `cmds` see only the task's own entries:
@@ -993,7 +1020,7 @@ change, and a sandboxed X warns about its own `generates`. A pattern writes in i
 before the first wildcard (`target/**/*` in `target/`), a plain file path in
 its directory (`bin/app` in `bin/`). The name resolves like a `task:` entry of
 `sources`, through X's own `from:` and `task:` generates entries; an unknown
-name, one that renders empty, or a cycle is an error. The entry grants access
+name, or one that renders empty, is an error. The entry grants access
 only: it changes neither the task's fingerprint nor its cache key. One whose
 task has no `generates` grants nothing, with a warning.
 
@@ -1004,7 +1031,8 @@ reference, the nested process's arguments do not. A mismatch makes another
 directory writable, and the sandbox denies the callee's writes.
 
 A task that runs X also depends on X's inputs, so it lists them in its own
-`sources` with `- task: X`, which makes them readable and fingerprints them.
+`sources` with `- task: X`, which makes them, and those of the tasks X runs,
+readable and fingerprints them.
 `sandbox.reads` takes no `task:` entry for that: inputs read without being
 fingerprinted would leave a stale up-to-date result or cache entry.
 
