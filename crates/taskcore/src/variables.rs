@@ -378,6 +378,101 @@ pub struct CompileContext<'a> {
     pub env_precedence: bool,
     /// The taskfile-level named cache models (`caches:`), for `cache.inherit`.
     pub caches: &'a Caches,
+    /// Compute `CHECKSUM` whenever the task has sources, as consumers outside
+    /// the task's own fields read it: `--summary` prints the compiled vars, and
+    /// templated `output:` group markers re-render them (see
+    /// [`ChecksumNeeds`]).
+    pub eager_checksum: bool,
+}
+
+/// Which compile phases need the sources checksum. Hashing a large tree is a
+/// whole pass over it, so a compile computes `CHECKSUM` only when something
+/// observes it; otherwise the run computes the value at its first consumer
+/// (the build-once lock, else the up-to-date check) and `CHECKSUM` stays
+/// unset.
+///
+/// The test is conservative: a false positive only costs the hash every
+/// compile used to compute. Task `vars:` cannot ask for it: every var layer
+/// is resolved before the task's own `CHECKSUM` is set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ChecksumNeeds {
+    /// Read by what renders with the task's own entries' checksum (C1):
+    /// commands, their `for:` loops (a deferred one included: the loop branch
+    /// renders it first), conditions and vars, and `setup`/`deps`.
+    pub early: bool,
+    /// Read by what renders with the final checksum (C2, widened by `from:`/
+    /// `task:` entries): preconditions, the cache block, deferred commands, and
+    /// the reach's rendering of a reached task's deferred calls.
+    pub last: bool,
+}
+
+/// Whether a raw field's text could read `CHECKSUM`: it names it, or calls
+/// Jinja's `debug()`, which dumps the whole context. Fields are scanned
+/// through their `Debug` form, which holds every string they carry.
+fn mentions_checksum(text: &str) -> bool {
+    text.contains("CHECKSUM") || text.contains("debug")
+}
+
+/// Whether `vars` could read `CHECKSUM`: a mention, or a `ref:`, which can
+/// capture the whole context (`ref: "."`) for a callee to index.
+fn vars_read_checksum(vars: Option<&Vars>) -> bool {
+    vars.is_some_and(|vars| {
+        vars.all()
+            .any(|(_, v)| !v.ref_.is_empty() || mentions_checksum(&format!("{v:?}")))
+    })
+}
+
+/// What in `t` observes `CHECKSUM`, by phase.
+pub(crate) fn checksum_needs(t: &Task, ctx: &CompileContext<'_>) -> ChecksumNeeds {
+    if t.sources.is_empty() {
+        return ChecksumNeeds::default();
+    }
+    if ctx.eager_checksum
+        // `requires` checks the compiled vars for it, and an `enum` its value.
+        || t.requires.as_ref().is_some_and(|r| mentions_checksum(&format!("{r:?}")))
+    {
+        return ChecksumNeeds {
+            early: true,
+            last: true,
+        };
+    }
+    let cmd_reads = |c: &crate::ast::Cmd| {
+        mentions_checksum(&c.cmd)
+            || mentions_checksum(&c.task)
+            || mentions_checksum(&c.if_)
+            || c.for_
+                .as_ref()
+                .is_some_and(|f| mentions_checksum(&format!("{f:?}")))
+            || vars_read_checksum(c.vars.as_ref())
+    };
+    let dep_reads = |d: &Dep| {
+        mentions_checksum(&d.task)
+            || d.for_
+                .as_ref()
+                .is_some_and(|f| mentions_checksum(&format!("{f:?}")))
+            || vars_read_checksum(d.vars.as_ref())
+    };
+    let early = t
+        .cmds
+        .iter()
+        .filter(|c| !c.defer || c.for_.is_some())
+        .any(cmd_reads)
+        || t.deps.iter().chain(&t.setup).any(dep_reads);
+    let cache_reads = t.cache.as_ref().is_some_and(|c| {
+        let model = (!c.inherit.is_empty())
+            .then(|| ctx.caches.get(&c.inherit))
+            .flatten();
+        // A vk model embeds the cache key, and with it the checksum, in its URL.
+        !c.vk.is_empty()
+            || model.is_some_and(|m| !m.vk.is_empty() || mentions_checksum(&format!("{m:?}")))
+            || mentions_checksum(&format!("{c:?}"))
+    });
+    let last = cache_reads
+        || t.preconditions
+            .iter()
+            .any(|p| mentions_checksum(&p.sh) || mentions_checksum(&p.msg))
+        || t.cmds.iter().filter(|c| c.defer).any(cmd_reads);
+    ChecksumNeeds { early, last }
 }
 
 /// Computes the cache key, converting hash errors to compile errors.
@@ -403,8 +498,21 @@ pub async fn compiled_task(
     logger: &mut Logger,
     resolver: Option<&dyn TaskResolver>,
 ) -> Result<Task, CompileError> {
-    let (mut new, mut vars, mut cache) =
-        compile_run(orig_task, vars, evaluate_sh_vars, ctx, compiler, logger).await?;
+    let needs = checksum_needs(orig_task, ctx);
+    let widens = evaluate_sh_vars
+        && resolver.is_some()
+        && (has_from_entries(&orig_task.sources) || has_from_entries(&orig_task.generates));
+    let (mut new, mut vars, mut cache) = compile_run(
+        orig_task,
+        vars,
+        evaluate_sh_vars,
+        ctx,
+        compiler,
+        logger,
+        needs,
+        widens,
+    )
+    .await?;
 
     // Resolve `from:` and `task:` entries in sources/generates/sandbox.writes,
     // recomputing the checksum if sources or generates were extended. Not
@@ -462,7 +570,12 @@ pub async fn compiled_task(
         let widened =
             has_from_entries(&orig_task.sources) || has_from_entries(&orig_task.generates);
         if widened && !orig_task.sources.is_empty() {
+            // A C1 computed for the commands is not the final value: leave
+            // that to the run unless something here reads it.
             new.source_hash.clear();
+            new.cache_checksum.clear();
+        }
+        if widened && needs.last {
             let mut checker = ChecksumChecker::new(ctx.fingerprint_temp_dir, new.clone());
             let source_hash = checker.source_value().await.to_string();
             new.cache_checksum = cache_checksum(orig_task, &source_hash)?;
@@ -495,7 +608,9 @@ pub async fn reached_task(
     compiler: &Compiler,
     logger: &mut Logger,
 ) -> Result<Task, CompileError> {
-    let (new, _, cache) = compile_run(orig_task, vars, true, ctx, compiler, logger).await?;
+    let needs = checksum_needs(orig_task, ctx);
+    let (new, _, cache) =
+        compile_run(orig_task, vars, true, ctx, compiler, logger, needs, false).await?;
     if let Some(err) = cache.err() {
         return Err(CompileError::Template(err.clone()));
     }
@@ -505,6 +620,11 @@ pub async fn reached_task(
 /// The part of [`compiled_task`] a run needs to know what it runs: everything
 /// up to `setup` and `deps`. Returns the task, its vars (`CHECKSUM` included)
 /// and the templater holding them.
+///
+/// `needs` says which phases read `CHECKSUM`; `widens` that references will
+/// widen the sources afterwards, making the value computed here (C1) final
+/// only for the commands.
+#[allow(clippy::too_many_arguments)]
 async fn compile_run(
     orig_task: &Task,
     mut vars: Vars,
@@ -512,6 +632,8 @@ async fn compile_run(
     ctx: &CompileContext<'_>,
     compiler: &Compiler,
     logger: &mut Logger,
+    needs: ChecksumNeeds,
+    widens: bool,
 ) -> Result<(Task, Vars, Cache), CompileError> {
     // Substitute captured wildcards from a `MATCH` var into the task name.
     let full_name = compute_full_name(orig_task, &vars);
@@ -651,10 +773,20 @@ async fn compile_run(
     }
     new.env = Some(env_vars);
 
-    // Compute the source checksum from the unresolved commands, so CHECKSUM is
-    // available before cmd/cache resolution. Setting CHECKSUM changes the
-    // variable set, so the cache is rebuilt afterwards.
     if !orig_task.sources.is_empty() {
+        new.cache_vars_digest =
+            crate::hash::cache_vars_digest(orig_task).map_err(|e| CompileError::CacheKey {
+                task: orig_task.name().to_string(),
+                message: e.to_string(),
+            })?;
+    }
+
+    // Compute the source checksum from the unresolved commands, so CHECKSUM is
+    // available before cmd/cache resolution, when something reads it: the
+    // commands, or a final consumer that no widening will recompute it for.
+    // Setting CHECKSUM changes the variable set, so the cache is rebuilt
+    // afterwards.
+    if !orig_task.sources.is_empty() && (needs.early || (needs.last && !widens)) {
         let mut checker = ChecksumChecker::new(ctx.fingerprint_temp_dir, new.clone());
         let source_hash = checker.source_value().await.to_string();
         new.cache_checksum = cache_checksum(orig_task, &source_hash)?;
@@ -1302,6 +1434,7 @@ mod tests {
             fingerprint_temp_dir: tmp,
             env_precedence: false,
             caches,
+            eager_checksum: false,
         }
     }
 
@@ -1940,5 +2073,218 @@ mod tests {
         ]);
         let product = product(&matrix);
         assert_eq!(product.len(), 2);
+    }
+
+    /// A directory holding one source, and a task over it running `cmds`.
+    fn sourced(cmds: Vec<Cmd>) -> (String, Task) {
+        let dir = std::env::temp_dir().join(format!(
+            "taskcore-lazy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("s.txt"), "s").unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+        let task = Task {
+            task: "build".to_string(),
+            dirs: vec![dir.clone()],
+            sources: vec![Glob {
+                glob: "s.txt".to_string(),
+                ..Default::default()
+            }],
+            cmds,
+            ..Default::default()
+        };
+        (dir, task)
+    }
+
+    fn cmd(text: &str) -> Cmd {
+        Cmd {
+            cmd: text.to_string(),
+            ..Default::default()
+        }
+    }
+
+    async fn compile(t: &Task, eager: bool) -> Task {
+        let env = Vars::new();
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let mut context = ctx(&env, &tmp);
+        context.eager_checksum = eager;
+        compiled_task(
+            t,
+            Vars::new(),
+            true,
+            &context,
+            &compiler(),
+            &mut silent_logger(),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A task that never reads CHECKSUM compiles without hashing its sources
+    /// and has the same identity as when they are hashed.
+    #[tokio::test]
+    async fn checksum_is_left_to_the_run_when_nothing_reads_it() {
+        let (_dir, t) = sourced(vec![cmd("echo hi")]);
+        let lazy = compile(&t, false).await;
+        assert!(lazy.source_hash.is_empty());
+        assert!(lazy.cache_checksum.is_empty());
+        assert!(!lazy.cache_vars_digest.is_empty());
+        assert!(
+            lazy.vars
+                .as_ref()
+                .is_none_or(|v| v.get("CHECKSUM").is_none())
+        );
+        let eager = compile(&t, true).await;
+        assert!(!eager.source_hash.is_empty());
+        assert_eq!(
+            crate::hash::fingerprint(&lazy).unwrap(),
+            crate::hash::fingerprint(&eager).unwrap()
+        );
+        assert_eq!(
+            crate::hash::join_cache_checksum(&eager.source_hash, &lazy.cache_vars_digest),
+            eager.cache_checksum
+        );
+    }
+
+    /// Each reader of CHECKSUM makes the compile hash, and keeps the identity
+    /// the eager compile gives.
+    #[tokio::test]
+    async fn each_reader_makes_the_compile_hash() {
+        let with = |f: &dyn Fn(&mut Task)| {
+            let (_dir, mut t) = sourced(vec![cmd("echo hi")]);
+            f(&mut t);
+            t
+        };
+        let var = |v: Var| {
+            Some(Vars::from_elements([VarElement {
+                key: "C".to_string(),
+                value: v,
+            }]))
+        };
+        let readers: Vec<(&str, Task)> = vec![
+            ("cmd", with(&|t| t.cmds = vec![cmd("echo {{.CHECKSUM}}")])),
+            (
+                "jinja debug",
+                with(&|t| t.cmds = vec![cmd("echo '{{ debug() }}'")]),
+            ),
+            (
+                "cmd var",
+                with(&|t| t.cmds[0].vars = var(string_var("{{.CHECKSUM}}"))),
+            ),
+            (
+                "cmd ref",
+                with(&|t| {
+                    t.cmds[0].vars = var(Var {
+                        ref_: ".".to_string(),
+                        ..Default::default()
+                    })
+                }),
+            ),
+            (
+                "deferred",
+                with(&|t| {
+                    t.cmds.push(Cmd {
+                        cmd: "echo {{.CHECKSUM}}".to_string(),
+                        defer: true,
+                        ..Default::default()
+                    })
+                }),
+            ),
+            (
+                "dep vars",
+                with(&|t| {
+                    t.deps = vec![Dep {
+                        task: "x".to_string(),
+                        vars: var(string_var("{{.CHECKSUM}}")),
+                        ..Default::default()
+                    }]
+                }),
+            ),
+            (
+                "setup task",
+                with(&|t| {
+                    t.setup = vec![Dep {
+                        task: "x-{{.CHECKSUM}}".to_string(),
+                        ..Default::default()
+                    }]
+                }),
+            ),
+            (
+                "precondition",
+                with(&|t| {
+                    t.preconditions = vec![Precondition {
+                        sh: "test {{.CHECKSUM}}".to_string(),
+                        msg: String::new(),
+                    }]
+                }),
+            ),
+            (
+                "cache url",
+                with(&|t| {
+                    t.cache = Some(crate::ast::Cache {
+                        url: "file:///c-{{.CHECKSUM}}.zip".to_string(),
+                        ..Default::default()
+                    })
+                }),
+            ),
+            (
+                "vk",
+                with(&|t| {
+                    t.cache = Some(crate::ast::Cache {
+                        vk: "127.0.0.1:9/repo".to_string(),
+                        ..Default::default()
+                    })
+                }),
+            ),
+            (
+                "requires",
+                with(&|t| {
+                    t.requires = Some(crate::ast::Requires {
+                        vars: vec![crate::ast::VarsWithValidation {
+                            name: "CHECKSUM".to_string(),
+                            ..Default::default()
+                        }],
+                    })
+                }),
+            ),
+        ];
+        for (what, t) in readers {
+            let lazy = compile(&t, false).await;
+            let eager = compile(&t, true).await;
+            assert!(!lazy.source_hash.is_empty(), "{what}");
+            assert_eq!(lazy.source_hash, eager.source_hash, "{what}");
+            assert_eq!(lazy.cache_checksum, eager.cache_checksum, "{what}");
+            assert_eq!(
+                crate::hash::fingerprint(&lazy).unwrap(),
+                crate::hash::fingerprint(&eager).unwrap(),
+                "{what}"
+            );
+        }
+    }
+
+    /// A fast compile hashes only for a reader too.
+    #[tokio::test]
+    async fn fast_compile_does_not_hash() {
+        let (_dir, t) = sourced(vec![cmd("echo hi")]);
+        let env = Vars::new();
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let fast = compiled_task(
+            &t,
+            Vars::new(),
+            false,
+            &ctx(&env, &tmp),
+            &compiler(),
+            &mut silent_logger(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(fast.source_hash.is_empty());
     }
 }

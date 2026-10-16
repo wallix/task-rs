@@ -1613,3 +1613,80 @@ fn cache_key_is_stable() {
         "{out}"
     );
 }
+
+/// A task whose fields never read CHECKSUM takes its sources value after
+/// `setup`: the cache entry it saves records the sources setup left, the same
+/// value its fingerprint recorded.
+#[test]
+fn cache_key_of_a_lazy_task_follows_setup() {
+    let cache = cache_dir();
+    std::fs::create_dir_all(&cache).unwrap();
+    let taskfile = format!(
+        "version: '3'\ntasks:\n  gen:\n    cmds: ['echo generated > input.txt']\n  build:\n    setup: [gen]\n    sources: [input.txt]\n    generates: [output.txt]\n    cache:\n      url: 'file://{}/entry.zip'\n    cmds: ['cp input.txt output.txt']\n",
+        cache.display()
+    );
+    let dir = stage_inline(&taskfile, "before setup\n");
+    let (out, code) = run_env(&dir, &["build"], &[]);
+    assert_eq!(code, 0, "{out}");
+    let comment = read_zip_comment(&std::fs::read(cache.join("entry.zip")).unwrap());
+    let meta = comment
+        .lines()
+        .find_map(|l| l.strip_prefix("sources:"))
+        .expect("sources: line")
+        .to_string();
+    let state = std::fs::read_to_string(checksum_file(&dir, "build").unwrap()).unwrap();
+    assert_eq!(state.lines().next(), Some(meta.as_str()), "{comment}");
+}
+
+/// One whose commands read CHECKSUM keeps the value its compile rendered,
+/// from before `setup`. When `setup` changes its sources that key no longer
+/// names what it builds, so the run neither restores nor saves under it.
+#[test]
+fn a_stale_cache_key_skips_restore_and_save() {
+    let cache = cache_dir();
+    std::fs::create_dir_all(&cache).unwrap();
+    let taskfile = format!(
+        "version: '3'\ntasks:\n  gen:\n    cmds: ['echo generated > input.txt']\n  build:\n    setup: [gen]\n    sources: [input.txt]\n    generates: [output.txt]\n    cache:\n      url: 'file://{}/entry-{{{{.CHECKSUM}}}}.zip'\n    cmds: ['cp input.txt output.txt', 'echo CHECKSUM={{{{.CHECKSUM}}}}']\n",
+        cache.display()
+    );
+    let dir = stage_inline(&taskfile, "before setup\n");
+    let (out, code) = run_env(&dir, &["-v", "build"], &[]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("CHECKSUM="), "{out}");
+    assert!(
+        out.contains("not saved: its sources changed since its cache key was taken"),
+        "{out}"
+    );
+    assert_eq!(dir_len(&cache), 0, "{out}");
+    // Setup writes the same content again: the compile's key is now current.
+    let (out, code) = run_env(&dir, &["-v", "build"], &[]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(dir_len(&cache), 1, "{out}");
+}
+
+/// Commands reading CHECKSUM see the task's own entries' value, as before,
+/// while the cache key, computed by the run, covers what its references fold
+/// in: never the commands' narrower value.
+#[test]
+fn cache_key_of_a_widened_task_is_the_final_value() {
+    let cache = cache_dir();
+    std::fs::create_dir_all(&cache).unwrap();
+    let taskfile = format!(
+        "version: '3'\ntasks:\n  leaf:\n    sources: [leaf.txt]\n  build:\n    sources: [{{task: leaf}}, input.txt]\n    generates: [output.txt]\n    cache:\n      url: 'file://{}/entry.zip'\n    cmds: ['cp input.txt output.txt', 'echo CHECKSUM={{{{.CHECKSUM}}}}']\n",
+        cache.display()
+    );
+    let dir = stage_inline(&taskfile, "in\n");
+    std::fs::write(dir.join("leaf.txt"), "leaf").unwrap();
+    let (out, code) = run_env(&dir, &["build"], &[]);
+    assert_eq!(code, 0, "{out}");
+    let comment = read_zip_comment(&std::fs::read(cache.join("entry.zip")).unwrap());
+    let meta = comment
+        .lines()
+        .find_map(|l| l.strip_prefix("sources:"))
+        .expect("sources: line")
+        .to_string();
+    let state = std::fs::read_to_string(checksum_file(&dir, "build").unwrap()).unwrap();
+    assert_eq!(state.lines().next(), Some(meta.as_str()), "{comment}");
+    assert!(!out.contains(&format!("CHECKSUM={meta}")), "{out}");
+    assert!(out.contains("CHECKSUM="), "{out}");
+}

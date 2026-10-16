@@ -1,6 +1,6 @@
 version: '3'
 
-# The cache key 4.8.0 derived for a task without references, which names the
+# A pinned cache key for a task without references, which names the
 # lock on the (unreachable) registry.
 tasks:
   cached:

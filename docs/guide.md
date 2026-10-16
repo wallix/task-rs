@@ -962,6 +962,15 @@ The special variable <span v-pre>`{{ CHECKSUM }}`</span> is available for
 interpolation within `cmds` and `status` commands. Only `source` globs are
 fingerprinted.
 
+The sources are hashed when the task is compiled only if something reads
+`CHECKSUM`: its commands and their vars, task names, preconditions, the cache
+block, deferred commands, `requires`, a `ref:` var, Jinja's `debug()`,
+`--summary`, or templated `output:` group markers. Otherwise a task with
+`generates` hashes them once after `setup`, for its build-once lock and cache
+key, and a task without (no lock, no cache entry) reuses its up-to-date
+reading. A cache entry is restored only when its key matches what the
+up-to-date check read, and saved only when it matches what the run built from.
+
 You can use `--force` or `-f` if you want to force a task to run even when
 up-to-date.
 

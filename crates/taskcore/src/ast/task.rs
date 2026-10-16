@@ -72,13 +72,18 @@ pub struct Task {
     /// The original unresolved command templates, set during compilation for
     /// stable checksumming independent of variable resolution.
     pub raw_cmds: Vec<Cmd>,
-    /// The checksum of sources + raw commands + generates, computed once during
-    /// compilation and reused for up-to-date checks and the `CHECKSUM` variable.
+    /// The checksum of sources + raw commands + generates, computed during
+    /// compilation when something reads the `CHECKSUM` variable it fills;
+    /// empty otherwise, for the run to compute (`ChecksumChecker::source_value`).
     pub source_hash: String,
     /// Cache entry and build-once lock checksum: `source_hash` plus a digest of
     /// raw task and include `vars` (`hash::cache_checksum`). Set alongside
-    /// `source_hash` during compilation.
+    /// `source_hash` during compilation, so empty when that is.
     pub cache_checksum: String,
+    /// The vars digest `cache_checksum` appends to `source_hash`
+    /// (`hash::cache_vars_digest`), set during compilation even when the
+    /// source hash is left for the run to compute. Not part of the identity.
+    pub cache_vars_digest: String,
 }
 
 impl Task {

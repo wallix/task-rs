@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Sources are hashed at compile time only when something reads
+  `{{.CHECKSUM}}`.** Compiling a task, the quick compile that checks its
+  platforms and required vars, and compiling every task a `task:` or `from:`
+  reference reaches no longer hash sources just to fill the variable. A task
+  reading it (in commands and their vars, task names, preconditions, the cache
+  block, deferred commands or `requires`, through a `ref:` var or Jinja
+  `debug()`), and every task under `--summary` or templated `output:` group
+  markers, keeps the compile-time value as before. For the others, a task with
+  `generates` computes the value once just before its build-once lock, after
+  `setup`: the sources hash in the lock name (`<task>:<cache checksum>`), the
+  cache key and the cache entry's recorded sources is now taken there rather
+  than before `setup`. A task without `generates` takes no lock and has no cache
+  entry, and simply reuses its up-to-date reading. A cache entry is now restored
+  only when the run's cache key matches what its up-to-date check read, and
+  saved only when it matches what the run built from: a key taken before
+  preconditions, a lock wait or another writer changed the sources is skipped
+  (noted with `-v`), for these tasks and for those keeping the compile-time
+  value alike.
 - **Fingerprinting walks each directory once and takes file types from the
   listing,** so hashing a regular file costs one `stat` instead of about four.
   A source or generated file removed after its directory was listed now fails

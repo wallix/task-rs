@@ -90,6 +90,7 @@ const _: fn() = || {
 
 impl Spec {
     fn sources_snapshot(&self) -> std::io::Result<Snapshot> {
+        super::passes::note(&self.dir);
         let files = hinted_globs(&self.dir, &self.sources)?;
         hinted_snapshot(&self.dir, &files, &self.data, Workers::Auto)
     }
@@ -185,6 +186,8 @@ impl ChecksumChecker {
         }
         let (spec, file) = (self.spec.clone(), self.checksum_file_path()?);
         let (sources, ok) = off_thread(move || spec.up_to_date(&file)).await?;
+        // Nothing before needed the sources value: this reading is the run's.
+        self.adopt_source_value(&sources.hash);
         self.pre_exec = Some(sources);
         Ok(ok)
     }
@@ -257,6 +260,37 @@ impl ChecksumChecker {
                 .unwrap_or_default();
         }
         &self.source_hash
+    }
+
+    /// The sources value as chosen so far, without computing it.
+    pub fn known_source_value(&self) -> &str {
+        &self.source_hash
+    }
+
+    /// Whether the run's sources value is what the up-to-date check read: a
+    /// value taken earlier (compile, lock) may predate changes to the sources.
+    pub fn source_value_is_the_reading(&self) -> bool {
+        self.pre_exec
+            .as_ref()
+            .is_some_and(|pre| pre.hash == self.source_hash)
+    }
+
+    /// Makes `value` the run's sources value unless one was chosen already.
+    pub fn adopt_source_value(&mut self, value: &str) {
+        if self.source_hash.is_empty() && self.spec.has_sources {
+            self.source_hash = value.to_string();
+        }
+    }
+
+    /// The cache entry and lock checksum (`hash::cache_checksum`): the
+    /// compile's, or one from [`ChecksumChecker::source_value`] and the
+    /// compiled vars digest. Empty without a sources value.
+    pub async fn cache_checksum(&mut self) -> String {
+        if !self.task.cache_checksum.is_empty() {
+            return self.task.cache_checksum.clone();
+        }
+        let digest = self.task.cache_vars_digest.clone();
+        crate::hash::join_cache_checksum(self.source_value().await, &digest)
     }
 
     /// Records the current sources and generates hashes as up to date, read

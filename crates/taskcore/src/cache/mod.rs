@@ -576,6 +576,7 @@ fn meta_from_annotations(ann: &std::collections::BTreeMap<String, String>) -> Ca
 pub async fn cache_save(
     url: &CacheUrl,
     task: &Task,
+    source_value: &str,
     recorded: &crate::fingerprint::Recorded,
     dir: &Path,
     guarded: &Guarded<'_>,
@@ -587,7 +588,7 @@ pub async fn cache_save(
     // the entry is keyed by — so a copy reached through another include
     // verifies against it.
     let entry_task = task.local_name();
-    let mut checker = ChecksumChecker::new(temp_dir, task.clone());
+    let checker = ChecksumChecker::new(temp_dir, task.clone());
     // The hashes the run just recorded, not a fresh reading.
     let st = match checker.cache_files().await {
         Ok(cache_files) if !cache_files.is_empty() => crate::fingerprint::TaskStatus {
@@ -606,7 +607,6 @@ pub async fn cache_save(
             return;
         }
     };
-    let source_value = checker.source_value().await.to_string();
     let (files, refused) = archive::split_unrestorable(dir, &st.cache_files);
     if !refused.is_empty() {
         logger.errf(
@@ -621,7 +621,7 @@ pub async fn cache_save(
         return;
     }
     // An entry whose links its restore would refuse would only ever miss.
-    let restore = TaskRestore::new(task, &source_value, dir, guarded);
+    let restore = TaskRestore::new(task, source_value, dir, guarded);
     let accept = |_: &str| true;
     let protected = |root: &std::fs::File, dest: &[String]| restore.protects(root, dest);
     if let Err(e) = restore
@@ -642,7 +642,7 @@ pub async fn cache_save(
     match url {
         CacheUrl::Zip { path } => {
             let dest = Path::new(path);
-            save_file(dest, &entry_task, dir, &source_value, &st, logger);
+            save_file(dest, &entry_task, dir, source_value, &st, logger);
         }
         CacheUrl::Oci { repo, tag, opts } => {
             save_oci(
@@ -651,7 +651,7 @@ pub async fn cache_save(
                 opts.clone(),
                 &entry_task,
                 dir,
-                &source_value,
+                source_value,
                 &st,
                 logger,
             )

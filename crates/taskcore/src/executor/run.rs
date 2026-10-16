@@ -499,6 +499,13 @@ impl Executor {
             fingerprint_temp_dir: &self.temp_dir.fingerprint,
             env_precedence: self.env_precedence,
             caches,
+            // `--summary` prints the compiled vars; group markers render
+            // against the compiled vars again, any var possibly carrying text
+            // that names CHECKSUM.
+            eager_checksum: self.summary
+                || [&self.output_style.group.begin, &self.output_style.group.end]
+                    .iter()
+                    .any(|m| m.contains('{')),
         };
         let result = match resolver {
             Some(resolver) => {
@@ -856,13 +863,28 @@ impl Executor {
         let cache_url = self.cache_url(t);
 
         // Acquire the build-once lock covering deps, fingerprint, execution and
-        // the up-to-date write, for tasks with fingerprint state.
+        // the up-to-date write, for tasks with fingerprint state. Its name
+        // carries the sources checksum: the compile's when it computed one,
+        // else read now, after setup, and kept as the run's value.
+        let mut checker = ChecksumChecker::new(&self.temp_dir.fingerprint, t.clone());
+        let lock_key = if self.takes_lock(t) {
+            checker.cache_checksum().await
+        } else {
+            String::new()
+        };
         let lock = self
-            .acquire_task_lock(t, &t.cache_checksum, cache_url.as_ref())
+            .acquire_task_lock(t, &lock_key, cache_url.as_ref())
             .await?;
 
         let result = self
-            .execute_locked(t, call, ancestors, cache_url.as_ref(), lock.as_ref())
+            .execute_locked(
+                t,
+                call,
+                ancestors,
+                cache_url.as_ref(),
+                lock.as_ref(),
+                checker,
+            )
             .await;
         // Release explicitly: a dropped vk lease only stops its heartbeat and
         // keeps peers waiting until it expires server-side.
@@ -887,9 +909,8 @@ impl Executor {
         ancestors: Ancestors,
         cache_url: Option<&CacheUrl>,
         lock: Option<&cache::Guard>,
+        mut checker: ChecksumChecker,
     ) -> Result<(), ExecutorError> {
-        let mut checker = ChecksumChecker::new(&self.temp_dir.fingerprint, t.clone());
-        let source_hash = t.source_hash.as_str();
         let cache_active = cache_url.is_some();
         let skip_fingerprinting = self.force_all || (!call.indirect && self.force);
         if !skip_fingerprinting {
@@ -907,10 +928,26 @@ impl Executor {
                 return Ok(());
             }
 
+            // The entry is keyed by the run's sources value (the compile's,
+            // the lock's, or the up-to-date reading). One taken before the
+            // sources changed would restore outputs of other sources and
+            // record them as up to date: skip the cache then.
+            let keyed = !checker.known_source_value().is_empty();
+            let stale_key = keyed && !checker.source_value_is_the_reading();
+            if cache_active && !self.dry && stale_key {
+                self.logger().borrow_mut().verbose_errf(
+                    Color::Yellow,
+                    &format!(
+                        "task: cache for {:?} not restored: its sources changed since its cache key was taken\n",
+                        t.name()
+                    ),
+                );
+            }
             // Try the remote cache before running deps.
             if cache_active
                 && !self.dry
-                && !source_hash.is_empty()
+                && keyed
+                && !stale_key
                 && let Some(url) = cache_url
             {
                 {
@@ -1140,8 +1177,26 @@ impl Executor {
                 let _ = checker.on_error();
             } else if let Some(post) = post {
                 let recorded = checker.publish(post)?;
+                // Without an up-to-date check (`--force`) nothing chose the
+                // run's sources value yet: the reading just published is it.
+                if let Some(recorded) = &recorded {
+                    checker.adopt_source_value(&recorded.sources);
+                }
+                // Saved only under the key of what it was built from.
+                let built_from_key = recorded
+                    .as_ref()
+                    .is_some_and(|r| r.sources == checker.known_source_value());
+                if cache_active && recorded.is_some() && !built_from_key {
+                    self.logger().borrow_mut().verbose_errf(
+                        Color::Yellow,
+                        &format!(
+                            "task: cache for {:?} not saved: its sources changed since its cache key was taken\n",
+                            t.name()
+                        ),
+                    );
+                }
                 if cache_active
-                    && !source_hash.is_empty()
+                    && built_from_key
                     && let Some(url) = cache_url
                     && let Some(recorded) = recorded
                 {
@@ -1149,6 +1204,7 @@ impl Executor {
                     cache::cache_save(
                         url,
                         t,
+                        checker.known_source_value(),
                         &recorded,
                         std::path::Path::new(&self.dir),
                         &cache::Guarded {
@@ -1969,6 +2025,12 @@ impl Executor {
         url
     }
 
+    /// Whether a run of `t` takes the build-once lock: it has sources and
+    /// generates, and the run is not dry.
+    fn takes_lock(&self, t: &Task) -> bool {
+        !self.dry && !t.sources.is_empty() && !t.generates.is_empty()
+    }
+
     /// Acquires the build-once lock for a task with both sources and generates,
     /// covering deps, the fingerprint check, execution, and the up-to-date
     /// write. Uses the configured `cache.lock` when set, otherwise a local
@@ -1983,7 +2045,7 @@ impl Executor {
         cache_checksum: &str,
         _cache_url: Option<&CacheUrl>,
     ) -> Result<Option<cache::Guard>, ExecutorError> {
-        if self.dry || t.sources.is_empty() || t.generates.is_empty() {
+        if !self.takes_lock(t) {
             return Ok(None);
         }
         let lock_name = if cache_checksum.is_empty() {

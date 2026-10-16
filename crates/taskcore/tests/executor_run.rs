@@ -485,3 +485,50 @@ tasks:
         "import should restore the generated file"
     );
 }
+
+/// An up-to-date run reads a task's sources once, twice when it takes the
+/// build-once lock (with `generates`), and never just to compile: not for the
+/// quick compile, nor for a task a `task:` reference reaches. A task without
+/// `generates` takes no lock and adopts its up-to-date reading.
+#[test]
+fn up_to_date_runs_read_sources_once_or_twice() {
+    taskcore::fingerprint::passes::record();
+    let dir = temp_dir();
+    for sub in ["plain", "built", "leaf", "top"] {
+        fs::create_dir_all(dir.join(sub)).unwrap();
+        fs::write(dir.join(sub).join("s.txt"), sub).unwrap();
+    }
+    let d = write_taskfile(
+        &dir,
+        r#"
+version: '3'
+tasks:
+  plain:
+    dir: plain
+    sources: [s.txt]
+    cmds: ['true']
+  built:
+    dir: built
+    sources: [s.txt]
+    generates: [o.txt]
+    cmds: ['touch o.txt']
+  leaf:
+    dir: leaf
+    sources: [s.txt]
+  top:
+    dir: top
+    sources: [{task: leaf}, s.txt]
+    cmds: ['true']
+"#,
+    );
+    let tasks = ["plain", "built", "top"];
+    block_on(setup_and_run(&d, &tasks)).unwrap();
+    let count = |sub: &str| taskcore::fingerprint::passes::of(&format!("{d}/{sub}"));
+    let before: Vec<u64> = ["plain", "built", "leaf", "top"].map(count).to_vec();
+    block_on(setup_and_run(&d, &tasks)).unwrap();
+    let after: Vec<u64> = ["plain", "built", "leaf", "top"].map(count).to_vec();
+    let passes: Vec<u64> = after.iter().zip(&before).map(|(a, b)| a - b).collect();
+    assert_eq!(passes, [1, 2, 0, 1], "plain, built, leaf, top");
+    // Up to date: none ran again.
+    assert!(fs::metadata(dir.join("built/o.txt")).is_ok());
+}

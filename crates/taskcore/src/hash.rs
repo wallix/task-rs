@@ -53,14 +53,25 @@ pub fn name(task: &ast::Task) -> Result<String, HashError> {
 /// are still declarations. Returns empty when `source_hash` is empty: a task
 /// without sources has no cache identity.
 pub fn cache_checksum(task: &ast::Task, source_hash: &str) -> Result<String, HashError> {
-    if source_hash.is_empty() {
-        return Ok(String::new());
-    }
+    Ok(join_cache_checksum(source_hash, &cache_vars_digest(task)?))
+}
+
+/// The digest [`cache_checksum`] appends to the source hash, computed alone so
+/// the source hash can come later.
+pub fn cache_vars_digest(task: &ast::Task) -> Result<String, HashError> {
     let mut enc = Encoder::new();
     encode_vars_flat(&mut enc, task.vars.as_ref())?;
     encode_vars_flat(&mut enc, task.include_vars.as_ref())?;
-    let hex = format!("{:016x}", XxHash3_64::oneshot(&enc.finish()));
-    Ok(format!("{source_hash}-{hex}"))
+    Ok(format!("{:016x}", XxHash3_64::oneshot(&enc.finish())))
+}
+
+/// [`cache_checksum`] from its two parts; empty without a source hash.
+pub fn join_cache_checksum(source_hash: &str, vars_digest: &str) -> String {
+    if source_hash.is_empty() {
+        String::new()
+    } else {
+        format!("{source_hash}-{vars_digest}")
+    }
 }
 
 /// The key of a call a `task:` or `from:` reference reaches: the task it

@@ -15,6 +15,40 @@ pub use checksum::{Datum, Snapshot, checksum_files};
 pub use glob::{CacheMatcher, cache_globs, glob, globs};
 pub use sources_checksum::{ChecksumChecker, PostRun, Recorded, TaskStatus};
 
+/// Counts readings of task sources, per task directory, once [`record`] is
+/// called: a hook for tests asserting how many passes a run makes. Off, it
+/// costs one atomic load per reading.
+#[doc(hidden)]
+pub mod passes {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static COUNTS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+    /// Starts counting.
+    pub fn record() {
+        ON.store(true, Ordering::Relaxed);
+    }
+
+    /// The readings so far of sources of tasks in `dir`.
+    pub fn of(dir: &str) -> u64 {
+        COUNTS
+            .lock()
+            .map_or(0, |c| c.get(dir).copied().unwrap_or(0))
+    }
+
+    pub(crate) fn note(dir: &str) {
+        if ON.load(Ordering::Relaxed)
+            && let Ok(mut c) = COUNTS.lock()
+        {
+            let n = c.entry(dir.to_string()).or_insert(0);
+            *n = n.saturating_add(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod testutil {
     use std::fs;

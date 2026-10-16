@@ -1049,6 +1049,36 @@ fn reference_fingerprints_are_stable() {
     }
 }
 
+/// Consumers outside the task's own fields still see CHECKSUM: `--summary`
+/// prints the compiled vars, and group markers render against them.
+#[test]
+fn checksum_reaches_summary_and_group_markers() {
+    let dir = scratch(
+        "version: '3'\noutput:\n  group:\n    begin: 'B={{.CHECKSUM}}'\ntasks:\n  build:\n    sources: [s.txt]\n    cmds: [echo hi]\n",
+    );
+    write(&dir, "s.txt", "s");
+    let summary = run(&dir, &["--summary", "build"]);
+    assert!(summary.ok(), "{}", summary.combined());
+    let line = summary
+        .stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("CHECKSUM: "))
+        .unwrap_or_else(|| panic!("{}", summary.combined()))
+        .to_string();
+    let value = line
+        .trim()
+        .trim_start_matches("CHECKSUM: ")
+        .trim_matches('"')
+        .to_string();
+    assert_eq!(value.len(), 32, "{line}");
+    let out = run(&dir, &["build"]);
+    assert!(
+        out.stdout.contains(&format!("B={value}\n")),
+        "{}",
+        out.combined()
+    );
+}
+
 /// A source that is neither a regular file nor a symlink fails the task,
 /// naming it, instead of blocking on it.
 #[cfg(unix)]
