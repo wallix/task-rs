@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Fingerprinting walks each directory once and takes file types from the
+  listing,** so hashing a regular file costs one `stat` instead of about four.
+  A source or generated file removed after its directory was listed now fails
+  the task, naming it, where it could be left out before, and so does one
+  whose type changed in between (a file replaced by a symlink, say). On
+  Windows that check opens reparse points without following them; it is
+  type-checked there but not run-tested, and reading files behind
+  filter-driver reparse points (deduplicated files, OneDrive placeholders) is
+  unverified.
 - **A cache restore cancelled before it is verified is undone,** and so is one
   that cannot durably mark itself kept: the task then runs normally, and an
   `--import-cache` fails. Recovering a restore cut short by a crash puts back

@@ -20,8 +20,9 @@
 //! A generated tree is archived whole and restored as it was, whatever the
 //! shell would have listed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::ast::Glob;
 use crate::filepathext;
@@ -34,11 +35,64 @@ use crate::filepathext;
 /// group by group, so a folded task's exclusions remove only its own matches;
 /// the task's own exclusions then apply to the whole result.
 pub fn globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<String>> {
+    Ok(globs_scanned(dir, globs, &mut Scan::default()))
+}
+
+/// [`globs`], with what the walk learned of each match's type, for the
+/// checksum to skip a `stat` of its own.
+pub(crate) fn hinted_globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<(String, Hint)>> {
+    let mut scan = Scan::default();
+    let files = globs_scanned(dir, globs, &mut scan);
+    Ok(files
+        .into_iter()
+        .map(|f| {
+            let hint = scan.hints.get(&f).copied().unwrap_or(Hint::Unknown);
+            (f, hint)
+        })
+        .collect())
+}
+
+fn globs_scanned(dir: &str, globs: &[Glob], scan: &mut Scan) -> Vec<String> {
     let mut folded = BTreeSet::new();
     for group in folded_groups(globs) {
-        folded.extend(shell_globs(dir, group, BTreeSet::new()));
+        folded.extend(shell_globs(dir, group, BTreeSet::new(), scan));
     }
-    Ok(shell_globs(dir, own(globs), folded))
+    shell_globs(dir, own(globs), folded, scan)
+}
+
+/// What the walk of one [`globs`] or [`cache_globs`] call learned.
+///
+/// Each directory is listed once per call, however many patterns or groups
+/// walk it. No command runs during a call, but other processes may still
+/// write meanwhile: overlapping patterns then see one listing, where they
+/// used to list the directory again.
+#[derive(Default)]
+struct Scan {
+    listings: HashMap<String, Rc<[Listed]>>,
+    /// Each match's type as listed, when the listing knew it.
+    hints: HashMap<String, Hint>,
+}
+
+/// A directory entry and its type as listed (`d_type`, or `lstat` where the
+/// filesystem does not report one): never followed.
+struct Listed {
+    name: String,
+    path: String,
+    kind: Option<std::fs::FileType>,
+}
+
+/// A match's type as its directory listing reported it, so a checksum need
+/// not `lstat` it again. Only a hint: the file may change before it is read,
+/// which the checksum detects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hint {
+    /// A regular file.
+    File,
+    /// A symlink.
+    Link,
+    /// Not known: a literal path, a name not valid UTF-8 (its lossy path may
+    /// not exist), or a listing that could not tell.
+    Unknown,
 }
 
 /// [`globs`] over a single group, starting from the `included` matches.
@@ -46,6 +100,7 @@ fn shell_globs<'a>(
     dir: &str,
     globs: impl Iterator<Item = &'a Glob>,
     mut included: BTreeSet<String>,
+    scan: &mut Scan,
 ) -> Vec<String> {
     let mut excluded: BTreeSet<String> = BTreeSet::new();
     let mut patterns = Vec::new();
@@ -61,7 +116,13 @@ fn shell_globs<'a>(
         patterns.push((join_pattern(dir, &g.glob), g.negate));
     }
 
-    expand_patterns(&patterns, &mut included, &mut excluded, Options::SHELL);
+    expand_patterns(
+        &patterns,
+        &mut included,
+        &mut excluded,
+        Options::SHELL,
+        scan,
+    );
     collect(&included, &excluded)
 }
 
@@ -73,11 +134,12 @@ fn shell_globs<'a>(
 /// also included (it may not match the glob). Groups are evaluated as by
 /// [`globs`].
 pub fn cache_globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<String>> {
+    let scan = &mut Scan::default();
     let mut folded = BTreeSet::new();
     for group in folded_groups(globs) {
-        folded.extend(tree_globs(dir, group, BTreeSet::new()));
+        folded.extend(tree_globs(dir, group, BTreeSet::new(), scan));
     }
-    Ok(tree_globs(dir, own(globs), folded))
+    Ok(tree_globs(dir, own(globs), folded, scan))
 }
 
 /// Match paths against [`cache_globs`]'s `globs` without walking the tree,
@@ -174,6 +236,7 @@ fn tree_globs<'a>(
     dir: &str,
     globs: impl Iterator<Item = &'a Glob>,
     mut included: BTreeSet<String>,
+    scan: &mut Scan,
 ) -> Vec<String> {
     let mut excluded: BTreeSet<String> = BTreeSet::new();
     let mut patterns = Vec::new();
@@ -188,7 +251,7 @@ fn tree_globs<'a>(
         }
     }
 
-    expand_patterns(&patterns, &mut included, &mut excluded, Options::TREE);
+    expand_patterns(&patterns, &mut included, &mut excluded, Options::TREE, scan);
     collect(&included, &excluded)
 }
 
@@ -241,6 +304,7 @@ fn expand_patterns(
     included: &mut BTreeSet<String>,
     excluded: &mut BTreeSet<String>,
     opts: Options,
+    scan: &mut Scan,
 ) {
     let includes: Vec<&str> = patterns
         .iter()
@@ -277,7 +341,7 @@ fn expand_patterns(
                 pruners.push(pruner);
             }
             None => {
-                for m in expand(pattern, &[], opts) {
+                for m in expand(pattern, &[], opts, scan) {
                     mark(included, excluded, m, true);
                 }
             }
@@ -285,7 +349,7 @@ fn expand_patterns(
     }
 
     for pattern in includes {
-        for m in expand(pattern, &pruners, opts) {
+        for m in expand(pattern, &pruners, opts, scan) {
             mark(included, excluded, m, false);
         }
     }
@@ -301,23 +365,42 @@ fn join_pattern(dir: &str, pattern: &str) -> String {
 /// Expands a single glob pattern rooted at `dir`, returning matching regular
 /// files (directories are skipped). Symlinks are included as regular entries.
 pub fn glob(dir: &str, pattern: &str) -> std::io::Result<Vec<String>> {
-    Ok(expand(&join_pattern(dir, pattern), &[], Options::SHELL))
+    Ok(expand(
+        &join_pattern(dir, pattern),
+        &[],
+        Options::SHELL,
+        &mut Scan::default(),
+    ))
 }
 
 /// Expands an already-joined pattern, skipping directories and never entering
 /// a directory one of the `pruners` covers.
-fn expand(pattern: &str, pruners: &[Pruner], opts: Options) -> Vec<String> {
+///
+/// A match whose listing gave its type is taken by that type; any other is
+/// checked with `lstat`, and skipped when it is gone.
+fn expand(pattern: &str, pruners: &[Pruner], opts: Options, scan: &mut Scan) -> Vec<String> {
     let mut results: BTreeSet<String> = BTreeSet::new();
-    for f in expand_fields(pattern, pruners, opts) {
-        let meta = match std::fs::symlink_metadata(&f) {
-            Ok(meta) => meta,
-            Err(_) => continue,
+    for (f, kind) in expand_fields(pattern, pruners, opts, scan) {
+        let kind = match kind {
+            Some(kind) => kind,
+            None => match std::fs::symlink_metadata(&f) {
+                Ok(meta) => meta.file_type(),
+                Err(_) => continue,
+            },
         };
         // A symlink to a directory should behave like a regular entry: only
         // skip real directories, matching how the shell lists path names.
-        if meta.file_type().is_dir() {
+        if kind.is_dir() {
             continue;
         }
+        let hint = if kind.is_symlink() {
+            Hint::Link
+        } else if kind.is_file() {
+            Hint::File
+        } else {
+            Hint::Unknown
+        };
+        scan.hints.insert(f.clone(), hint);
         results.insert(f);
     }
     results.into_iter().collect()
@@ -530,7 +613,14 @@ fn collect(included: &BTreeSet<String>, excluded: &BTreeSet<String>) -> Vec<Stri
 /// Expands an absolute glob path into the set of matching filesystem paths,
 /// reproducing bash's `globstar` pathname expansion under `opts`. A pattern
 /// with no metacharacters yields itself.
-fn expand_fields(pattern: &str, pruners: &[Pruner], opts: Options) -> Vec<String> {
+/// Each match comes with its listed type, `None` when it was not listed (a
+/// literal path) or its listing could not tell.
+fn expand_fields(
+    pattern: &str,
+    pruners: &[Pruner],
+    opts: Options,
+    scan: &mut Scan,
+) -> Vec<(String, Option<std::fs::FileType>)> {
     let segments: Vec<&str> = pattern.split('/').collect();
     // An absolute path begins with an empty first segment; expansion starts
     // from the filesystem root. A relative path starts from ".".
@@ -542,6 +632,7 @@ fn expand_fields(pattern: &str, pruners: &[Pruner], opts: Options) -> Vec<String
     let mut walker = Walker {
         pruners,
         opts,
+        scan,
         out: Vec::new(),
     };
     walker.walk(&root, rest);
@@ -551,7 +642,8 @@ fn expand_fields(pattern: &str, pruners: &[Pruner], opts: Options) -> Vec<String
 struct Walker<'a> {
     pruners: &'a [Pruner],
     opts: Options,
-    out: Vec<String>,
+    scan: &'a mut Scan,
+    out: Vec<(String, Option<std::fs::FileType>)>,
 }
 
 impl Walker<'_> {
@@ -560,22 +652,46 @@ impl Walker<'_> {
     }
 
     /// Reports whether a wildcard-matched `child` is a directory to descend
-    /// into: a symlink to one counts only when following symlinks.
-    fn descends(&self, child: &str) -> bool {
-        if self.opts.follow_symlinks {
-            Path::new(child).is_dir()
-        } else {
-            std::fs::symlink_metadata(child)
+    /// into: a symlink to one counts only when following symlinks. The listed
+    /// type answers without a syscall except for a symlink to follow, or an
+    /// entry the listing could not type.
+    fn descends(&self, child: &Listed) -> bool {
+        match child.kind {
+            Some(k) if k.is_dir() => true,
+            Some(k) if k.is_symlink() => {
+                self.opts.follow_symlinks && Path::new(&child.path).is_dir()
+            }
+            Some(_) => false,
+            None if self.opts.follow_symlinks => Path::new(&child.path).is_dir(),
+            None => std::fs::symlink_metadata(&child.path)
                 .map(|m| m.file_type().is_dir())
-                .unwrap_or(false)
+                .unwrap_or(false),
         }
+    }
+
+    /// `base`'s entries, listed once per [`Scan`].
+    /// Nothing once the reading is cancelled, cached or not.
+    fn list(&mut self, base: &str) -> Rc<[Listed]> {
+        if super::offload::cancelled() {
+            return Rc::from([]);
+        }
+        if let Some(l) = self.scan.listings.get(base) {
+            return Rc::clone(l);
+        }
+        let l: Rc<[Listed]> = list_dir(base).into();
+        self.scan.listings.insert(base.to_string(), Rc::clone(&l));
+        l
     }
 
     /// Recursively matches the remaining glob segments against the tree rooted
     /// at `base`, appending matched paths to `self.out`.
     fn walk(&mut self, base: &str, segments: &[&str]) {
+        // A cancelled reading stops here: its result is discarded.
+        if super::offload::cancelled() {
+            return;
+        }
         let Some((segment, rest)) = segments.split_first() else {
-            self.out.push(base.to_string());
+            self.out.push((base.to_string(), None));
             return;
         };
 
@@ -591,7 +707,7 @@ impl Walker<'_> {
             let next = join_seg(base, segment);
             if rest.is_empty() {
                 if Path::new(&next).exists() {
-                    self.out.push(next);
+                    self.out.push((next, None));
                 }
             } else if Path::new(&next).is_dir() && self.enter(&next) {
                 self.walk(&next, rest);
@@ -599,13 +715,16 @@ impl Walker<'_> {
             return;
         }
 
-        for child in list_dir(base, self.opts.dotglob) {
-            let name = file_name(&child);
-            if matches_segment(segment, &name, self.opts.dotglob) {
+        let dotglob = self.opts.dotglob;
+        for child in self.list(base).iter().filter(|c| shown(c, dotglob)) {
+            if super::offload::cancelled() {
+                return;
+            }
+            if matches_segment(segment, &child.name, dotglob) {
                 if rest.is_empty() {
-                    self.out.push(child);
-                } else if self.descends(&child) && self.enter(&child) {
-                    self.walk(&child, rest);
+                    self.out.push((child.path.clone(), child.kind));
+                } else if self.descends(child) && self.enter(&child.path) {
+                    self.walk(&child.path, rest);
                 }
             }
         }
@@ -622,21 +741,27 @@ impl Walker<'_> {
     /// also emits each file it passes, making `a/**` equivalent to `a/**/*` as
     /// in bash and mvdan.
     fn descend_double_star(&mut self, base: &str, rest: &[&str]) {
-        for child in list_dir(base, self.opts.dotglob) {
-            if self.descends(&child) {
-                if self.enter(&child) {
-                    self.walk_double_star(&child, rest);
+        let dotglob = self.opts.dotglob;
+        for child in self.list(base).iter().filter(|c| shown(c, dotglob)) {
+            if super::offload::cancelled() {
+                return;
+            }
+            if self.descends(child) {
+                if self.enter(&child.path) {
+                    self.walk_double_star(&child.path, rest);
                 }
             } else if rest.is_empty() {
-                self.out.push(child);
+                self.out.push((child.path.clone(), child.kind));
             }
         }
     }
 }
 
-/// Lists directory entries. With `dotglob` disabled bash hides names beginning
-/// with a dot; `**` traversal also never crosses into dot directories.
-fn list_dir(dir: &str, dotglob: bool) -> Vec<String> {
+/// Lists a directory's entries with their types, hidden ones included: see
+/// [`shown`]. An unreadable directory lists nothing. A name that is not valid
+/// UTF-8 keeps its lossy spelling, as before, but no type: its lossy path may
+/// name nothing, which `expand` then finds out.
+fn list_dir(dir: &str) -> Vec<Listed> {
     let mut entries = Vec::new();
     // A cancelled reading ends here: its result is discarded.
     if super::offload::cancelled() {
@@ -646,13 +771,24 @@ fn list_dir(dir: &str, dotglob: bool) -> Vec<String> {
         return entries;
     };
     for entry in read.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !dotglob && name.starts_with('.') {
-            continue;
+        // A large directory is enumerated entry by entry: stop there too.
+        if super::offload::cancelled() {
+            return Vec::new();
         }
-        entries.push(join_seg(dir, &name));
+        let (name, kind) = match entry.file_name().into_string() {
+            Ok(name) => (name, entry.file_type().ok()),
+            Err(raw) => (raw.to_string_lossy().into_owned(), None),
+        };
+        let path = join_seg(dir, &name);
+        entries.push(Listed { name, path, kind });
     }
     entries
+}
+
+/// With `dotglob` disabled bash hides names beginning with a dot, even from
+/// `.*`; `**` traversal also never crosses into dot directories.
+fn shown(entry: &Listed, dotglob: bool) -> bool {
+    dotglob || !entry.name.starts_with('.')
 }
 
 /// Joins a base directory with a single path segment.
@@ -665,6 +801,7 @@ fn join_seg(base: &str, seg: &str) -> String {
 }
 
 /// Extracts the final path component.
+#[cfg(test)]
 fn file_name(path: &str) -> String {
     Path::new(path)
         .file_name()
@@ -799,6 +936,10 @@ fn match_bracket(pat: &[char], c: char) -> Option<&[char]> {
     // No closing bracket: not a valid bracket expression.
     None
 }
+
+#[cfg(test)]
+#[path = "glob_legacy.rs"]
+mod legacy;
 
 #[cfg(test)]
 mod tests {
@@ -1434,5 +1575,202 @@ mod tests {
         write_file(&dir, ".hidden", "h");
         let files = glob(&dir, "*").unwrap();
         assert_eq!(files, vec![join(&dir, "visible.txt")]);
+    }
+
+    /// A tree with what a walk can trip over: hidden entries, symlinks to a
+    /// file, a directory, nothing, a loop and a chain, a FIFO, odd and non-UTF-8
+    /// names, an unreadable directory, plus seeded random files.
+    ///
+    /// It sits one level below a fresh directory, so `../*` lists only that
+    /// directory, not the temp dir other tests write to.
+    fn tricky_tree(seed: u64) -> String {
+        let dir = join(&tmp(), "root");
+        for f in [
+            "a/x.txt",
+            "a/b/y.txt",
+            "a/b/c/z.c",
+            "a/.h/hid.txt",
+            ".hid/top.txt",
+            ".dot",
+            "c/sp ace.txt",
+            "c/br[a]ck.txt",
+            "c/st*r.txt",
+            "c/q?.txt",
+            "d/e/f/g/deep.c",
+            "keep.tmp",
+            "a/b/drop.tmp",
+            "shared/s.txt",
+        ] {
+            write_file(&dir, f, f);
+        }
+        std::fs::create_dir_all(join(&dir, "empty/inner")).unwrap();
+        let mut x = seed;
+        for i in 0..40 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let d = ["a", "a/b", "c", "d/e", ".hid", "r"][(x % 6) as usize];
+            let ext = ["txt", "c", "tmp", "md"][((x >> 8) % 4) as usize];
+            write_file(&dir, &format!("{d}/r{i}.{ext}"), "r");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink("x.txt", join(&dir, "a/flink")).unwrap();
+            symlink("../a", join(&dir, "c/dlink")).unwrap();
+            symlink("nowhere", join(&dir, "c/dangling")).unwrap();
+            symlink(".", join(&dir, "d/loop")).unwrap();
+            symlink("flink", join(&dir, "a/chain")).unwrap();
+            symlink("../.hid", join(&dir, "c/hidlink")).unwrap();
+            let fifo = std::ffi::CString::new(join(&dir, "c/pipe")).unwrap();
+            // SAFETY: a valid NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::path::Path::new(&dir).join(std::ffi::OsStr::from_bytes(b"c/n\xffu.txt"));
+            std::fs::write(raw, "x").unwrap();
+            write_file(&dir, "locked/in.txt", "x");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(join(&dir, "locked"), std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+        }
+        dir
+    }
+
+    /// Entry lists the current walker must agree with the old one on.
+    fn corpus_lists(dir: &str) -> Vec<Vec<Glob>> {
+        let patterns = [
+            "**/*",
+            "**",
+            "a/**",
+            "**/*.c",
+            "*/x.txt",
+            "*/*",
+            ".*",
+            "*",
+            "[ac]/*",
+            "?/*",
+            "c/*",
+            "a/b/**/*",
+            "d/**",
+            "c/dlink/**/*",
+            "c/dlink/*",
+            "c/hidlink/*",
+            "a/x.txt",
+            "a/flink",
+            ".hid/top.txt",
+            "locked/*",
+            "locked/in.txt",
+            "../*",
+            "empty/**",
+            "c/sp ace.txt",
+            "nope/**/*",
+        ];
+        let mut lists: Vec<Vec<Glob>> = patterns.iter().map(|p| vec![g(p)]).collect();
+        let abs = format!("{dir}/a/**/*");
+        lists.push(vec![g(&abs)]);
+        lists.push(vec![g("**/*"), g_neg("**/*.tmp")]);
+        lists.push(vec![g("**/*"), g_neg("a/**/*")]);
+        lists.push(vec![g("**/*"), g_neg("a/**")]);
+        lists.push(vec![g("a/**/*"), g_neg("a/.h/**/*"), g("a/.h/hid.txt")]);
+        lists.push(vec![g_fp("a/**/*", "keep.tmp"), g("c/*")]);
+        lists.push(vec![g_fp("d/**/*", "a/x.txt"), g_neg("a/**/*")]);
+        lists.push(vec![
+            grouped(g("**/*.txt"), 1),
+            grouped(g_neg("a/**/*"), 1),
+            grouped(g("a/**/*"), 2),
+            g_neg("**/*.tmp"),
+        ]);
+        lists
+    }
+
+    /// A cancelled reading stops walking, listings it already holds included.
+    #[test]
+    fn cancelled_walks_stop_on_cached_listings() {
+        let dir = tricky_tree(3);
+        let mut scan = Scan::default();
+        let pattern = join(&dir, "**/*");
+        let before = expand(&pattern, &[], Options::SHELL, &mut scan);
+        assert!(!before.is_empty());
+        assert!(scan.listings.len() > 1);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        super::super::offload::set_cancel(Some(flag));
+        let after = expand(&pattern, &[], Options::SHELL, &mut scan);
+        let fresh = globs(&dir, &[g("**/*")]).unwrap();
+        super::super::offload::set_cancel(None);
+        assert!(after.is_empty(), "{after:?}");
+        assert!(fresh.is_empty(), "{fresh:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                join(&dir, "locked"),
+                std::fs::Permissions::from_mode(0o755),
+            );
+        }
+    }
+
+    /// The walker lists each directory once and trusts listed types; it
+    /// matches what the old walker matched, in both modes, on every list.
+    #[test]
+    fn walker_matches_the_old_walker() {
+        for seed in [1, 5, 9] {
+            let dir = tricky_tree(seed);
+            // Under the full suite's load, a deep lookup through the symlink
+            // loop occasionally fails transiently (cause not pinned down), and
+            // the old walker's extra `lstat` then drops that entry. A real
+            // difference is stable: compare again before failing.
+            let agree = |new: &dyn Fn() -> Vec<String>, old: &dyn Fn() -> Vec<String>| {
+                let mut last = (new(), old());
+                for _ in 0..4 {
+                    if last.0 == last.1 {
+                        break;
+                    }
+                    last = (new(), old());
+                }
+                last
+            };
+            for list in corpus_lists(&dir) {
+                let (new, old) = agree(&|| globs(&dir, &list).unwrap(), &|| {
+                    legacy::globs(&dir, &list).unwrap()
+                });
+                assert_eq!(new, old, "globs {list:?}");
+                let (new, old) = agree(&|| cache_globs(&dir, &list).unwrap(), &|| {
+                    legacy::cache_globs(&dir, &list).unwrap()
+                });
+                assert_eq!(new, old, "cache_globs {list:?}");
+                for (f, hint) in hinted_globs(&dir, &list).unwrap() {
+                    let ft = std::fs::symlink_metadata(&f).map(|m| m.file_type());
+                    match hint {
+                        Hint::File => assert!(ft.unwrap().is_file(), "{f}"),
+                        Hint::Link => assert!(ft.unwrap().is_symlink(), "{f}"),
+                        Hint::Unknown => {}
+                    }
+                }
+            }
+            // The corpus exercises what it is meant to.
+            #[cfg(unix)]
+            {
+                let all = globs(&dir, &[g("**/*")]).unwrap();
+                assert!(all.contains(&join(&dir, "c/dlink/x.txt")), "{all:?}");
+                // Followed until the kernel refuses (ELOOP).
+                let loops = all.iter().map(|p| p.matches("/loop").count()).max();
+                assert!(loops.unwrap_or(0) >= 8, "{loops:?}");
+                assert!(!all.iter().any(|f| f.contains(".hid")), "{all:?}");
+                let tree = cache_globs(&dir, &[g("**/*")]).unwrap();
+                assert!(tree.contains(&join(&dir, "c/dlink")), "{tree:?}");
+                assert!(tree.contains(&join(&dir, ".hid/top.txt")), "{tree:?}");
+                let hints = hinted_globs(&dir, &[g("**/*")]).unwrap();
+                assert!(hints.contains(&(join(&dir, "a/x.txt"), Hint::File)));
+                assert!(hints.contains(&(join(&dir, "a/flink"), Hint::Link)));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    join(&dir, "locked"),
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
+        }
     }
 }

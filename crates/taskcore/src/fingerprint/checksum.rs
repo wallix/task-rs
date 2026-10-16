@@ -18,6 +18,7 @@ use twox_hash::XxHash3_128;
 
 use crate::filepathext;
 
+use super::glob::Hint;
 use super::pool::{Workers, digest_all};
 
 /// Leads every checksum, so a future format cannot collide with this one.
@@ -138,25 +139,37 @@ pub(crate) struct Entry {
     pub key: String,
     /// The path to read.
     pub path: String,
+    /// Its type as the walk listed it.
+    pub hint: Hint,
 }
 
-/// Maps the glob results to entries keyed by path relative to `basedir`, sorted
-/// by key. Keys are cleaned lexically, so two results can share one (`a/./x`
-/// and `a/x`, or `link/../x` and `x`, which may be different files): each is
-/// still hashed, ordered by its joined path, rather than merged.
+/// [`hinted_entries`] for glob results without types.
+#[cfg(test)]
 pub(crate) fn entries(basedir: &str, files: &[String]) -> Vec<Entry> {
+    let hinted: Vec<(String, Hint)> = files.iter().map(|f| (f.clone(), Hint::Unknown)).collect();
+    hinted_entries(basedir, &hinted)
+}
+
+/// Maps the glob results, with their listed types, to entries keyed by path
+/// relative to `basedir`, sorted by key. Keys are cleaned lexically, so two
+/// results can share one (`a/./x` and `a/x`, or `link/../x` and `x`, which may
+/// be different files): each is still hashed, ordered by its joined path,
+/// rather than merged.
+pub(crate) fn hinted_entries(basedir: &str, files: &[(String, Hint)]) -> Vec<Entry> {
     let mut out: Vec<Entry> = files
         .iter()
-        .map(|f| match filepathext::rel_str(basedir, f) {
+        .map(|(f, hint)| match filepathext::rel_str(basedir, f) {
             Some(rel) => Entry {
                 tag: b'R',
                 key: separators(rel),
                 path: f.clone(),
+                hint: *hint,
             },
             None => Entry {
                 tag: b'A',
                 key: f.clone(),
                 path: f.clone(),
+                hint: *hint,
             },
         })
         .collect();
@@ -174,22 +187,37 @@ fn separators(key: String) -> String {
 }
 
 /// Digests one entry: a symlink's target, or a regular file's content. Any
-/// other kind is an error, as is a file that changes kind while being opened.
-/// Errors keep their kind and name the path.
-/// A set `cancel` stops it between reads.
+/// other kind is an error, and so is a change of kind since the walk listed
+/// it (`hint`) or since this `lstat`ed it. Errors keep their kind and name the
+/// path. A set `cancel` stops it between reads.
 pub(crate) fn digest(
     path: &str,
+    hint: Hint,
     buf: &mut [u8],
     cancel: Option<&AtomicBool>,
 ) -> std::io::Result<(Kind, u128)> {
-    digest_inner(Path::new(path), buf, cancel).map_err(|e| with_path(path, e))
+    digest_inner(Path::new(path), hint, buf, cancel).map_err(|e| with_path(path, e))
 }
 
 fn digest_inner(
     path: &Path,
+    hint: Hint,
     buf: &mut [u8],
     cancel: Option<&AtomicBool>,
 ) -> std::io::Result<(Kind, u128)> {
+    // The listing already typed it: no `lstat` of our own.
+    match hint {
+        Hint::File => return digest_file(path, buf, cancel),
+        Hint::Link => {
+            return match std::fs::read_link(path) {
+                Ok(target) => Ok((Kind::Link, XxHash3_128::oneshot(&os_bytes(&target)))),
+                // No longer a symlink.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(changed()),
+                Err(e) => Err(e),
+            };
+        }
+        Hint::Unknown => {}
+    }
     let meta = std::fs::symlink_metadata(path)?;
     let ft = meta.file_type();
     if ft.is_symlink() {
@@ -199,6 +227,15 @@ fn digest_inner(
     if !ft.is_file() {
         return Err(unsupported());
     }
+    digest_file(path, buf, cancel)
+}
+
+/// Digests a file known to be regular.
+fn digest_file(
+    path: &Path,
+    buf: &mut [u8],
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<(Kind, u128)> {
     let mut file = open_regular(path)?;
     let mut hasher = XxHash3_128::new();
     loop {
@@ -214,8 +251,8 @@ fn digest_inner(
     Ok((Kind::File, hasher.finish_128()))
 }
 
-/// Opens a file `lstat` reported as regular without following a link or
-/// blocking on a FIFO swapped in since, and checks it still is one.
+/// Opens a file known to be regular without following a link or blocking on
+/// a FIFO swapped in since, and checks it still is one: its one `fstat`.
 fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
@@ -224,11 +261,32 @@ fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
-    let file = opts.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(unsupported());
+    // Opens a reparse point (a symlink swapped in) itself, so the handle's
+    // metadata below sees a link, not its target. Type-checked, not run-tested
+    // on Windows; content behind filter-driver reparse points (deduplicated
+    // files, OneDrive placeholders) is unverified.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = match opts.open(path) {
+        Ok(file) => file,
+        // Replaced by a symlink.
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(changed()),
+        Err(e) => return Err(e),
+    };
+    let kind = file.metadata()?.file_type();
+    if kind.is_symlink() || !kind.is_file() {
+        return Err(changed());
     }
     Ok(file)
+}
+
+fn changed() -> std::io::Error {
+    std::io::Error::other("changed type while being fingerprinted")
 }
 
 fn unsupported() -> std::io::Error {
@@ -308,6 +366,15 @@ pub(crate) fn checksum_files_with(
     Ok(snapshot_files(basedir, files, data, workers)?.hash)
 }
 
+/// The checksum of glob results that carry their listed types.
+pub(crate) fn hinted_checksum(
+    basedir: &str,
+    files: &[(String, Hint)],
+    data: &[Datum],
+) -> std::io::Result<String> {
+    Ok(hinted_snapshot(basedir, files, data, Workers::Auto)?.hash)
+}
+
 /// A checksum and the digest of each entry it covers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
@@ -351,7 +418,18 @@ pub(crate) fn snapshot_files(
     data: &[Datum],
     workers: Workers,
 ) -> std::io::Result<Snapshot> {
-    let entries = entries(basedir, files);
+    let hinted: Vec<(String, Hint)> = files.iter().map(|f| (f.clone(), Hint::Unknown)).collect();
+    hinted_snapshot(basedir, &hinted, data, workers)
+}
+
+/// [`snapshot_files`] for glob results that carry their listed types.
+pub(crate) fn hinted_snapshot(
+    basedir: &str,
+    files: &[(String, Hint)],
+    data: &[Datum],
+    workers: Workers,
+) -> std::io::Result<Snapshot> {
+    let entries = hinted_entries(basedir, files);
     let digests = digest_all(&entries, workers)?;
     if super::offload::cancelled() {
         return Err(super::offload::interrupted());
@@ -585,6 +663,51 @@ mod tests {
         let after = snap(&["a", "b", "d"]);
         assert_eq!(before.changed(&after), ["b", "c", "d"]);
         assert!(before.changed(&before).is_empty());
+    }
+
+    /// A change of kind since the walk listed an entry fails, naming it.
+    #[cfg(unix)]
+    #[test]
+    fn kind_changes_since_the_listing_fail() {
+        let dir = tmp();
+        let path = join(&dir, "f");
+        let mut buf = vec![0u8; 16];
+        let err = |hint: Hint, buf: &mut [u8]| digest(&path, hint, buf, None).unwrap_err();
+        // Listed as a file, now a link.
+        std::os::unix::fs::symlink("t", &path).unwrap();
+        let e = err(Hint::File, &mut buf);
+        assert!(e.to_string().contains("changed type"), "{e}");
+        assert!(e.to_string().starts_with(&path), "{e}");
+        // Listed as a link, now a file.
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"x").unwrap();
+        assert!(
+            err(Hint::Link, &mut buf)
+                .to_string()
+                .contains("changed type")
+        );
+        // Listed as a file, now a FIFO: not blocked on.
+        fs::remove_file(&path).unwrap();
+        let c = std::ffi::CString::new(path.clone()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(
+            err(Hint::File, &mut buf)
+                .to_string()
+                .contains("changed type")
+        );
+        // Gone since: not found.
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            err(Hint::File, &mut buf).kind(),
+            std::io::ErrorKind::NotFound
+        );
+        // A hint that still holds digests as without one.
+        fs::write(&path, b"x").unwrap();
+        assert_eq!(
+            digest(&path, Hint::File, &mut buf, None).unwrap(),
+            digest(&path, Hint::Unknown, &mut buf, None).unwrap()
+        );
     }
 
     #[test]

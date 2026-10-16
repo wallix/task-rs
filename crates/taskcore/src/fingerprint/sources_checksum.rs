@@ -7,8 +7,8 @@ use serde::Serialize;
 use crate::ast::{Cmd, Glob, Task};
 use crate::filepathext;
 
-use super::checksum::{Datum, Snapshot, checksum_files, snapshot_files};
-use super::glob::{cache_globs, globs};
+use super::checksum::{Datum, Snapshot, hinted_checksum, hinted_snapshot};
+use super::glob::{cache_globs, globs, hinted_globs};
 use super::offload::off_thread;
 use super::pool::Workers;
 
@@ -90,13 +90,13 @@ const _: fn() = || {
 
 impl Spec {
     fn sources_snapshot(&self) -> std::io::Result<Snapshot> {
-        let files = globs(&self.dir, &self.sources)?;
-        snapshot_files(&self.dir, &files, &self.data, Workers::Auto)
+        let files = hinted_globs(&self.dir, &self.sources)?;
+        hinted_snapshot(&self.dir, &files, &self.data, Workers::Auto)
     }
 
     fn generates_checksum(&self) -> std::io::Result<String> {
-        let files = globs(&self.dir, &self.generates)?;
-        checksum_files(&self.dir, &files, &[])
+        let files = hinted_globs(&self.dir, &self.generates)?;
+        hinted_checksum(&self.dir, &files, &[])
     }
 
     /// The sources and the stored state compared at the up-to-date check.

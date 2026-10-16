@@ -83,7 +83,7 @@ pub(crate) fn digest_in(
             if i > first_err.load(Ordering::Relaxed) {
                 continue;
             }
-            let r = digest(&e.path, &mut buf, cancel);
+            let r = digest(&e.path, e.hint, &mut buf, cancel);
             if r.is_err() {
                 first_err.fetch_min(i, Ordering::Relaxed);
             }

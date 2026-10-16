@@ -35,6 +35,12 @@ pub(crate) fn cancelled() -> bool {
     })
 }
 
+/// Sets this thread's cancellation flag, as a job does, for tests.
+#[cfg(test)]
+pub(crate) fn set_cancel(flag: Option<Arc<AtomicBool>>) {
+    CANCEL.with(|c| *c.borrow_mut() = flag);
+}
+
 /// The error a cancelled reading ends with. Nobody awaits it.
 pub(crate) fn interrupted() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Interrupted, "fingerprinting cancelled")
