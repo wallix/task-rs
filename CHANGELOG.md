@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.9.0 - 2026-10-16
+
 - **A walk of `sources` or `generates` no longer leaves files out on an error.**
   It moves from directory to directory by handle, one name per lookup, so the
   symlinks along a path no longer add up to the kernel's limit (a single link
