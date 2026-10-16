@@ -469,7 +469,7 @@ fn cache_restore_refuses_files_outside_generates() {
         zip.start_file(name, SimpleFileOptions::default()).unwrap();
         zip.write_all(body.as_bytes()).unwrap();
     }
-    zip.set_comment(comment);
+    zip.set_comment(comment).unwrap();
     zip.finish().unwrap();
 
     let taskfile = std::fs::read_to_string(dir.join("Taskfile.yml")).unwrap();
@@ -542,7 +542,7 @@ tasks:
         zip.start_file("out/extra", SimpleFileOptions::default())
             .unwrap();
         zip.write_all(b"x").unwrap();
-        zip.set_comment(comment);
+        zip.set_comment(comment).unwrap();
         zip.finish().unwrap();
 
         std::fs::remove_dir_all(dir.join("out")).unwrap();
@@ -625,7 +625,7 @@ tasks:
         zip.start_file("out/keep.txt", SimpleFileOptions::default())
             .unwrap();
         zip.write_all(b"cached").unwrap();
-        zip.set_comment(comment);
+        zip.set_comment(comment).unwrap();
         zip.finish().unwrap();
 
         // A file of the user's own under the outputs, which the entry would

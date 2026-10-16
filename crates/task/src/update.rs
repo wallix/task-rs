@@ -1449,20 +1449,17 @@ mod tests {
     }
 
     /// A member that inflates past [`MAX_ASSET`] is refused while it is being
-    /// written, not by believing the size the archive claims: a zip's declared
-    /// uncompressed size is a header field, and the reader bounds only the
-    /// compressed stream, so the ceiling has to be on the bytes that land.
+    /// written, not by believing the size the archive claims: the ceiling is on
+    /// the bytes that land, whatever the header says.
     ///
     /// The body is zeros, which deflate and gzip both reduce to a few kilobytes —
     /// the archive under test is small, and only the extraction is large.
     #[test]
     fn an_archive_member_larger_than_the_cap_is_refused() {
-        // A zip that *lies*: it declares a kilobyte and inflates to more than the
-        // ceiling. This is the case a pre-check on the declared size cannot
-        // catch — the whole point of capping the bytes that land instead — so
-        // reverting `copy_member` to trusting the header makes this test fail
-        // rather than pass on a different message.
-        let archive = zip_lying_about_its_size(BIN, MAX_ASSET + 1, 1024);
+        // Declare the true size so the zip reader delivers every byte,
+        // leaving `copy_member`'s cap to stop the oversized write.
+        let declared = u32::try_from(MAX_ASSET + 1).unwrap();
+        let archive = zip_lying_about_its_size(BIN, MAX_ASSET + 1, declared);
         // The archive itself stays tiny; only the extraction is large.
         assert!(archive.len() < 512 * 1024, "{}", archive.len());
 
@@ -1474,6 +1471,18 @@ mod tests {
             err.contains(&format!("{BIN} member is larger than")),
             "{err}"
         );
+    }
+
+    /// A zip declaring a kilobyte but inflating past the ceiling is rejected
+    /// by the zip reader as soon as it exceeds the declared size, before the cap.
+    #[test]
+    fn a_zip_member_larger_than_it_declares_is_refused() {
+        let archive = zip_lying_about_its_size(BIN, MAX_ASSET + 1, 1024);
+        let err = format!(
+            "{:#}",
+            extracted(&archive, "lying-member").expect_err("must not extract")
+        );
+        assert!(err.contains("declared uncompressed size"), "{err}");
     }
 
     /// A tar walk that would spend the gzip ratio skipping members before it
@@ -1509,8 +1518,8 @@ mod tests {
     /// while its headers claim `declared`.
     ///
     /// Hand-built rather than through `ZipWriter`, which always records the true
-    /// size: a reader that believes the header is exactly what is under test. The
-    /// CRC is left zero — nothing here reaches the point where it is checked.
+    /// size. The CRC is left zero — nothing here reaches the point where it is
+    /// checked.
     fn zip_lying_about_its_size(name: &str, real: u64, declared: u32) -> Vec<u8> {
         // Written in chunks so the uncompressed body is never held in memory.
         let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());

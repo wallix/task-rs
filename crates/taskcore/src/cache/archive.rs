@@ -11,8 +11,8 @@ use ocicas::restore::{
     DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, MAX_LINK_TARGET, MODE_MASK, Pending, Resolution, Tree,
     Written,
 };
-use zip::write::{FileOptions, SimpleFileOptions};
-use zip::{CompressionMethod, ZipArchive, ZipWriter};
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, System, ZipArchive, ZipWriter};
 
 use super::error::CacheError;
 
@@ -63,19 +63,18 @@ fn add_file_to_zip<W: Write + std::io::Seek>(
     })?;
     let name = rel.to_string_lossy().replace('\\', "/");
 
-    let mode = perm_bits(&meta);
-    let is_symlink = meta.file_type().is_symlink();
+    // Unix whatever the host: a reader takes the mode bits only from a Unix
+    // entry, and a cache written on Windows may be restored on Linux.
+    let opts = SimpleFileOptions::default()
+        .system(System::Unix)
+        .unix_permissions(perm_bits(&meta));
 
-    if is_symlink {
+    if meta.file_type().is_symlink() {
         let target = fs::read_link(file_path)?;
-        let opts: FileOptions<'_, ()> = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Stored)
-            .unix_permissions(mode);
+        let opts = opts.compression_method(CompressionMethod::Stored);
         zw.add_symlink(name, target.to_string_lossy(), opts)?;
     } else {
-        let opts: FileOptions<'_, ()> = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Deflated)
-            .unix_permissions(mode);
+        let opts = opts.compression_method(CompressionMethod::Deflated);
         zw.start_file(name, opts)?;
         let data = fs::read(file_path)?;
         zw.write_all(&data)?;
@@ -98,7 +97,7 @@ pub fn write_archive(
         let path = resolve(dir, f);
         add_file_to_zip(&mut zw, dir, &path)?;
     }
-    zw.set_comment(cache_comment(&meta.task, &meta.sources, &meta.generates));
+    zw.set_comment(cache_comment(&meta.task, &meta.sources, &meta.generates))?;
     zw.finish()?;
     Ok(())
 }
@@ -333,7 +332,7 @@ fn plan<R: Read + std::io::Seek>(
     let mut set = BTreeMap::new();
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
-        let name = entry.name().to_string();
+        let name = entry.name()?.into_owned();
         let kind = if entry.is_dir() {
             Kind::Dir
         } else if entry.is_symlink() {
@@ -506,7 +505,9 @@ pub fn archive_matches(base_dir: &Path, zip_path: &Path, files: &[String]) -> bo
         let Ok(entry) = archive.by_index(i) else {
             return false;
         };
-        let name = entry.name().to_string();
+        let Ok(name) = entry.name().map(std::borrow::Cow::into_owned) else {
+            return false;
+        };
         let (is_symlink, size) = (entry.is_symlink(), entry.size());
         // Only a name extraction would accept can match a file under base_dir.
         let Ok(parts) = entry_components(&name) else {
@@ -643,7 +644,7 @@ mod tests {
     fn build_with_comment(comment: &str) -> Vec<u8> {
         let mut zw = ZipWriter::new(Cursor::new(Vec::new()));
         if !comment.is_empty() {
-            zw.set_comment(comment.to_string());
+            zw.set_comment(comment.to_string()).unwrap();
         }
         zw.finish().unwrap().into_inner()
     }
@@ -1138,7 +1139,7 @@ mod tests {
         let dst = tempdir();
         let bytes = zip_bytes(|zw| {
             add_file(zw, "out", b"a");
-            zw.set_comment(cache_comment("other", "s", "g"));
+            zw.set_comment(cache_comment("other", "s", "g")).unwrap();
         });
         let check = |m: &CacheMeta| {
             if m.task == "build" {
@@ -1215,6 +1216,28 @@ mod tests {
         let dst = tempdir();
         let mut bytes = zip_bytes(|zw| add_file(zw, "cafX", b"x"));
         patch_name(&mut bytes, b"cafX", b"caf\x82");
+        extract_bytes(&bytes, &dst).unwrap();
+        assert_eq!(fs::read(dst.join("caf\u{e9}")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn extract_reads_an_unflagged_utf8_name_as_utf8() {
+        // Valid UTF-8 without the UTF-8 flag, as some writers produce it: read
+        // as UTF-8. zip 2 read it as CP437 (`cafÃ©`); Go and this crate's
+        // writer flag every non-ASCII name, so their archives are unaffected.
+        let dst = tempdir();
+        let mut bytes = zip_bytes(|zw| add_file(zw, "caf\u{e9}", b"x"));
+        let cdh = central_headers(&bytes)[0];
+        let mut local = 0;
+        patch_u32(&mut bytes, cdh + 42, |off| {
+            local = off as usize;
+            off
+        });
+        for flags in [cdh + 8, local + 6] {
+            let flag = u16::from_le_bytes([bytes[flags], bytes[flags + 1]]);
+            assert_ne!(flag & 0x0800, 0, "the writer flags a UTF-8 name");
+            bytes[flags..flags + 2].copy_from_slice(&(flag & !0x0800).to_le_bytes());
+        }
         extract_bytes(&bytes, &dst).unwrap();
         assert_eq!(fs::read(dst.join("caf\u{e9}")).unwrap(), b"x");
     }

@@ -60,8 +60,12 @@ minijinja = { version = "2", features = ["custom_syntax"] }
 semver = "1"
 notify = "8"
 # Zip archive format for the classic (non-OCI) remote build cache, and the
-# Windows release archive `task --update` installs from. No stdlib zip.
-zip = "2"
+# Windows release archive `task --update` installs from. No stdlib zip. Only
+# Deflate and Stored are ever written or expected: the defaults' other codecs
+# would add C libraries to the musl-static build. `deflate-flate2` selects no
+# flate2 backend, so each crate using zip also depends on flate2 below.
+# `time` stamps written entries with the current time, as before.
+zip = { version = "9", default-features = false, features = ["deflate-flate2", "time"] }
 # Directory-handle-relative filesystem operations confine cache extraction and
 # checksum cleanup after untrusted cache imports, including on Windows; std has
 # no such API.

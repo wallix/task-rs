@@ -21,6 +21,10 @@ itoa = { workspace = true }
 indexmap = { workspace = true }
 twox-hash = { workspace = true }
 zip = { workspace = true }
+# Not used directly: zip's `deflate-flate2` selects no flate2 backend, and only
+# this picks the pure-Rust one (otherwise flate2 fails to build on its own, as
+# it does on macOS and Windows where no other dependency enables it).
+flate2 = { workspace = true }
 cap-primitives = { workspace = true }
 regex = { workspace = true }
 redis = { workspace = true }
