@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::chunker::{AVG_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::error::{Error, Result};
 use crate::index::{ChunkRef, FileEntry, Index, ZSTD_LEVEL, safe_rel_path, zstd_decode_bounded};
-use crate::restore::{self, Tree};
+use crate::restore::{self, Tree, Written};
 
 /// Concatenate the given files (slash-separated paths relative to `base_dir`,
 /// duplicates ignored) into the content stream, chunk it, and emit each
@@ -173,7 +173,16 @@ impl Read for ConcatFiles {
 /// It applies no policy on *which* paths may be written: a caller restoring
 /// into a project vets [`Index::files`] first (as `task` does through
 /// [`crate::Store::pull_index`]).
-pub fn assemble<Src>(idx: &Index, base_dir: &Path, src: Src) -> Result<()>
+///
+/// Returns what was written, for the caller to commit or undo; a failure
+/// partway undoes it itself. With `journal_dir`, a journal there lets
+/// [`crate::restore::recover`] clean up a restore cut short.
+pub fn assemble<Src>(
+    idx: &Index,
+    base_dir: &Path,
+    journal_dir: Option<&Path>,
+    src: Src,
+) -> Result<Written>
 where
     Src: FnMut(&str) -> Result<Vec<u8>>,
 {
@@ -182,15 +191,43 @@ where
         .iter()
         .map(|f| restore::components(&f.path, false))
         .collect::<Result<Vec<_>>>()?;
+    restore::check_unique(parts.iter().map(Vec::as_slice))?;
     restore::check_link_parents(
         parts
             .iter()
             .zip(&idx.files)
             .map(|(p, f)| (p.as_slice(), !f.symlink.is_empty())),
     )?;
+    if !cfg!(unix)
+        && let Some(link) = idx.files.iter().find(|f| !f.symlink.is_empty())
+    {
+        return Err(Error::format(format!(
+            "entry {:?}: symlinks are not restored on this platform",
+            link.path
+        )));
+    }
     let mut tree = Tree::open(base_dir)?;
+    if let Some(dir) = journal_dir {
+        tree.journal_in(dir)?;
+    }
+    // A failure partway takes out what was written, so a restore leaves all
+    // or nothing behind — unless that undo fails too, which is reported as
+    // such rather than as a miss.
+    match write_files(idx, &parts, &mut tree, src) {
+        Ok(()) => Ok(tree.finish()),
+        Err(e) => match tree.into_written().undo() {
+            Ok(()) => Err(e),
+            Err(undo) => Err(Error::unrecoverable(&e, &undo)),
+        },
+    }
+}
+
+fn write_files<Src>(idx: &Index, parts: &[Vec<String>], tree: &mut Tree, src: Src) -> Result<()>
+where
+    Src: FnMut(&str) -> Result<Vec<u8>>,
+{
     let mut stream = StreamReader::new(idx, src);
-    for (entry, parts) in idx.files.iter().zip(&parts) {
+    for (entry, parts) in idx.files.iter().zip(parts) {
         if !entry.symlink.is_empty() {
             tree.symlink(parts, entry.symlink.as_bytes())?;
             continue;
@@ -206,7 +243,7 @@ where
             return Err(Error::format(format!("{}: short contents", entry.path)));
         }
     }
-    tree.finish()
+    Ok(())
 }
 
 /// One file's bytes out of the stream, exactly as many as the index gives it.
@@ -229,7 +266,9 @@ where
         }
         let data = self.stream.read(want).map_err(|e| match e {
             Error::Io(e) => e,
-            Error::Format(m) | Error::Network(m) => std::io::Error::other(m),
+            Error::Format(m) | Error::Network(m) | Error::Unrecoverable(m) => {
+                std::io::Error::other(m)
+            }
             e => std::io::Error::other(e),
         })?;
         let n = data.len();
@@ -432,7 +471,7 @@ mod tests {
         );
 
         let dst = tmpdir("dst");
-        assemble(&idx, &dst, mem_source(&store)).unwrap();
+        assemble(&idx, &dst, None, mem_source(&store)).unwrap();
 
         assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"hello world");
         assert_eq!(
@@ -488,7 +527,7 @@ mod tests {
         assert!(idx.transparent);
 
         let dst = tmpdir("dst");
-        assemble(&idx, &dst, mem_source(&store)).unwrap();
+        assemble(&idx, &dst, None, mem_source(&store)).unwrap();
         assert_eq!(
             std::fs::read(src.join("f")).unwrap(),
             std::fs::read(dst.join("f")).unwrap()
@@ -508,7 +547,7 @@ mod tests {
             store.insert(first.digest.clone(), b"garbage".to_vec());
         }
         let dst = tmpdir("dst");
-        assert!(assemble(&idx, &dst, mem_source(&store)).is_err());
+        assert!(assemble(&idx, &dst, None, mem_source(&store)).is_err());
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&dst).ok();
     }
@@ -522,7 +561,7 @@ mod tests {
         let paths = vec!["target.txt".to_string(), "link".to_string()];
         let (idx, store) = mem_build(&src, &paths, false);
         let dst = tmpdir("dst");
-        assemble(&idx, &dst, mem_source(&store)).unwrap();
+        assemble(&idx, &dst, None, mem_source(&store)).unwrap();
         assert_eq!(
             std::fs::read_link(dst.join("link")).unwrap(),
             Path::new("target.txt")
@@ -566,7 +605,7 @@ mod tests {
             let dst = root.join("dst");
             std::fs::create_dir(&dst).unwrap();
             assert!(
-                assemble(&idx, &dst, mem_source(&store)).is_err(),
+                assemble(&idx, &dst, None, mem_source(&store)).is_err(),
                 "{path:?}"
             );
             assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "{path:?}");
@@ -582,7 +621,7 @@ mod tests {
         idx.files
             .insert(0, symlink_entry("a", outside.to_str().unwrap()));
         let dst = tmpdir("dst");
-        let err = assemble(&idx, &dst, mem_source(&store)).unwrap_err();
+        let err = assemble(&idx, &dst, None, mem_source(&store)).unwrap_err();
         assert!(err.to_string().contains("is a symlink"), "{err}");
         assert!(!outside.join("secret").exists());
         assert!(std::fs::symlink_metadata(dst.join("a")).is_err());
@@ -597,9 +636,9 @@ mod tests {
         std::os::unix::fs::symlink(&outside, dst.join("p")).unwrap();
         std::os::unix::fs::symlink(outside.join("secret"), dst.join("leaf")).unwrap();
         let (idx, store) = one_file("p/secret", 0o644, b"PWN");
-        assert!(assemble(&idx, &dst, mem_source(&store)).is_err());
+        assert!(assemble(&idx, &dst, None, mem_source(&store)).is_err());
         let (idx, store) = one_file("leaf", 0o644, b"PWN");
-        assemble(&idx, &dst, mem_source(&store)).unwrap();
+        assemble(&idx, &dst, None, mem_source(&store)).unwrap();
         assert_eq!(std::fs::read(outside.join("secret")).unwrap(), b"S");
         assert_eq!(std::fs::read(dst.join("leaf")).unwrap(), b"PWN");
     }
@@ -615,7 +654,7 @@ mod tests {
         let dst = tmpdir("dst");
         std::fs::hard_link(&secret, dst.join("h")).unwrap();
         let (idx, store) = one_file("h", 0o777, b"PWN");
-        assemble(&idx, &dst, mem_source(&store)).unwrap();
+        assemble(&idx, &dst, None, mem_source(&store)).unwrap();
         assert_eq!(std::fs::read(&secret).unwrap(), b"S");
         let mode = std::fs::metadata(&secret).unwrap().permissions().mode();
         assert_eq!(mode & 0o7777, 0o600);
@@ -624,16 +663,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn assemble_duplicate_entry_does_not_follow_earlier_symlink() {
+    fn assemble_refuses_a_destination_named_twice() {
         let outside = tmpdir("outside");
         let (mut idx, store) = one_file("x", 0o644, b"PWN");
         let target = outside.join("f");
         idx.files
             .insert(0, symlink_entry("x", target.to_str().unwrap()));
         let dst = tmpdir("dst");
-        assemble(&idx, &dst, mem_source(&store)).unwrap();
+        let err = assemble(&idx, &dst, None, mem_source(&store)).unwrap_err();
+        assert!(err.to_string().contains("appears twice"), "{err}");
         assert!(!target.exists());
-        assert_eq!(std::fs::read(dst.join("x")).unwrap(), b"PWN");
+        assert!(std::fs::symlink_metadata(dst.join("x")).is_err());
     }
 
     #[test]
@@ -643,7 +683,7 @@ mod tests {
             ..Index::new()
         };
         let dst = tmpdir("dst");
-        assert!(assemble(&idx, &dst, |_: &str| Ok(Vec::new())).is_err());
+        assert!(assemble(&idx, &dst, None, |_: &str| Ok(Vec::new())).is_err());
     }
 
     #[test]
@@ -653,5 +693,53 @@ mod tests {
         let forged = format!("sha256:{:/<64}", "../../../../tmp/x");
         assert!(digest_hex(&forged).is_none());
         assert!(digest_hex(&format!("sha256:{}", "A".repeat(64))).is_none());
+    }
+
+    /// A restore failing partway whose undo fails too (here: the directory of
+    /// what it wrote turns read-only) is `Unrecoverable`, not a plain failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_restore_that_cannot_be_undone_is_unrecoverable() {
+        use std::os::unix::fs::PermissionsExt;
+        let src = tmpdir("src");
+        write_file(&src, "f0", b"first");
+        write_file(&src, "f1", b"second");
+        let (mut idx, store) = mem_build(&src, &["f0".to_string(), "f1".to_string()], false);
+        idx.files[0].path = "sub/a".to_string();
+        idx.files[1].path = "b".to_string();
+        // One more chunk the second file needs, which fails to fetch.
+        let fake = format!("sha256:{}", "f".repeat(64));
+        idx.chunks.push(ChunkRef {
+            digest: fake.clone(),
+            size: 1,
+            raw_size: 1,
+        });
+        idx.files[1].size += 1;
+        let dst = tmpdir("dst");
+        let base = dst.clone();
+        let err = assemble(&idx, &dst, None, |d: &str| {
+            if d == fake {
+                std::fs::set_permissions(base.join("sub"), std::fs::Permissions::from_mode(0o555))
+                    .unwrap();
+                return Err(Error::format("injected fetch failure"));
+            }
+            mem_source(&store)(d)
+        })
+        .unwrap_err();
+        std::fs::set_permissions(dst.join("sub"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(err, Error::Unrecoverable(_)), "{err}");
+        assert!(err.to_string().contains("injected fetch failure"), "{err}");
+
+        // The same failure with an undo that works is an ordinary error.
+        let dst = tmpdir("dst2");
+        let err = assemble(&idx, &dst, None, |d: &str| {
+            if d == fake {
+                return Err(Error::format("injected fetch failure"));
+            }
+            mem_source(&store)(d)
+        })
+        .unwrap_err();
+        assert!(!matches!(err, Error::Unrecoverable(_)), "{err}");
+        assert!(!dst.join("sub").exists());
     }
 }

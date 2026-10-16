@@ -46,6 +46,10 @@ pub struct Cache {
     pub ttl: String,
     /// Maximum wait for lock contention (e.g. `5m`, `1h`).
     pub lock_timeout: String,
+    /// Whether a restore may create symlinks pointing outside the project
+    /// (absolute, or climbing above the root). `None` means not set here, so
+    /// inherited, else refused.
+    pub outside_links: Option<bool>,
     /// The template dialect this block's template strings are authored in,
     /// stamped from the owning Taskfile's dialect when the file is read. A
     /// task-level block inherits its own file's dialect from the task; a
@@ -80,6 +84,14 @@ impl<'de> Deserialize<'de> for Cache {
                         "namespace" => c.namespace = value_as_string(&v),
                         "ttl" => c.ttl = value_as_string(&v),
                         "lock_timeout" => c.lock_timeout = value_as_string(&v),
+                        "outside_links" => match v {
+                            Value::Bool(b) => c.outside_links = Some(b),
+                            _ => {
+                                return Err(de::Error::custom(TaskfileDecodeError::type_message(
+                                    "cache.outside_links",
+                                )));
+                            }
+                        },
                         _ => {}
                     }
                 }
@@ -139,6 +151,15 @@ impl Caches {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outside_links_is_a_bool() {
+        let c: Cache = crate::yaml::from_str("{url: x, outside_links: true}").unwrap();
+        assert_eq!(c.outside_links, Some(true));
+        let c: Cache = crate::yaml::from_str("{url: x}").unwrap();
+        assert_eq!(c.outside_links, None);
+        assert!(crate::yaml::from_str::<Cache>("{outside_links: yes please}").is_err());
+    }
 
     #[test]
     fn bare_string_sets_inherit() {

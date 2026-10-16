@@ -48,6 +48,22 @@
   task's files, but no restore writes into `.git`, or an import into the temp
   directory's `tmp`. Entries named with a `..` component are refused, and
   restored files and directories lose their setuid, setgid and sticky bits.
+- **A cache entry holding a symlink out of the project is refused,** unless
+  the task sets `cache: {outside_links: true}` (for a virtualenv, say): the
+  task's commands would otherwise write through a link a poisoned entry
+  planted in its outputs. Links are followed through those already in the
+  project, and one leading to a Taskfile or dotenv file Task read, `.taskrc`,
+  `.git` (at any depth: a directory holding a nested repository too) or Task's
+  temp directory is refused whatever the setting, so a task whose pnpm-style
+  link points at a package holding one of these misses the cache. A task whose
+  outputs hold such a link is not saved. An entry naming one file twice is
+  refused. An entry whose restored files fail verification is removed again
+  before the task runs, the files it replaced put back, and a restore that
+  fails partway is undone the same way; if undoing fails, the task fails
+  instead of running among restored files. A restore that is killed leaves
+  nothing behind once the next restore runs. On Windows no symlink is restored; an
+  entry holding one is a cache miss. These checks do not guard against other
+  processes changing the project during a restore.
 
 ## v4.8.0 - 2026-10-16
 

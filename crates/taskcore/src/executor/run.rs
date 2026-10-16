@@ -915,22 +915,40 @@ impl Executor {
             {
                 {
                     let source_value = checker.source_value().to_string();
-                    let (ok, meta) = {
+                    let restored = {
                         let (mut scratch, sink) = self.scratch_logger();
                         let r = cache::cache_restore(
                             url,
                             t,
                             &source_value,
                             std::path::Path::new(&self.dir),
+                            &cache::Guarded {
+                                temp_dir: &self.temp_dir.fingerprint,
+                                taskfiles: &self.read_config_files(t),
+                            },
                             &mut scratch,
                         )
                         .await;
                         self.flush_scratch(&sink);
-                        r
+                        // A partial restore that could not be undone leaves
+                        // its entries in place: fail rather than run among them.
+                        r.map_err(|e| ExecutorError::Cache(Box::new(e)))?
                     };
-                    if ok {
-                        match self.cache_verify_meta(t, &mut checker, &meta) {
-                            Ok(()) => return Ok(()),
+                    if let Some(restored) = restored {
+                        match self.cache_verify_meta(t, &mut checker, &restored.meta) {
+                            Ok(()) => {
+                                // Verified: drop the originals it replaced.
+                                if let Err(e) = restored.written.commit() {
+                                    self.logger().borrow_mut().errf(
+                                        Color::Yellow,
+                                        &format!(
+                                            "task: WARNING: cache for {:?}: cleaning up after the restore: {e}\n",
+                                            t.name()
+                                        ),
+                                    );
+                                }
+                                return Ok(());
+                            }
                             Err(e) => {
                                 self.logger().borrow_mut().errf(
                                     Color::Yellow,
@@ -939,6 +957,17 @@ impl Executor {
                                         t.name()
                                     ),
                                 );
+                                // Undo unverified output before commands can write
+                                // through a restored link. If undo fails, fail the
+                                // task rather than run among restored entries.
+                                if let Err(e) = restored.written.undo() {
+                                    return Err(ExecutorError::Cache(Box::new(
+                                        cache::CacheError::msg(format!(
+                                            "undoing the unverified restore of {:?}: {e}",
+                                            t.name()
+                                        )),
+                                    )));
+                                }
                             }
                         }
                     }
@@ -1075,7 +1104,10 @@ impl Executor {
                         url,
                         t,
                         std::path::Path::new(&self.dir),
-                        &self.temp_dir.fingerprint,
+                        &cache::Guarded {
+                            temp_dir: &self.temp_dir.fingerprint,
+                            taskfiles: &self.read_config_files(t),
+                        },
                         &mut scratch,
                     )
                     .await;
@@ -1982,6 +2014,27 @@ impl Executor {
     /// fingerprint as up to date on success. The task annotation is the local
     /// name the entry is keyed by, so a copy reached through another include
     /// verifies against it. Ports Go `cacheVerifyMeta`.
+    /// The Taskfiles and dotenv files Task read for `t`: a cached link must
+    /// not reach them (see `cache::Guarded`).
+    fn read_config_files(&self, t: &Task) -> Vec<String> {
+        let task_dir = t.compute_dir();
+        let task_dir = task_dir.to_string_lossy();
+        let mut files = self.taskfile_paths.clone();
+        if let Some(tf) = &self.taskfile {
+            files.extend(tf.dotenv.iter().map(|f| {
+                filepathext::smart_join(&self.dir, f)
+                    .to_string_lossy()
+                    .into_owned()
+            }));
+        }
+        files.extend(t.dotenv.iter().map(|f| {
+            filepathext::smart_join(&task_dir, f)
+                .to_string_lossy()
+                .into_owned()
+        }));
+        files
+    }
+
     fn cache_verify_meta(
         &self,
         t: &Task,

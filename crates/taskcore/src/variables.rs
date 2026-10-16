@@ -794,6 +794,9 @@ fn finish_compile(
             if !resolved.lock_timeout.is_empty() {
                 merged.lock_timeout = resolved.lock_timeout.clone();
             }
+            if resolved.outside_links.is_some() {
+                merged.outside_links = resolved.outside_links;
+            }
             resolved = merged;
         }
         resolved.inherit = String::new();

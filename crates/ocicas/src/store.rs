@@ -27,7 +27,7 @@ use crate::index::{
     ARTIFACT_TYPE, ChunkRef, Index, MAX_CHUNK_BLOB, MAX_INDEX_BLOB, MEDIA_TYPE_CHUNK,
     MEDIA_TYPE_INDEX, unmarshal_index,
 };
-use crate::restore;
+use crate::restore::{self, Written};
 use crate::retry::{is_transport, with_retry};
 
 /// Bounds parallel chunk transfers (pull fetches and push uploads).
@@ -368,7 +368,7 @@ impl Store {
     /// policy on which paths the entry may write (see [`assemble`]).
     pub async fn pull(&self, tag: &str, dir: &Path) -> Result<(Index, BTreeMap<String, String>)> {
         let pulled = self.pull_index(tag).await?;
-        self.assemble_pulled(&pulled, dir).await?;
+        self.assemble_pulled(&pulled, dir, None).await?.commit()?;
         Ok((pulled.index, pulled.annotations))
     }
 
@@ -404,11 +404,17 @@ impl Store {
 
     /// Fetch the chunks of a pulled index and assemble its file set under
     /// `dir` (see [`assemble`]).
-    pub async fn assemble_pulled(&self, pulled: &Pulled, dir: &Path) -> Result<()> {
+    pub async fn assemble_pulled(
+        &self,
+        pulled: &Pulled,
+        dir: &Path,
+        journal_dir: Option<&Path>,
+    ) -> Result<Written> {
         let source = self.chunk_source(&pulled.image, &pulled.index).await?;
         let owned_idx = pulled.index.clone();
         let dir = dir.to_path_buf();
-        tokio::task::spawn_blocking(move || assemble(&owned_idx, &dir, source))
+        let journal = journal_dir.map(Path::to_path_buf);
+        tokio::task::spawn_blocking(move || assemble(&owned_idx, &dir, journal.as_deref(), source))
             .await
             .map_err(join_err)?
     }
@@ -700,7 +706,7 @@ fn cas_dir(dir: &Path, create: bool) -> Result<std::fs::File> {
         std::fs::create_dir_all(dir)?;
     }
     let root = cap_primitives::fs::open_ambient_dir(dir, cap_primitives::ambient_authority())?;
-    restore::open_parent(&root, &["sha256".to_string()], create)
+    restore::open_parent(&root, &["sha256".to_string()], create, &mut Vec::new())
 }
 
 fn cas_hex(digest: &str) -> Result<&str> {

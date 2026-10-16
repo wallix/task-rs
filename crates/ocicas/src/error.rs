@@ -25,9 +25,23 @@ pub enum Error {
     /// stalled transfer). Distinguished from [`Error::Format`] so callers can
     /// report an unreachable cache separately from a cache miss or bad content.
     Network(String),
+    /// A restore failed partway, and undoing what it had written failed too:
+    /// its entries may still be on disk. Unlike every other error, not a
+    /// cache miss to run past.
+    Unrecoverable(String),
 }
 
 impl Error {
+    /// The error for a restore that failed with `write`, then could not be
+    /// undone because of `undo`.
+    pub fn unrecoverable(write: &Error, undo: &Error) -> Self {
+        Error::Unrecoverable(format!(
+            "{}; undoing the partial restore failed too: {}",
+            crate::restore::message(write),
+            crate::restore::message(undo)
+        ))
+    }
+
     /// Build a [`Error::Format`] from a message.
     pub(crate) fn format(msg: impl Into<String>) -> Self {
         Error::Format(msg.into())
@@ -73,6 +87,7 @@ impl fmt::Display for Error {
             Error::Json(e) => write!(f, "ocicas: {e}"),
             Error::Format(m) => write!(f, "ocicas: {m}"),
             Error::Network(m) => write!(f, "ocicas: {m}"),
+            Error::Unrecoverable(m) => write!(f, "ocicas: {m}"),
         }
     }
 }
@@ -84,6 +99,7 @@ impl std::error::Error for Error {
             Error::Json(e) => Some(e),
             Error::Format(_) => None,
             Error::Network(_) => None,
+            Error::Unrecoverable(_) => None,
         }
     }
 }

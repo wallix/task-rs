@@ -405,6 +405,7 @@ fn encode_cache(enc: &mut Encoder, cache: Option<&ast::Cache>) {
             // `api_key` is a credential, not an identity: left out.
             enc.str(&c.ttl);
             enc.str(&c.lock_timeout);
+            // `outside_links` is a restore policy, not an identity: left out.
         }
     }
 }

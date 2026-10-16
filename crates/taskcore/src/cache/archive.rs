@@ -7,7 +7,10 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use ocicas::restore::{DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, MAX_LINK_TARGET, MODE_MASK, Tree};
+use ocicas::restore::{
+    DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, MAX_LINK_TARGET, MODE_MASK, Pending, Resolution, Tree,
+    Written,
+};
 use zip::write::{FileOptions, SimpleFileOptions};
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -112,7 +115,22 @@ pub struct RestorePolicy<'a> {
     /// Whether the entry at this root-relative, slash-separated path may be
     /// written. Entries naming a `.git` component are refused regardless.
     pub accept: Option<&'a dyn Fn(&str) -> bool>,
+    /// Whether a symlink may lead outside the root. Refused otherwise: the
+    /// task, or whatever runs next, would read and write through it.
+    pub outside_links: bool,
+    /// Whether a symlink may not lead to this path below the root (given its
+    /// handle), however it gets there: a link the task then writes through
+    /// must not reach its Taskfile or `.git`. With neither this nor
+    /// `outside_links` unset, links are not resolved at all.
+    pub protected: Option<&'a Protected<'a>>,
+    /// Where to journal the originals the restore moves aside (see
+    /// [`ocicas::restore::recover`]).
+    pub journal: Option<&'a Path>,
 }
+
+/// A check that a resolved link destination is one no restore may link to.
+/// Returns why, if so.
+pub type Protected<'a> = dyn Fn(&std::fs::File, &[String]) -> Option<String> + 'a;
 
 /// A check on a cache entry's metadata.
 pub type MetaCheck<'a> = dyn Fn(&CacheMeta) -> Result<(), CacheError> + 'a;
@@ -122,6 +140,11 @@ impl RestorePolicy<'_> {
     /// `.git` component is refused, so no restore can plant hooks or rewrite a
     /// repository's configuration.
     pub fn check_entry(&self, name: &str, parts: &[String]) -> Result<(), CacheError> {
+        if parts.iter().any(|p| ocicas::restore::is_aside_name(p)) {
+            return Err(CacheError::rejected(format!(
+                "entry {name:?} has the name of a file a restore moves aside"
+            )));
+        }
         if parts.iter().any(|p| is_git_name(p)) {
             return Err(CacheError::rejected(format!(
                 "entry {name:?} is inside a .git directory"
@@ -133,6 +156,71 @@ impl RestorePolicy<'_> {
             return Err(CacheError::rejected(format!(
                 "entry {name:?} is not one of the files this restore may write"
             )));
+        }
+        Ok(())
+    }
+
+    /// Check the links among `set`, the entries a restore into `base_dir`
+    /// would write: each is resolved as the kernel will once the set is in
+    /// place, through the set's own links and those already on disk (see
+    /// [`ocicas::restore::resolve_link`]), and refused if it is absolute or
+    /// leads outside the root (unless `outside_links`), or reaches a
+    /// [`RestorePolicy::protected`] path. Off unix any link is refused: none
+    /// can be created safely there.
+    pub fn check_links(
+        &self,
+        base_dir: &Path,
+        set: &BTreeMap<Vec<String>, Pending>,
+    ) -> Result<(), CacheError> {
+        let links = set.iter().filter_map(|(parts, p)| match p {
+            Pending::Link(t) => Some((parts, t)),
+            _ => None,
+        });
+        if !cfg!(unix) {
+            if let Some((parts, _)) = links.clone().next() {
+                return Err(CacheError::rejected(format!(
+                    "entry {:?} is a symlink, which is not restored on this platform",
+                    parts.join("/")
+                )));
+            }
+            return Ok(());
+        }
+        if self.outside_links && self.protected.is_none() {
+            return Ok(());
+        }
+        let root =
+            cap_primitives::fs::open_ambient_dir(base_dir, cap_primitives::ambient_authority())?;
+        for (parts, target) in links {
+            let name = parts.join("/");
+            let shown = String::from_utf8_lossy(target);
+            let refused = || {
+                CacheError::rejected(format!(
+                    "entry {name:?} is a symlink to {shown:?}, which is absolute or leaves the project (see `cache: outside_links`)"
+                ))
+            };
+            // Absolute is refused even inside the project: it breaks when the
+            // checkout moves, which a cache key does not see.
+            if !self.outside_links && Path::new(&*shown).has_root() {
+                return Err(refused());
+            }
+            let resolved = ocicas::restore::resolve_link(&root, base_dir, set, parts, target)
+                .map_err(|e| CacheError::rejected(format!("entry {name:?}: {}", restore_err(e))))?;
+            match resolved {
+                Resolution::Outside if self.outside_links => {}
+                Resolution::Outside => return Err(refused()),
+                Resolution::Inside(dest) => {
+                    if let Some(why) = self.protected.and_then(|p| p(&root, &dest)) {
+                        return Err(CacheError::rejected(format!(
+                            "entry {name:?} is a symlink leading to {:?}, {why}",
+                            if dest.is_empty() {
+                                ".".to_string()
+                            } else {
+                                dest.join("/")
+                            }
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -155,15 +243,50 @@ pub fn is_git_name(part: &str) -> bool {
             .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// The cache files under `dir` a restore would refuse, as inside a `.git`
-/// directory, split off `files`: saving them would make the entry unusable.
-pub fn split_git_files(dir: &Path, files: &[String]) -> (Vec<String>, Vec<String>) {
+/// The cache files under `dir` a restore would refuse by name, split off
+/// `files`: inside a `.git` directory, or named in a way no restore accepts on
+/// this platform (see [`ocicas::restore::components`]). Saving them would make
+/// the entry unusable.
+pub fn split_unrestorable(dir: &Path, files: &[String]) -> (Vec<String>, Vec<String>) {
     files.iter().cloned().partition(|f| {
-        let rel = resolve(dir, f);
-        let rel = rel.strip_prefix(dir).unwrap_or(&rel);
-        !rel.components()
-            .any(|c| is_git_name(&c.as_os_str().to_string_lossy()))
+        let full = resolve(dir, f);
+        let Ok(rel) = full.strip_prefix(dir) else {
+            return true; // outside the root: the save itself reports it
+        };
+        ocicas::restore::components(&slash_path(rel), false).is_ok_and(|parts| {
+            !parts
+                .iter()
+                .any(|p| is_git_name(p) || ocicas::restore::is_aside_name(p))
+        })
     })
+}
+
+/// `rel` with its components joined by `/` whatever the platform's own
+/// separator, as an entry is named.
+fn slash_path(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The symlinks among `files` (under `dir`), as a restore would see them: for
+/// [`RestorePolicy::check_links`] before saving.
+pub fn links_of(dir: &Path, files: &[String]) -> BTreeMap<Vec<String>, Pending> {
+    let mut set = BTreeMap::new();
+    for f in files {
+        let full = resolve(dir, f);
+        let (Ok(rel), Ok(target)) = (full.strip_prefix(dir), fs::read_link(&full)) else {
+            continue;
+        };
+        if let Ok(parts) = ocicas::restore::components(&slash_path(rel), false) {
+            set.insert(
+                parts,
+                Pending::Link(target.as_os_str().as_encoded_bytes().to_vec()),
+            );
+        }
+    }
+    set
 }
 
 /// A restore failure from [`ocicas::restore`], as this module reports its own.
@@ -171,6 +294,7 @@ fn restore_err(e: ocicas::Error) -> CacheError {
     match e {
         ocicas::Error::Io(e) => CacheError::Io(e),
         ocicas::Error::Format(m) => CacheError::Msg(m),
+        ocicas::Error::Unrecoverable(m) => CacheError::Unrecoverable(m),
         e => CacheError::Ocicas(e),
     }
 }
@@ -202,9 +326,11 @@ struct Planned {
 /// or the first refusal. Nothing is written.
 fn plan<R: Read + std::io::Seek>(
     archive: &mut ZipArchive<R>,
+    base_dir: &Path,
     policy: &RestorePolicy<'_>,
 ) -> Result<Vec<Planned>, CacheError> {
     let mut planned = Vec::with_capacity(archive.len());
+    let mut set = BTreeMap::new();
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
         let name = entry.name().to_string();
@@ -222,9 +348,23 @@ fn plan<R: Read + std::io::Seek>(
         };
         let mode = entry.unix_mode().map_or(default, |m| m & MODE_MASK);
         let size = entry.size();
-        drop(entry);
+        let target = match kind {
+            Kind::Symlink => Some(link_target(&name, entry)?),
+            _ => {
+                drop(entry);
+                None
+            }
+        };
         let parts = entry_components(&name)?;
         policy.check_entry(&name, &parts)?;
+        set.insert(
+            parts.clone(),
+            match (kind, target) {
+                (_, Some(t)) => Pending::Link(t),
+                (Kind::Dir, _) => Pending::Dir,
+                _ => Pending::File,
+            },
+        );
         planned.push(Planned {
             index,
             name,
@@ -240,6 +380,9 @@ fn plan<R: Read + std::io::Seek>(
             .map(|p| (p.parts.as_slice(), p.kind == Kind::Symlink)),
     )
     .map_err(restore_err)?;
+    ocicas::restore::check_unique(planned.iter().map(|p| p.parts.as_slice()))
+        .map_err(|e| CacheError::rejected(restore_err(e).to_string()))?;
+    policy.check_links(base_dir, &set)?;
     Ok(planned)
 }
 
@@ -296,21 +439,47 @@ pub fn extract_archive(
     zip_path: &Path,
     base_dir: &Path,
     policy: &RestorePolicy<'_>,
-) -> Result<CacheMeta, CacheError> {
+) -> Result<Extracted, CacheError> {
     let file = fs::File::open(zip_path)?;
     let mut archive = ZipArchive::new(file)?;
     let meta = read_cache_comment(std::str::from_utf8(archive.comment()).unwrap_or(""));
     if let Some(check) = policy.check_meta {
         check(&meta)?;
     }
-    let planned = plan(&mut archive, policy)?;
+    let planned = plan(&mut archive, base_dir, policy)?;
 
     let mut tree = Tree::open(base_dir).map_err(restore_err)?;
-    for p in &planned {
-        write_entry(&mut archive, p, &mut tree)?;
+    if let Some(dir) = policy.journal {
+        tree.journal_in(dir).map_err(restore_err)?;
     }
-    tree.finish().map_err(restore_err)?;
-    Ok(meta)
+    // A failure partway takes out what was written, so a restore leaves all
+    // or nothing behind — unless that undo fails too, which is reported as
+    // `Unrecoverable` rather than as a miss.
+    for p in &planned {
+        let written = write_entry(&mut archive, p, &mut tree);
+        #[cfg(test)]
+        let written = written.and_then(|()| tests::after_entry(base_dir));
+        if let Err(e) = written {
+            return Err(match tree.into_written().undo() {
+                Ok(()) => e,
+                Err(undo) => CacheError::Unrecoverable(format!(
+                    "{e}; undoing the partial restore failed too: {}",
+                    restore_err(undo)
+                )),
+            });
+        }
+    }
+    let written = tree.finish();
+    Ok(Extracted { meta, written })
+}
+
+/// What [`extract_archive`] restored.
+pub struct Extracted {
+    /// The metadata in the archive's comment.
+    pub meta: CacheMeta,
+    /// The files, links and directories written, for undoing the restore if
+    /// what it restored does not verify.
+    pub written: Written,
 }
 
 /// Whether the archive at `zip_path` contains exactly the given files with
@@ -404,6 +573,66 @@ fn perm_bits(meta: &fs::Metadata) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type Hook = Box<dyn FnMut(&Path) -> Result<(), CacheError>>;
+
+    thread_local! {
+        /// Run after each entry a test extraction writes: a way to change the
+        /// tree mid-restore (or fail it) that no archive can.
+        static AFTER_ENTRY: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_entry(base: &Path) -> Result<(), CacheError> {
+        AFTER_ENTRY.with(|h| match h.borrow_mut().as_mut() {
+            Some(hook) => hook(base),
+            None => Ok(()),
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_restore_that_cannot_be_undone_is_unrecoverable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dst = tempdir();
+        let bytes = zip_bytes(|zw| {
+            add_file(zw, "out/a", b"a");
+            add_file(zw, "late", b"b");
+        });
+        // After the first entry, its directory turns read-only (so undo cannot
+        // remove the file), and the next entry fails.
+        let mut n = 0;
+        AFTER_ENTRY.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |base: &Path| {
+                n += 1;
+                if n == 1 {
+                    fs::set_permissions(base.join("out"), fs::Permissions::from_mode(0o555))?;
+                    return Err(CacheError::msg("injected write failure"));
+                }
+                Ok(())
+            }));
+        });
+        let err = extract_bytes(&bytes, &dst).unwrap_err();
+        AFTER_ENTRY.with(|h| *h.borrow_mut() = None);
+        fs::set_permissions(dst.join("out"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(err, CacheError::Unrecoverable(_)), "{err}");
+        assert!(err.to_string().contains("injected write failure"), "{err}");
+    }
+
+    #[test]
+    fn a_partial_restore_that_is_undone_is_an_ordinary_failure() {
+        let dst = tempdir();
+        let bytes = zip_bytes(|zw| {
+            add_file(zw, "out/a", b"a");
+            add_file(zw, "late", b"b");
+        });
+        AFTER_ENTRY.with(|h| {
+            *h.borrow_mut() = Some(Box::new(|_: &Path| Err(CacheError::msg("injected"))));
+        });
+        let err = extract_bytes(&bytes, &dst).unwrap_err();
+        AFTER_ENTRY.with(|h| *h.borrow_mut() = None);
+        assert!(matches!(err, CacheError::Msg(_)), "{err}");
+        assert!(!dst.join("out").exists());
+    }
     use std::io::Cursor;
 
     fn comment_of(bytes: &[u8]) -> String {
@@ -475,7 +704,7 @@ mod tests {
 
         let dst = tempdir();
         let got = extract_archive(&zip_path, &dst, &RestorePolicy::default()).unwrap();
-        assert_eq!(got, meta);
+        assert_eq!(got.meta, meta);
         assert_eq!(fs::read(dst.join("out.txt")).unwrap(), b"hello");
     }
 
@@ -497,9 +726,15 @@ mod tests {
             .unwrap();
     }
 
-    /// Extract `bytes` into `dst` from an archive file kept outside it.
+    /// Extract `bytes` into `dst` from an archive file kept outside it, as an
+    /// import would: links may point anywhere, so these tests exercise the
+    /// writer's own confinement.
     fn extract_bytes(bytes: &[u8], dst: &Path) -> Result<CacheMeta, CacheError> {
-        extract_with(bytes, dst, &RestorePolicy::default())
+        let policy = RestorePolicy {
+            outside_links: true,
+            ..RestorePolicy::default()
+        };
+        extract_with(bytes, dst, &policy)
     }
 
     fn extract_with(
@@ -509,7 +744,11 @@ mod tests {
     ) -> Result<CacheMeta, CacheError> {
         let zip_path = tempdir().join("cache.zip");
         fs::write(&zip_path, bytes).unwrap();
-        extract_archive(&zip_path, dst, policy)
+        // As a restore that verified: the originals it replaced are dropped.
+        extract_archive(&zip_path, dst, policy).map(|e| {
+            e.written.commit().unwrap();
+            e.meta
+        })
     }
 
     fn matches_bytes(bytes: &[u8], dst: &Path, files: &[&str]) -> bool {
@@ -632,6 +871,63 @@ mod tests {
         assert!(!outside.join("passwd").exists());
     }
 
+    #[test]
+    fn extract_refuses_links_leaving_the_root_unless_allowed() {
+        for target in ["/usr/bin/python3", "../../outside", "bin/../../x"] {
+            let dst = tempdir();
+            let bytes = zip_bytes(|zw| {
+                add_file(zw, "venv/ok", b"x");
+                add_link(zw, "venv/python", target);
+            });
+            let err = extract_with(&bytes, &dst, &RestorePolicy::default()).unwrap_err();
+            assert!(matches!(err, CacheError::Rejected(_)), "{target}: {err}");
+            // Refused before anything was written.
+            assert!(!dst.join("venv").exists(), "{target}");
+        }
+        let dst = tempdir();
+        let bytes = zip_bytes(|zw| add_link(zw, "nm/.bin/x", "../pkg/bin/x"));
+        extract_with(&bytes, &dst, &RestorePolicy::default()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_undoes_a_restore_that_fails_partway() {
+        let dst = tempdir();
+        fs::create_dir_all(dst.join("keep")).unwrap();
+        fs::write(dst.join("keep/old"), b"old").unwrap();
+        let mut bytes = zip_bytes(|zw| {
+            add_file(zw, "new/a", b"a");
+            add_file(zw, "keep/b", b"b");
+            add_file(zw, "late", &[0u8; 4096]);
+        });
+        // The last entry inflates past its declared size, failing mid-write.
+        patch_declared_size(&mut bytes, 2, 10);
+        assert!(extract_bytes(&bytes, &dst).is_err());
+        assert!(!dst.join("new").exists());
+        assert!(!dst.join("keep/b").exists());
+        assert!(!dst.join("late").exists());
+        assert_eq!(fs::read(dst.join("keep/old")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn written_undo_takes_out_what_the_restore_wrote_and_puts_originals_back() {
+        let dst = tempdir();
+        fs::write(dst.join("mine"), b"m").unwrap();
+        let bytes = zip_bytes(|zw| {
+            add_file(zw, "out/a", b"a");
+            add_file(zw, "mine", b"replaced");
+        });
+        let zip_path = tempdir().join("c.zip");
+        fs::write(&zip_path, &bytes).unwrap();
+        let got = extract_archive(&zip_path, &dst, &RestorePolicy::default()).unwrap();
+        assert!(dst.join("out/a").exists());
+        got.written.undo().unwrap();
+        assert!(!dst.join("out").exists());
+        // The original the restore replaced is back.
+        assert_eq!(fs::read(dst.join("mine")).unwrap(), b"m");
+        assert_eq!(fs::read_dir(&dst).unwrap().count(), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn extract_keeps_symlink_targets_outside_the_root() {
@@ -655,6 +951,17 @@ mod tests {
         let dst = tempdir();
         let bytes = zip_bytes(|zw| {
             add_link(zw, "d", outside.to_str().unwrap());
+            zw.add_directory("d/", SimpleFileOptions::default().unix_permissions(0o777))
+                .unwrap();
+        });
+        // The link and the directory name one destination: refused outright.
+        let err = extract_bytes(&bytes, &dst).unwrap_err();
+        assert!(err.to_string().contains("appears twice"), "{err}");
+        let mode = fs::metadata(&outside).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o700);
+        // A directory entry over a link already on disk replaces the link.
+        std::os::unix::fs::symlink(&outside, dst.join("d")).unwrap();
+        let bytes = zip_bytes(|zw| {
             zw.add_directory("d/", SimpleFileOptions::default().unix_permissions(0o777))
                 .unwrap();
         });
@@ -706,22 +1013,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn extract_duplicate_entry_does_not_follow_earlier_symlink() {
+    fn extract_refuses_a_destination_named_twice() {
         let outside = tempdir();
         let dst = tempdir();
-        let mut bytes = zip_bytes(|zw| {
-            add_link(zw, "dupA", outside.join("f").to_str().unwrap());
-            add_file(zw, "dupB", b"payload");
-        });
-        // ZipWriter refuses a duplicate name; rename the second entry in place.
-        for i in 0..bytes.len() - 3 {
-            if &bytes[i..i + 4] == b"dupB" {
-                bytes[i + 3] = b'A';
-            }
+        // Two spellings of one destination: checks would see one of them.
+        for second in ["./dup", "dup/", "sub/../dup"] {
+            let bytes = zip_bytes(|zw| {
+                add_link(zw, "dup", outside.join("f").to_str().unwrap());
+                add_file(zw, second, b"payload");
+            });
+            let err = extract_bytes(&bytes, &dst).unwrap_err();
+            assert!(
+                err.to_string().contains("appears twice") || err.to_string().contains("outside"),
+                "{second}: {err}"
+            );
+            assert!(!outside.join("f").exists());
+            assert!(fs::symlink_metadata(dst.join("dup")).is_err(), "{second}");
         }
-        extract_bytes(&bytes, &dst).unwrap();
-        assert!(!outside.join("f").exists());
-        assert_eq!(fs::read(dst.join("dupA")).unwrap(), b"payload");
     }
 
     #[cfg(unix)]
@@ -815,6 +1123,9 @@ mod tests {
         let policy = RestorePolicy {
             check_meta: None,
             accept: Some(&accept),
+            outside_links: false,
+            protected: None,
+            journal: None,
         };
         let err = extract_with(&bytes, &dst, &policy).unwrap_err();
         assert!(matches!(err, CacheError::Rejected(_)), "{err}");
@@ -839,9 +1150,25 @@ mod tests {
         let policy = RestorePolicy {
             check_meta: Some(&check),
             accept: None,
+            outside_links: false,
+            protected: None,
+            journal: None,
         };
         assert!(extract_with(&bytes, &dst, &policy).is_err());
         assert!(!dst.join("out").exists());
+    }
+
+    #[test]
+    fn slash_path_joins_native_components() {
+        let rel: PathBuf = ["out", "sub", "file"].iter().collect();
+        assert_eq!(slash_path(&rel), "out/sub/file");
+        let (keep, _) = split_unrestorable(Path::new("/p"), &[rel.to_string_lossy().into_owned()]);
+        assert_eq!(keep.len(), 1);
+        let (_, refused) = split_unrestorable(
+            Path::new("/p"),
+            &["out/.task-restore-0123456789abcdef".into()],
+        );
+        assert_eq!(refused.len(), 1);
     }
 
     #[test]
@@ -855,7 +1182,7 @@ mod tests {
             assert!(!is_git_name(part), "{part}");
         }
         let dir = Path::new("/p");
-        let (keep, git) = split_git_files(
+        let (keep, git) = split_unrestorable(
             dir,
             &["out/a".into(), "/p/sub/.git/HEAD".into(), ".git/x".into()],
         );

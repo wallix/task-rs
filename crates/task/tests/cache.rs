@@ -491,6 +491,235 @@ fn cache_restore_refuses_files_outside_generates() {
     );
 }
 
+// A poisoned entry carrying a link out of the project, inside the task's
+// generates: refused by default; with `outside_links` it is restored, fails
+// verification, and is taken out again before the commands run, so they never
+// write through it.
+#[cfg(unix)]
+#[test]
+fn cache_restore_never_lets_the_task_write_through_an_outside_link() {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    for outside_links in [false, true] {
+        let cache = cache_dir();
+        let outside = cache_dir().with_extension("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "S").unwrap();
+        let taskfile = format!(
+            r#"version: '3'
+tasks:
+  build:
+    sources: [input.txt]
+    generates: ['out/**']
+    cache:
+      url: 'file://{}/build-{{{{.CHECKSUM}}}}.zip'
+      outside_links: {outside_links}
+    cmds:
+      - mkdir -p out
+      - echo built > out/link
+"#,
+            cache.display()
+        );
+        let dir = stage_inline(&taskfile, "data");
+        let (first, code) = run_env(&dir, &["build"], &[]);
+        assert_eq!(code, 0, "first run failed: {first}");
+
+        let entry = std::fs::read_dir(&cache)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let comment = read_zip_comment(&std::fs::read(&entry).unwrap());
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&entry).unwrap());
+        zip.add_symlink(
+            "out/link",
+            outside.join("secret").to_str().unwrap(),
+            SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.start_file("out/extra", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"x").unwrap();
+        zip.set_comment(comment);
+        zip.finish().unwrap();
+
+        std::fs::remove_dir_all(dir.join("out")).unwrap();
+        std::fs::remove_dir_all(dir.join(".task")).unwrap();
+        let (second, code) = run_env(&dir, &["build"], &[]);
+        assert_eq!(code, 0, "second run failed: {second}");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("secret")).unwrap(),
+            "S",
+            "outside_links={outside_links}: {second}"
+        );
+        let link = std::fs::symlink_metadata(dir.join("out/link")).unwrap();
+        assert!(link.is_file(), "outside_links={outside_links}: {second}");
+        assert!(!dir.join("out/extra").exists(), "{second}");
+        if outside_links {
+            assert!(second.contains("checksum mismatch"), "{second}");
+        } else {
+            assert!(second.contains("leaves the project"), "{second}");
+        }
+    }
+}
+
+// Links that the text of their target keeps in the project, but that lead
+// out of it through a link already there, or to the Taskfile or `.git`: a
+// command writing through them would escape or rewrite them. Refused, whatever
+// `outside_links` says for the last two; and a restore that fails
+// verification puts back the file it replaced.
+#[cfg(unix)]
+#[test]
+fn cache_restore_resolves_links_and_puts_originals_back() {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let outside = cache_dir().with_extension("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret"), "S").unwrap();
+    for (target, outside_links) in [
+        ("../bridge/secret", false),
+        ("../Taskfile.yml", false),
+        ("../Taskfile.yml", true),
+        ("../.git/info/exclude", true),
+        ("../.git/hooks", false),
+        // Allowed: fails verification instead, and is undone.
+        ("../input.txt", false),
+    ] {
+        let cache = cache_dir();
+        let taskfile = format!(
+            r#"version: '3'
+tasks:
+  build:
+    sources: [input.txt]
+    generates: ['out/**']
+    cache:
+      url: 'file://{}/build-{{{{.CHECKSUM}}}}.zip'
+      outside_links: {outside_links}
+    cmds:
+      - mkdir -p out
+      - echo built > out/link
+"#,
+            cache.display()
+        );
+        let dir = stage_inline(&taskfile, "data");
+        std::fs::create_dir_all(dir.join(".git/info")).unwrap();
+        std::fs::create_dir_all(dir.join(".git/hooks")).unwrap();
+        std::fs::write(dir.join(".git/info/exclude"), "git").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("bridge")).unwrap();
+        let (first, code) = run_env(&dir, &["build"], &[]);
+        assert_eq!(code, 0, "first run failed: {first}");
+
+        let entry = std::fs::read_dir(&cache)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let comment = read_zip_comment(&std::fs::read(&entry).unwrap());
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&entry).unwrap());
+        zip.add_symlink("out/link", target, SimpleFileOptions::default())
+            .unwrap();
+        zip.start_file("out/keep.txt", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"cached").unwrap();
+        zip.set_comment(comment);
+        zip.finish().unwrap();
+
+        // A file of the user's own under the outputs, which the entry would
+        // replace.
+        std::fs::remove_dir_all(dir.join(".task")).unwrap();
+        std::fs::write(dir.join("out/keep.txt"), "mine").unwrap();
+        let taskfile_before = std::fs::read_to_string(dir.join("Taskfile.yml")).unwrap();
+        let (second, code) = run_env(&dir, &["build"], &[]);
+        let label = format!("{target} outside_links={outside_links}: {second}");
+        assert_eq!(code, 0, "{label}");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("secret")).unwrap(),
+            "S",
+            "{label}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("Taskfile.yml")).unwrap(),
+            taskfile_before,
+            "{label}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap(),
+            "git",
+            "{label}"
+        );
+        assert!(
+            std::fs::read_dir(dir.join(".git/hooks"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "{label}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("input.txt")).unwrap(),
+            "data",
+            "{label}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out/keep.txt")).unwrap(),
+            "mine",
+            "{label}"
+        );
+        assert!(
+            std::fs::symlink_metadata(dir.join("out/link"))
+                .unwrap()
+                .is_file(),
+            "{label}"
+        );
+        if target == "../input.txt" {
+            assert!(second.contains("checksum mismatch"), "{label}");
+        } else {
+            assert!(second.contains("rejected"), "{label}");
+        }
+    }
+}
+
+// An entry whose restore would refuse its links is not saved: it could only
+// ever miss.
+#[cfg(unix)]
+#[test]
+fn cache_save_skips_an_entry_its_restore_would_refuse() {
+    for (link, saved) in [
+        ("../Taskfile.yml", false),
+        ("/usr/bin/env", false),
+        ("data", true),
+    ] {
+        let cache = cache_dir();
+        let taskfile = format!(
+            r#"version: '3'
+tasks:
+  build:
+    sources: [input.txt]
+    generates: ['out/**']
+    cache:
+      url: 'file://{}/build-{{{{.CHECKSUM}}}}.zip'
+    cmds:
+      - mkdir -p out
+      - echo built > out/data
+      - ln -sfn {link} out/link
+"#,
+            cache.display()
+        );
+        let dir = stage_inline(&taskfile, "data");
+        let (out, code) = run_env(&dir, &["build"], &[]);
+        assert_eq!(code, 0, "{link}: {out}");
+        assert_eq!(dir_len(&cache) == 1, saved, "{link}: {out}");
+        assert_eq!(
+            out.contains("cache save \"build\" skipped"),
+            !saved,
+            "{link}: {out}"
+        );
+    }
+}
+
 // A failed file:// cache save warns without failing the task; previously it
 // logged only under `--verbose`. A destination beneath a regular file makes
 // `create_dir_all` fail.

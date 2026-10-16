@@ -250,6 +250,10 @@
                 "lock_timeout": {
                   "description": "Maximum time to wait for lock contention (e.g. \"5m\", \"1h\"). Default: 1h.",
                   "type": "string"
+                },
+                "outside_links": {
+                  "description": "Whether a restored entry may hold symlinks pointing outside the project (absolute, or climbing above the root), as a virtualenv's bin/python does. Default: false, which refuses such an entry so the task runs instead.",
+                  "type": "boolean"
                 }
               },
               "additionalProperties": false
@@ -986,6 +990,10 @@
                 "lock_timeout": {
                   "description": "Maximum time to wait for lock contention (e.g. \"5m\", \"1h\"). Default: 1h.",
                   "type": "string"
+                },
+                "outside_links": {
+                  "description": "Whether a restored entry may hold symlinks pointing outside the project (absolute, or climbing above the root), as a virtualenv's bin/python does. Default: false, which refuses such an entry so the task runs instead.",
+                  "type": "boolean"
                 }
               },
               "additionalProperties": false

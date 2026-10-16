@@ -114,13 +114,31 @@ impl Executor {
                     .zip(tmp)
                     .all(|(a, b)| a.eq_ignore_ascii_case(b)))
         };
+        crate::cache::recover_restores(&self.temp_dir.fingerprint, &mut self.logger().borrow_mut());
+        let journal = crate::cache::journal_dir(&self.temp_dir.fingerprint);
+        // The archive is trusted input (see `--import-cache`): its links may
+        // point anywhere.
         let policy = archive::RestorePolicy {
             check_meta: None,
             accept: Some(&accept),
+            outside_links: true,
+            protected: None,
+            journal: Some(&journal),
         };
-        if let Err(e) = archive::extract_archive(zip_path, Path::new(&self.dir), &policy) {
-            self.discard_checksums(cleanup);
-            return Err(e.into());
+        match archive::extract_archive(zip_path, Path::new(&self.dir), &policy) {
+            // Nothing to verify an import against: keep it.
+            Ok(extracted) => {
+                if let Err(e) = extracted.written.commit() {
+                    self.logger().borrow_mut().errf(
+                        Color::Yellow,
+                        &format!("task: cleaning up after the import: {e}\n"),
+                    );
+                }
+            }
+            Err(e) => {
+                self.discard_checksums(cleanup);
+                return Err(e.into());
+            }
         }
         self.run_setup_for_calls(calls).await
     }
@@ -202,12 +220,12 @@ impl Executor {
                     files.insert(st.checksum_file.clone(), task.name().to_string());
                 }
             }
-            let (keep, git) = archive::split_git_files(Path::new(&self.dir), &st.cache_files);
+            let (keep, git) = archive::split_unrestorable(Path::new(&self.dir), &st.cache_files);
             if !git.is_empty() {
                 self.logger().borrow_mut().errf(
                     Color::Yellow,
                     &format!(
-                        "task: {:?}: leaving out {} file(s) inside .git, which import refuses\n",
+                        "task: {:?}: leaving out {} file(s) inside .git or named so import cannot write them\n",
                         task.name(),
                         git.len()
                     ),

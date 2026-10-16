@@ -126,10 +126,18 @@ fn warn_cache_save_failed(logger: &mut Logger, repo: &str, task_name: &str, err:
     }
 }
 
+/// A restored cache entry: its metadata, and what it wrote.
+pub struct Restored {
+    pub meta: CacheMeta,
+    pub written: ocicas::restore::Written,
+}
+
 /// Attempt to download and restore a cached entry for `task` into `dir`. On
-/// success returns `(true, meta)`; the caller verifies the generates checksum
-/// against the restored files. A miss or any recoverable failure returns
-/// `(false, _)`. `source_value` is the task's current sources checksum: an
+/// success returns what was restored; the caller verifies the generates
+/// checksum against the restored files, and undoes the restore if it does not
+/// match. A miss or any recoverable failure returns `None`, having written
+/// nothing; an error means a restore failed partway and could not be undone,
+/// so the task must not run. `source_value` is the task's current sources checksum: an
 /// entry cached for other sources, or for another task, is refused before
 /// anything is written, as is one holding files outside the task's generates.
 pub async fn cache_restore(
@@ -137,19 +145,22 @@ pub async fn cache_restore(
     task: &Task,
     source_value: &str,
     dir: &Path,
+    guarded: &Guarded<'_>,
     logger: &mut Logger,
-) -> (bool, CacheMeta) {
+) -> Result<Option<Restored>, CacheError> {
+    recover_restores(guarded.temp_dir, logger);
+    let restore = TaskRestore::new(task, source_value, dir, guarded);
     match url {
-        CacheUrl::Zip { path } => restore_file(Path::new(path), task, source_value, dir, logger),
+        CacheUrl::Zip { path } => restore_file(Path::new(path), task, &restore, dir, logger),
         CacheUrl::Oci { repo, tag, opts } => {
-            restore_oci(repo, tag, opts.clone(), task, source_value, dir, logger).await
+            restore_oci(repo, tag, opts.clone(), task, &restore, dir, logger).await
         }
         CacheUrl::Redis => {
             logger.verbose_errf(
                 Color::Yellow,
                 "task: redis cache not yet supported in the Rust port\n",
             );
-            (false, CacheMeta::default())
+            Ok(None)
         }
     }
 }
@@ -158,16 +169,77 @@ pub async fn cache_restore(
 /// cached for this task and these sources, with a generates checksum, holding
 /// only the task's generates. Both transports write an entry from those alone
 /// (see [`cache_save`]), so anything else is not one Task wrote.
+/// What a cached link may never lead to besides `.git` (see
+/// [`archive::RestorePolicy::protected`]): Task's own state, and the Taskfiles
+/// it read, which a command writing through the link would rewrite.
+pub struct Guarded<'a> {
+    /// The fingerprint temp dir.
+    pub temp_dir: &'a str,
+    /// Every Taskfile and dotenv file read.
+    pub taskfiles: &'a [String],
+}
+
+/// Where restores journal the originals they move aside, under the temp dir.
+pub fn journal_dir(temp_dir: &str) -> std::path::PathBuf {
+    Path::new(temp_dir).join("restore")
+}
+
+/// Clean up after restores cut short (see [`ocicas::restore::recover`]),
+/// reporting what was done.
+pub fn recover_restores(temp_dir: &str, logger: &mut Logger) {
+    for done in ocicas::restore::recover(&journal_dir(temp_dir)) {
+        logger.errf(Color::Yellow, &format!("task: WARNING: {done}\n"));
+    }
+}
+
+/// How many entries [`TaskRestore::protects`] looks at below a link's target
+/// for a `.git` directory before giving up, and refusing the link.
+const PROTECT_WALK_BUDGET: usize = 100_000;
+
 struct TaskRestore {
+    /// The task's `cache: outside_links`.
+    outside_links: bool,
     local_name: String,
     source_value: String,
     matcher: CacheMatcher,
     root: String,
+    /// The temp dir and the Taskfiles, relative to the root (those under it).
+    temp_dir: Option<Vec<String>>,
+    taskfiles: Vec<Vec<String>>,
+    journal: std::path::PathBuf,
+}
+
+/// `path`'s components relative to `root`, if it lies under it.
+fn rel_parts(root: &Path, path: &str) -> Option<Vec<String>> {
+    let path = Path::new(path);
+    let rel = if path.is_absolute() {
+        path.strip_prefix(root).ok()?
+    } else {
+        path
+    };
+    Some(
+        rel.components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect(),
+    )
 }
 
 impl TaskRestore {
-    fn new(task: &Task, source_value: &str, dir: &Path) -> Self {
+    fn new(task: &Task, source_value: &str, dir: &Path, guarded: &Guarded<'_>) -> Self {
         Self {
+            temp_dir: rel_parts(dir, guarded.temp_dir),
+            journal: journal_dir(guarded.temp_dir),
+            taskfiles: guarded
+                .taskfiles
+                .iter()
+                .filter_map(|t| rel_parts(dir, t))
+                .collect(),
+            outside_links: task
+                .cache
+                .as_ref()
+                .and_then(|c| c.outside_links)
+                .unwrap_or(false),
             local_name: task.local_name(),
             source_value: source_value.to_string(),
             matcher: CacheMatcher::new(&task.compute_dir().to_string_lossy(), &task.generates),
@@ -188,7 +260,10 @@ impl TaskRestore {
                 meta.task
             )));
         }
-        if meta.sources.is_empty() || meta.sources != *source_value {
+        if meta.sources.is_empty() {
+            return Err(CacheError::rejected("it has no sources checksum"));
+        }
+        if meta.sources != *source_value {
             return Err(CacheError::rejected(format!(
                 "sources checksum mismatch: cached {}, got {source_value}",
                 meta.sources
@@ -199,6 +274,75 @@ impl TaskRestore {
 
     fn accept(&self, rel: &str) -> bool {
         self.matcher.matches(&self.root, rel)
+    }
+
+    /// Why a link may not lead to `dest`, if it may not: it is, or holds, a
+    /// path a command writing through the link must never rewrite — the root
+    /// itself, a `.git` directory or file at any depth, the temp dir, a
+    /// Taskfile or dotenv file Task read, the default Taskfile names and
+    /// `.taskrc.yml`/`.taskrc.yaml` in the root.
+    fn protects(&self, root: &std::fs::File, dest: &[String]) -> Option<String> {
+        let same = |a: &String, b: &String| a.eq_ignore_ascii_case(b);
+        // `dest` is `p`, or a directory above it.
+        let covers =
+            |p: &[String]| dest.len() <= p.len() && dest.iter().zip(p).all(|(a, b)| same(a, b));
+        let within =
+            |p: &[String]| dest.len() >= p.len() && p.iter().zip(dest).all(|(a, b)| same(a, b));
+        let root_file = |name: &str| matches!(dest, [d] if d.eq_ignore_ascii_case(name));
+        if dest.is_empty() {
+            return Some("the root directory".into());
+        }
+        if dest.iter().any(|c| archive::is_git_name(c)) {
+            return Some("inside a .git directory".into());
+        }
+        if self
+            .temp_dir
+            .as_deref()
+            .is_some_and(|t| covers(t) || within(t))
+        {
+            return Some("Task's temp directory, or one holding it".into());
+        }
+        if let Some(f) = self.taskfiles.iter().find(|t| covers(t)) {
+            return Some(format!(
+                "{:?}, or a directory holding it, which Task reads",
+                f.join("/")
+            ));
+        }
+        if crate::reader::DEFAULT_TASKFILES
+            .iter()
+            .chain(&[".taskrc.yml", ".taskrc.yaml"])
+            .any(|n| root_file(n))
+        {
+            return Some("a file Task reads".into());
+        }
+        match ocicas::restore::find_below(root, dest, PROTECT_WALK_BUDGET, archive::is_git_name) {
+            Ok(ocicas::restore::Found::Nothing) => None,
+            Ok(ocicas::restore::Found::Hit(git)) => {
+                Some(format!("which holds the repository {:?}", git.join("/")))
+            }
+            Ok(ocicas::restore::Found::TooMany) => Some(format!(
+                "which holds more than {PROTECT_WALK_BUDGET} entries to check for a .git directory"
+            )),
+            Err(e) => Some(format!(
+                "which could not be checked for a .git directory: {e}"
+            )),
+        }
+    }
+
+    /// The restore policy for this task, given its meta and path checks.
+    fn policy<'a>(
+        &'a self,
+        check: Option<&'a archive::MetaCheck<'a>>,
+        accept: &'a dyn Fn(&str) -> bool,
+        protected: &'a archive::Protected<'a>,
+    ) -> archive::RestorePolicy<'a> {
+        archive::RestorePolicy {
+            check_meta: check,
+            accept: Some(accept),
+            outside_links: self.outside_links,
+            protected: Some(protected),
+            journal: Some(&self.journal),
+        }
     }
 }
 
@@ -220,32 +364,30 @@ fn report_restore_error(logger: &mut Logger, task_name: &str, what: &str, e: &Ca
 fn restore_file(
     zip_path: &Path,
     task: &Task,
-    source_value: &str,
+    restore: &TaskRestore,
     dir: &Path,
     logger: &mut Logger,
-) -> (bool, CacheMeta) {
+) -> Result<Option<Restored>, CacheError> {
     let task_name = task.name();
     if !zip_path.exists() {
-        return (false, CacheMeta::default()); // miss
+        return Ok(None); // miss
     }
-    let restore = TaskRestore::new(task, source_value, dir);
     let check = |m: &CacheMeta| restore.check_meta(m);
     let accept = |rel: &str| restore.accept(rel);
-    let policy = archive::RestorePolicy {
-        check_meta: Some(&check),
-        accept: Some(&accept),
-    };
+    let protected = |root: &std::fs::File, dest: &[String]| restore.protects(root, dest);
+    let policy = restore.policy(Some(&check), &accept, &protected);
     match archive::extract_archive(zip_path, dir, &policy) {
-        Ok(meta) => {
+        Ok(archive::Extracted { meta, written }) => {
             logger.errf(
                 Color::Magenta,
                 &format!("task: {task_name:?} restored from cache\n"),
             );
-            (true, meta)
+            Ok(Some(Restored { meta, written }))
         }
+        Err(e @ CacheError::Unrecoverable(_)) => Err(e),
         Err(e) => {
             report_restore_error(logger, task_name, "cache extract", &e);
-            (false, CacheMeta::default())
+            Ok(None)
         }
     }
 }
@@ -254,19 +396,33 @@ fn restore_file(
 /// [`archive::extract_archive`] checks a zip's, before anything is fetched.
 fn vet_oci(
     restore: &TaskRestore,
+    dir: &Path,
     meta: &CacheMeta,
     index: &ocicas::Index,
 ) -> Result<(), CacheError> {
     restore.check_meta(meta)?;
     let accept = |rel: &str| restore.accept(rel);
-    let policy = archive::RestorePolicy {
-        check_meta: None,
-        accept: Some(&accept),
-    };
-    index.files.iter().try_for_each(|f| {
+    let protected = |root: &std::fs::File, dest: &[String]| restore.protects(root, dest);
+    let policy = restore.policy(None, &accept, &protected);
+    let mut set = std::collections::BTreeMap::new();
+    for f in &index.files {
         let parts = ocicas::restore::components(&f.path, false)?;
-        policy.check_entry(&f.path, &parts)
-    })
+        policy.check_entry(&f.path, &parts)?;
+        set.insert(
+            parts,
+            if f.symlink.is_empty() {
+                ocicas::restore::Pending::File
+            } else {
+                ocicas::restore::Pending::Link(f.symlink.as_bytes().to_vec())
+            },
+        );
+    }
+    ocicas::restore::check_unique(set.keys().map(Vec::as_slice))
+        .map_err(|e| CacheError::rejected(e.to_string()))?;
+    if set.len() != index.files.len() {
+        return Err(CacheError::rejected("the entry names one file twice"));
+    }
+    policy.check_links(dir, &set)
 }
 
 async fn restore_oci(
@@ -274,10 +430,10 @@ async fn restore_oci(
     tag: &str,
     opts: ocicas::RemoteOptions,
     task: &Task,
-    source_value: &str,
+    restore: &TaskRestore,
     dir: &Path,
     logger: &mut Logger,
-) -> (bool, CacheMeta) {
+) -> Result<Option<Restored>, CacheError> {
     let task_name = task.name();
     let store = match ocicas::Store::open(repo, opts).await {
         Ok(s) => s,
@@ -287,11 +443,11 @@ async fn restore_oci(
                 &format!("task: cache restore {task_name:?}: {e}\n"),
             );
             warn_cache_unreachable(logger, repo, &e);
-            return (false, CacheMeta::default());
+            return Ok(None);
         }
     };
     match store.resolve_annotations(tag).await {
-        Ok(None) => return (false, CacheMeta::default()), // miss
+        Ok(None) => return Ok(None), // miss
         Ok(Some(_)) => {}
         Err(e) => {
             logger.verbose_errf(
@@ -299,7 +455,7 @@ async fn restore_oci(
                 &format!("task: cache restore {task_name:?}: {e}\n"),
             );
             warn_cache_unreachable(logger, repo, &e);
-            return (false, CacheMeta::default());
+            return Ok(None);
         }
     }
     // Vet the annotations and the file list the index fetch returns — not the
@@ -313,35 +469,38 @@ async fn restore_oci(
                 &format!("task: cache restore {task_name:?}: {e}\n"),
             );
             warn_cache_unreachable(logger, repo, &e);
-            return (false, CacheMeta::default());
+            return Ok(None);
         }
     };
     let meta = meta_from_annotations(&pulled.annotations);
-    let restore = TaskRestore::new(task, source_value, dir);
-    if let Err(e) = vet_oci(&restore, &meta, &pulled.index) {
+    if let Err(e) = vet_oci(restore, dir, &meta, &pulled.index) {
         report_restore_error(
             logger,
             task_name,
             &format!("cache restore {task_name:?}"),
             &e,
         );
-        return (false, CacheMeta::default());
+        return Ok(None);
     }
-    match store.assemble_pulled(&pulled, dir).await {
-        Ok(()) => {
+    match store
+        .assemble_pulled(&pulled, dir, Some(&restore.journal))
+        .await
+    {
+        Ok(written) => {
             logger.errf(
                 Color::Magenta,
                 &format!("task: {task_name:?} restored from cache\n"),
             );
-            (true, meta)
+            Ok(Some(Restored { meta, written }))
         }
+        Err(ocicas::Error::Unrecoverable(m)) => Err(CacheError::Unrecoverable(m)),
         Err(e) => {
             logger.verbose_errf(
                 Color::Yellow,
                 &format!("task: cache restore {task_name:?}: {e}\n"),
             );
             warn_cache_unreachable(logger, repo, &e);
-            (false, CacheMeta::default())
+            Ok(None)
         }
     }
 }
@@ -361,9 +520,10 @@ pub async fn cache_save(
     url: &CacheUrl,
     task: &Task,
     dir: &Path,
-    temp_dir: &str,
+    guarded: &Guarded<'_>,
     logger: &mut Logger,
 ) {
+    let temp_dir = guarded.temp_dir;
     let task_name = task.name().to_string();
     // The annotation names the task as its own Taskfile does — the identity
     // the entry is keyed by — so a copy reached through another include
@@ -382,17 +542,31 @@ pub async fn cache_save(
         }
     };
     let source_value = checker.source_value().to_string();
-    let (files, git) = archive::split_git_files(dir, &st.cache_files);
-    if !git.is_empty() {
+    let (files, refused) = archive::split_unrestorable(dir, &st.cache_files);
+    if !refused.is_empty() {
         logger.errf(
             Color::Yellow,
             &format!(
-                "task: WARNING: cache save {task_name:?}: leaving out {} file(s) inside .git, which no restore writes\n",
-                git.len()
+                "task: WARNING: cache save {task_name:?}: leaving out {} file(s) inside .git or named so no restore can write them\n",
+                refused.len()
             ),
         );
     }
     if files.is_empty() {
+        return;
+    }
+    // An entry whose links its restore would refuse would only ever miss.
+    let restore = TaskRestore::new(task, &source_value, dir, guarded);
+    let accept = |_: &str| true;
+    let protected = |root: &std::fs::File, dest: &[String]| restore.protects(root, dest);
+    if let Err(e) = restore
+        .policy(None, &accept, &protected)
+        .check_links(dir, &archive::links_of(dir, &files))
+    {
+        logger.errf(
+            Color::Yellow,
+            &format!("task: WARNING: cache save {task_name:?} skipped: {e}\n"),
+        );
         return;
     }
     let st = crate::fingerprint::TaskStatus {
@@ -595,7 +769,14 @@ mod tests {
 
     #[test]
     fn oci_restore_takes_only_the_tasks_generates() {
-        let root = std::env::temp_dir().join("task-oci-vet");
+        let root = std::env::temp_dir().join(format!("task-oci-vet-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("packages/lib")).unwrap();
+        let taskfiles = [root.join("Taskfile.yml").to_string_lossy().into_owned()];
+        let temp_dir = root.join(".task").to_string_lossy().into_owned();
+        let guarded = Guarded {
+            temp_dir: &temp_dir,
+            taskfiles: &taskfiles,
+        };
         let task = Task {
             task: "build".into(),
             dirs: vec![root.to_string_lossy().into_owned()],
@@ -605,20 +786,107 @@ mod tests {
             }],
             ..Default::default()
         };
-        let restore = TaskRestore::new(&task, "src1", &root);
+        let restore = TaskRestore::new(&task, "src1", &root, &guarded);
         let meta = CacheMeta {
             task: "build".into(),
             sources: "src1".into(),
             generates: "gen".into(),
         };
-        assert!(vet_oci(&restore, &meta, &oci_index(&["out/a", "out/b/c"])).is_ok());
+        assert!(vet_oci(&restore, &root, &meta, &oci_index(&["out/a", "out/b/c"])).is_ok());
+        let mut linked = oci_index(&["out/a"]);
+        linked.files.push(ocicas::FileEntry {
+            path: "out/link".into(),
+            mode: 0o777,
+            size: 0,
+            symlink: "/etc/passwd".into(),
+        });
+        let err = vet_oci(&restore, &root, &meta, &linked).unwrap_err();
+        assert!(matches!(err, CacheError::Rejected(_)), "{err}");
+        let mut trusting = task.clone();
+        trusting.cache = Some(crate::ast::Cache {
+            outside_links: Some(true),
+            ..Default::default()
+        });
+        let trusting = TaskRestore::new(&trusting, "src1", &root, &guarded);
+        assert!(vet_oci(&trusting, &root, &meta, &linked).is_ok());
+        // Links that stay in the project, but would let the task's commands
+        // rewrite a Taskfile, git state or Task's own state: refused even with
+        // `outside_links`. A pnpm-style link into the workspace is fine.
+        let link_to = |target: &str| {
+            let mut idx = oci_index(&["out/a"]);
+            idx.files.push(ocicas::FileEntry {
+                path: "out/nm/link".into(),
+                mode: 0o777,
+                size: 0,
+                symlink: target.into(),
+            });
+            idx
+        };
+        for target in [
+            "../../Taskfile.yml",
+            "../../taskfile.yaml",
+            "../../.git/hooks",
+            "../../.git/info/exclude",
+            "../../.task",
+            "../..",
+        ] {
+            for r in [&restore, &trusting] {
+                let err = vet_oci(r, &root, &meta, &link_to(target)).unwrap_err();
+                assert!(matches!(err, CacheError::Rejected(_)), "{target}: {err}");
+            }
+        }
+        assert!(vet_oci(&restore, &root, &meta, &link_to("../../packages/lib")).is_ok());
+        // Directories holding something protected, however deep: a nested
+        // repository, an included Taskfile, a dotenv file, `.taskrc.yml`.
+        std::fs::create_dir_all(root.join("vendor/deep/repo/.git")).unwrap();
+        std::fs::create_dir_all(root.join("packages/withtf")).unwrap();
+        std::fs::write(root.join("packages/withtf/Taskfile.yml"), "x").unwrap();
+        std::fs::create_dir_all(root.join("conf")).unwrap();
+        std::fs::write(root.join("conf/.env"), "A=1").unwrap();
+        let guarded2_files = [
+            root.join("Taskfile.yml").to_string_lossy().into_owned(),
+            root.join("packages/withtf/Taskfile.yml")
+                .to_string_lossy()
+                .into_owned(),
+            root.join("conf/.env").to_string_lossy().into_owned(),
+        ];
+        let guarded2 = Guarded {
+            temp_dir: &temp_dir,
+            taskfiles: &guarded2_files,
+        };
+        let restore2 = TaskRestore::new(&task, "src1", &root, &guarded2);
+        for target in [
+            "../../vendor",
+            "../../vendor/deep",
+            "../../packages/withtf",
+            "../../conf",
+            "../../conf/.env",
+            "../../.taskrc.yml",
+        ] {
+            let err = vet_oci(&restore2, &root, &meta, &link_to(target)).unwrap_err();
+            assert!(matches!(err, CacheError::Rejected(_)), "{target}: {err}");
+        }
+        assert!(vet_oci(&restore2, &root, &meta, &link_to("../../packages/lib")).is_ok());
+        // One destination named twice.
+        let mut twice = oci_index(&["out/a"]);
+        twice.files.push(ocicas::FileEntry {
+            path: "out/a".into(),
+            mode: 0o777,
+            size: 0,
+            symlink: "/etc/passwd".into(),
+        });
+        let err = vet_oci(&trusting, &root, &meta, &twice).unwrap_err();
+        assert!(
+            matches!(err, CacheError::Rejected(_) | CacheError::Ocicas(_)),
+            "{err}"
+        );
         for bad in [
             "Taskfile.yml",
             "out/.git/hooks/x",
             ".git/config",
             ".task/checksum/x",
         ] {
-            let err = vet_oci(&restore, &meta, &oci_index(&["out/a", bad])).unwrap_err();
+            let err = vet_oci(&restore, &root, &meta, &oci_index(&["out/a", bad])).unwrap_err();
             assert!(matches!(err, CacheError::Rejected(_)), "{bad}: {err}");
         }
         for wrong in [
@@ -643,7 +911,7 @@ mod tests {
                 ..meta.clone()
             },
         ] {
-            let err = vet_oci(&restore, &wrong, &oci_index(&["out/a"])).unwrap_err();
+            let err = vet_oci(&restore, &root, &wrong, &oci_index(&["out/a"])).unwrap_err();
             assert!(matches!(err, CacheError::Rejected(_)), "{wrong:?}: {err}");
         }
     }

@@ -730,16 +730,17 @@ tasks:
 
 Cache fields:
 
-| Field       | Type     | Description                                                          |
-| ----------- | -------- | -------------------------------------------------------------------- |
-| `inherit`   | `string` | Name of a cache model to inherit from                                |
-| `enabled`   | `bool`   | Explicitly enable or disable the cache block                         |
-| `vk`        | `string` | Template string resolving to a vk-registry repository; see below     |
-| `api_key`   | `string` | Template string resolving to a bearer token (a vk-registry API key)  |
-| `namespace` | `string` | Template string prefixing the entries and locks under `vk`           |
-| `url`       | `string` | Template string resolving to the cache URL (`file://`, `oci://`)     |
-| `lock`      | `string` | Lock URL (`file://`, `redis://`, `vk://`, `vks://`); see below       |
-| `ttl`       | `string` | TTL for cached assets (e.g. `48h`, `7d`); default `48h`             |
+| Field           | Type     | Description                                                         |
+| --------------- | -------- | ------------------------------------------------------------------- |
+| `inherit`       | `string` | Name of a cache model to inherit from                               |
+| `enabled`       | `bool`   | Explicitly enable or disable the cache block                        |
+| `vk`            | `string` | Template string resolving to a vk-registry repository; see below    |
+| `api_key`       | `string` | Template string resolving to a bearer token (a vk-registry API key) |
+| `namespace`     | `string` | Template string prefixing the entries and locks under `vk`          |
+| `url`           | `string` | Template string resolving to the cache URL (`file://`, `oci://`)    |
+| `lock`          | `string` | Lock URL (`file://`, `redis://`, `vk://`, `vks://`); see below      |
+| `ttl`           | `string` | TTL for cached assets (e.g. `48h`, `7d`); default `48h`             |
+| `outside_links` | `bool`   | Allow restored symlinks pointing outside the project; see below     |
 
 **vk-registry**: `vk: host[:port]/repo` names one vk-registry repository that
 serves both the cache and the build-once lock, and derives the two URLs below
@@ -778,7 +779,68 @@ Supported `url` (storage) schemes:
 
 Whatever the scheme, a restore writes only the task's `generates`: an entry
 holding any other file, or cached for another task or other sources, is refused
-before anything is written, and the task runs instead.
+before anything is written, and the task runs instead. A generated file the
+save reaches through a directory symlink in the project — a literal path
+through the link, or one a wildcard exclusion skipped there — is refused on
+restore, and files inside `.git` are left out of the entry; a task relying on
+either misses the cache.
+
+A restore also refuses an entry holding a symlink that leads outside the
+project, since the task's commands, or whatever runs next, would read and
+write through it, and a shared cache is not trusted that far. Each link is
+resolved as the system will once the entry is in place — through the entry's
+own links and those already in the project — so a link reaching outside
+through another is refused too. An absolute target is refused even when it
+names a path in the project, as it breaks once the checkout moves. A relative
+link that stays inside is restored as is, including one into another task's
+outputs or a workspace package (`node_modules/@ws/lib -> ../../packages/lib`),
+unless it leads to a file a command writing through it must never rewrite, or
+to a directory holding one: a Taskfile or dotenv file Task read, the default
+Taskfile names and `.taskrc.yml`/`.taskrc.yaml` in the root directory, a
+`.git` directory or file at any depth (so a nested repository or submodule
+too), Task's temp directory, or the root directory itself. Up to 100,000
+entries below a link's target are looked at for a `.git`; a larger target is
+refused, as it cannot be checked. Such a link is refused whatever the task's
+settings, `outside_links` included: a pnpm workspace link to a package with a
+Taskfile of its own that Task reads, or to a directory holding a repository,
+makes that task's cache entries miss. An entry naming one destination twice
+(say `out/a` and `out/./a`) is refused too. A task whose own outputs hold a
+link the restore would refuse is not saved to the cache, with a warning. Set
+`outside_links: true` on a task whose outputs legitimately leave the project,
+such as a virtualenv, whose `bin/python` points at the system interpreter:
+
+```yaml
+tasks:
+  venv:
+    sources: [requirements.txt]
+    generates: ['.venv/**']
+    cache:
+      inherit: default
+      outside_links: true
+    cmds:
+      - python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+```
+
+With `outside_links: true`, cached links may lead anywhere outside the project.
+Checksum verification and commands follow these links, including poisoned ones:
+enable it only for caches you trust as much as the build itself.
+Whatever the setting, an entry whose restored files do not match its
+generates checksum is taken out again before the task runs, the files it
+replaced put back, and the restored directories' permissions applied only once
+it verifies. A restore that fails partway is taken out the same way, and
+counts as a miss. If taking a restore out fails, the task fails rather than
+run among the restored files, and so does `--import-cache`. A restore cut short (the process killed) leaves the originals
+it moved aside as `.task-restore-*` files beside them, journaled under the temp
+directory: the next restore puts them back, or drops them where the name has
+been filled since, and no save ever includes them. Windows restores no
+symlinks at all (an entry holding one misses there).
+
+These checks hold against what a cache entry holds, not against other
+processes changing the project concurrently: a link resolved before the
+restore can be retargeted before the task uses it, more easily on Windows.
+Nor do they bound disk use beyond the sizes an entry declares, or match
+`.git` spellings that macOS's HFS+ treats as the same name through ignorable
+Unicode characters.
 
 OCI cache requests retry connection failures, timeouts and interrupted transfers
 up to three times, waiting 2, 4 and 8 seconds between attempts. Each retry starts

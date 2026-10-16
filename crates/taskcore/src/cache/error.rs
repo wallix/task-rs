@@ -19,6 +19,9 @@ pub enum CacheError {
     /// A cached entry refused before anything was restored from it: it does
     /// not belong to the task, or would write outside its outputs.
     Rejected(String),
+    /// A restore failed partway and undoing it failed too, so restored
+    /// entries may remain: the task must not run past it as a miss.
+    Unrecoverable(String),
     /// Any other message-only failure.
     Msg(String),
 }
@@ -47,6 +50,7 @@ impl fmt::Display for CacheError {
             CacheError::Ocicas(e) => write!(f, "{e}"),
             CacheError::Unsupported(s) => write!(f, "{s}"),
             CacheError::Rejected(s) => write!(f, "{s}"),
+            CacheError::Unrecoverable(s) => write!(f, "{s}"),
             CacheError::Msg(s) => write!(f, "{s}"),
         }
     }
