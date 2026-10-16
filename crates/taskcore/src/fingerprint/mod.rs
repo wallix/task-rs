@@ -56,13 +56,21 @@ mod testutil {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+
+    const PREFIX: &str = "taskcore-fingerprint-";
 
     /// Creates a unique temporary directory and returns its path as a string.
+    ///
+    /// The directories are not removed when a test ends (callers hold plain
+    /// paths); instead the first call in a test process removes those left by
+    /// test processes that have exited, so they do not pile up in `TMPDIR`.
     pub fn tmp() -> String {
+        SWEEP.call_once(sweep_stale);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut d = std::env::temp_dir();
         d.push(format!(
-            "taskcore-fingerprint-{}-{}-{}",
+            "{PREFIX}{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -72,6 +80,91 @@ mod testutil {
         ));
         fs::create_dir_all(&d).unwrap();
         d.to_string_lossy().into_owned()
+    }
+
+    /// Removes `tmp()` directories whose test process (the first number in
+    /// the name) is gone. Some tests make a directory unreadable, so owner
+    /// permissions are restored first. Best effort: errors are ignored.
+    fn sweep_stale() {
+        let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix(PREFIX))
+                .and_then(|rest| rest.split('-').next())
+                .and_then(|pid| pid.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid != std::process::id() && !alive(pid) {
+                let path = entry.path();
+                make_owner_accessible(&path);
+                let _ = fs::remove_dir_all(&path);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn alive(pid: u32) -> bool {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    /// Without a portable liveness check, keep everything.
+    #[cfg(not(target_os = "linux"))]
+    fn alive(_pid: u32) -> bool {
+        true
+    }
+
+    #[cfg(unix)]
+    fn make_owner_accessible(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return;
+        };
+        if !meta.is_dir() {
+            return;
+        }
+        let mode = meta.permissions().mode() | 0o700;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                make_owner_accessible(&entry.path());
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn make_owner_accessible(_path: &Path) {}
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        #[test]
+        fn sweep_removes_unreadable_dirs_of_exited_processes() {
+            // A finished child's pid stands in for an exited test process.
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let dead = child.id();
+            child.wait().unwrap();
+            let stale = std::env::temp_dir().join(format!("{PREFIX}{dead}-0-0"));
+            let locked = stale.join("locked");
+            fs::create_dir_all(&locked).unwrap();
+            fs::write(locked.join("in.txt"), "x").unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let mine = tmp();
+
+            sweep_stale();
+
+            assert!(!stale.exists(), "{} left behind", stale.display());
+            assert!(
+                Path::new(&mine).exists(),
+                "the live process's dir was removed"
+            );
+        }
     }
 
     /// Polls `f` once, outside a runtime: fingerprint readings then run inline
