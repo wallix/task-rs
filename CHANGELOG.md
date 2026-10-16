@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **A cache restore cancelled before it is verified is undone,** and so is one
+  that cannot durably mark itself kept: the task then runs normally, and an
+  `--import-cache` fails. Recovering a restore cut short by a crash puts back
+  the originals it moved aside over entries it never verified, but only where an
+  entry is still exactly what the restore wrote: an entry changed since is kept,
+  with a warning naming the original, saved beside it as
+  `.task-restore-original-<name>-<random>`. A restore cut short while committing
+  keeps its entries.
+- **Fingerprints are read off the thread that schedules tasks.** Tasks running
+  in parallel now fingerprint at the same time, and interrupts, output and lock
+  renewals are handled while a large tree is being hashed.
 - **A run reads its sources and generates once after its commands.** The
   drift check, the saved fingerprint and the cache entry all use that one
   reading, instead of reading the files up to three more times. The drift

@@ -66,6 +66,30 @@ fn sources_and_outputs_are_allowed() {
     }
 }
 
+/// Fingerprinting runs on the engine's threads, outside any command's
+/// sandbox, even while a sandboxed command runs.
+#[test]
+fn fingerprints_are_read_outside_the_sandbox() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        let dir = stage("sandbox");
+        let env = [("TASK_SANDBOX", mode)];
+        let first = run_with_env(&dir, &["hash-beside-sandbox"], &env);
+        assert!(first.ok(), "{mode}: {}", first.combined());
+        let second = run_with_env(&dir, &["hash-beside-sandbox"], &env);
+        assert!(second.ok(), "{mode}: {}", second.combined());
+        for task in ["sandboxed-slow", "secret-hasher"] {
+            assert!(
+                second
+                    .combined()
+                    .contains(&format!("Task \"{task}\" is up to date")),
+                "{mode}: {}",
+                second.combined()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[test]
 fn sources_of_a_referenced_task_are_allowed() {
     for mode in ENFORCING.into_iter().filter(|m| available(m)) {

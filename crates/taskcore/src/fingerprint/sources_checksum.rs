@@ -9,6 +9,7 @@ use crate::filepathext;
 
 use super::checksum::{Datum, Snapshot, checksum_files, snapshot_files};
 use super::glob::{cache_globs, globs};
+use super::offload::off_thread;
 use super::pool::Workers;
 
 /// Validates whether a task is up to date by comparing a checksum of its source
@@ -17,8 +18,7 @@ use super::pool::Workers;
 pub struct ChecksumChecker {
     temp_dir: String,
     task: Task,
-    sources_globs: Vec<Glob>,
-    src_data: Vec<Datum>,
+    spec: Spec,
     /// From `task.source_hash` or lazily computed; empty when the task has no
     /// sources.
     source_hash: String,
@@ -67,83 +67,50 @@ pub struct TaskStatus {
     pub cache_files: Vec<String>,
 }
 
-impl ChecksumChecker {
-    /// Creates a checker bound to `task`. It precomputes the source globs and
-    /// metadata but does not access disk for the source hash: it reuses
-    /// `task.source_hash` when available (set during compilation). When that is
-    /// empty, [`ChecksumChecker::source_value`] computes it lazily.
-    pub fn new(temp_dir: impl Into<String>, task: Task) -> Self {
-        let mut c = ChecksumChecker {
-            temp_dir: temp_dir.into(),
-            source_hash: task.source_hash.clone(),
-            task,
-            sources_globs: Vec::new(),
-            src_data: Vec::new(),
-            pre_exec: None,
-        };
-        let (globs, data) = c.build_checksum_data();
-        c.sources_globs = globs;
-        c.src_data = data;
-        c
+/// What a reading of a task's fingerprint needs: owned, so a reading can run
+/// on another thread ([`super::offload`]) while the checker stays on the
+/// engine.
+#[derive(Clone, Debug)]
+struct Spec {
+    dir: String,
+    has_sources: bool,
+    sources: Vec<Glob>,
+    data: Vec<Datum>,
+    generates: Vec<Glob>,
+}
+
+// Readings move these across threads.
+const _: fn() = || {
+    fn assert_send<T: Send + 'static>() {}
+    assert_send::<Spec>();
+    assert_send::<Snapshot>();
+    assert_send::<PostRun>();
+    assert_send::<TaskStatus>();
+};
+
+impl Spec {
+    fn sources_snapshot(&self) -> std::io::Result<Snapshot> {
+        let files = globs(&self.dir, &self.sources)?;
+        snapshot_files(&self.dir, &files, &self.data, Workers::Auto)
     }
 
-    fn build_checksum_data(&self) -> (Vec<Glob>, Vec<Datum>) {
-        let dir = self.compute_dir();
-        let mut sources = Vec::new();
-        let mut data = Vec::new();
-        for source in &self.task.sources {
-            if let Some(value) = source.glob.strip_prefix("value:") {
-                data.push(Datum::Value(value.to_string()));
-            } else {
-                sources.push(source.clone());
-                data.push(Datum::SrcRule {
-                    group: source.group,
-                    negate: source.negate,
-                    glob: rel_glob(&dir, &source.glob),
-                });
-            }
-        }
-        for (i, cmd) in self.task.raw_cmds.iter().enumerate() {
-            data.push(serialize_cmd(i, cmd));
-        }
-        for g in &self.task.generates {
-            data.push(Datum::GenRule {
-                group: g.group,
-                negate: g.negate,
-                glob: rel_glob(&dir, &g.glob),
-            });
-        }
-        // Shown in this order by `--status`; the checksum sorts by encoding.
-        data.sort_by_cached_key(Datum::display);
-        (sources, data)
+    fn generates_checksum(&self) -> std::io::Result<String> {
+        let files = globs(&self.dir, &self.generates)?;
+        checksum_files(&self.dir, &files, &[])
     }
 
-    /// Reports whether the task is up to date: its sources and generates hashes
-    /// match the stored values. A task with no sources is never up to date.
-    pub fn is_up_to_date(&mut self) -> std::io::Result<bool> {
-        if self.task.sources.is_empty() {
-            return Ok(false);
-        }
-
+    /// The sources and the stored state compared at the up-to-date check.
+    fn up_to_date(&self, checksum_file: &str) -> std::io::Result<(Snapshot, bool)> {
         let sources = self.sources_snapshot()?;
-        let current_sources_hash = sources.hash.clone();
-        self.pre_exec = Some(sources);
-
-        let checksum_file = self.checksum_file_path()?;
-        let stored = std::fs::read_to_string(&checksum_file).unwrap_or_default();
-        let (old_sources_hash, old_generates_hash) = split_hashes(&stored);
-
-        let new_generates_hash = self.generates_checksum()?;
-
-        Ok(old_sources_hash == current_sources_hash && old_generates_hash == new_generates_hash)
+        let stored = std::fs::read_to_string(checksum_file).unwrap_or_default();
+        let (old_sources, old_generates) = split_hashes(&stored);
+        let generates = self.generates_checksum()?;
+        let ok = old_sources == sources.hash && old_generates == generates;
+        Ok((sources, ok))
     }
 
-    /// Reads the sources and generates once after the run, for
-    /// [`ChecksumChecker::drifted`] and [`ChecksumChecker::publish`]. Without
-    /// sources there is nothing to read. A sources error is returned; a
-    /// generates one is kept for the publish.
-    pub fn post_run(&self) -> std::io::Result<PostRun> {
-        if self.task.sources.is_empty() {
+    fn post_run(&self) -> std::io::Result<PostRun> {
+        if !self.has_sources {
             return Ok(PostRun {
                 sources: None,
                 generates: Ok(String::new()),
@@ -154,6 +121,81 @@ impl ChecksumChecker {
             sources: Some(sources),
             generates: self.generates_checksum(),
         })
+    }
+
+    fn status(&self, task: String, checksum_file: String) -> std::io::Result<TaskStatus> {
+        let stored = std::fs::read_to_string(&checksum_file).unwrap_or_default();
+        let (old_sources_hash, old_generates_hash) = split_hashes(&stored);
+
+        let current_sources_hash = self.sources_snapshot()?.hash;
+        let new_generates_hash = self.generates_checksum()?;
+
+        let sources_files = globs(&self.dir, &self.sources).unwrap_or_default();
+        let generates = globs(&self.dir, &self.generates).unwrap_or_default();
+        let cache_files = cache_globs(&self.dir, &self.generates).unwrap_or_default();
+
+        let src_ok = old_sources_hash == current_sources_hash;
+        let gen_ok = old_generates_hash == new_generates_hash;
+
+        Ok(TaskStatus {
+            task,
+            up_to_date: src_ok && gen_ok,
+            sources_up_to_date: src_ok,
+            generates_up_to_date: gen_ok,
+            checksum_file,
+            sources_hash: old_sources_hash.to_string(),
+            source_files: sources_files,
+            source_data: self.data.iter().map(Datum::display).collect(),
+            generates_hash: old_generates_hash.to_string(),
+            generate_files: generates,
+            cache_files,
+        })
+    }
+}
+
+impl ChecksumChecker {
+    /// Creates a checker bound to `task`. It precomputes the source globs and
+    /// metadata but does not access disk for the source hash: it reuses
+    /// `task.source_hash` when available (set during compilation). When that is
+    /// empty, [`ChecksumChecker::source_value`] computes it lazily.
+    pub fn new(temp_dir: impl Into<String>, task: Task) -> Self {
+        let dir = task.compute_dir().to_string_lossy().into_owned();
+        let (sources, data) = build_checksum_data(&dir, &task);
+        ChecksumChecker {
+            temp_dir: temp_dir.into(),
+            source_hash: task.source_hash.clone(),
+            spec: Spec {
+                dir,
+                has_sources: !task.sources.is_empty(),
+                sources,
+                data,
+                generates: task.generates.clone(),
+            },
+            task,
+            pre_exec: None,
+        }
+    }
+
+    /// Reports whether the task is up to date: its sources and generates hashes
+    /// match the stored values. A task with no sources is never up to date.
+    /// Reads off the engine's thread.
+    pub async fn is_up_to_date(&mut self) -> std::io::Result<bool> {
+        if !self.spec.has_sources {
+            return Ok(false);
+        }
+        let (spec, file) = (self.spec.clone(), self.checksum_file_path()?);
+        let (sources, ok) = off_thread(move || spec.up_to_date(&file)).await?;
+        self.pre_exec = Some(sources);
+        Ok(ok)
+    }
+
+    /// Reads the sources and generates once after the run, off the engine's
+    /// thread, for [`ChecksumChecker::drifted`] and
+    /// [`ChecksumChecker::publish`]. Without sources there is nothing to read.
+    /// A sources error is returned; a generates one is kept for the publish.
+    pub async fn post_run(&self) -> std::io::Result<PostRun> {
+        let spec = self.spec.clone();
+        off_thread(move || spec.post_run()).await
     }
 
     /// Reports whether the sources changed during the run: `post` differs
@@ -192,66 +234,51 @@ impl ChecksumChecker {
         Ok(Some(recorded))
     }
 
-    /// Returns the full fingerprint state for the task.
-    pub fn status(&self) -> std::io::Result<TaskStatus> {
-        let checksum_file = self.checksum_file_path()?;
-        let stored = std::fs::read_to_string(&checksum_file).unwrap_or_default();
-        let (old_sources_hash, old_generates_hash) = split_hashes(&stored);
-
-        let current_sources_hash = self.sources_checksum()?;
-        let new_generates_hash = self.generates_checksum()?;
-
-        let dir = self.compute_dir();
-        let sources_files = globs(&dir, &self.sources_globs).unwrap_or_default();
-        let generates = globs(&dir, &self.task.generates).unwrap_or_default();
-        let cache_files = cache_globs(&dir, &self.task.generates).unwrap_or_default();
-
-        let src_ok = old_sources_hash == current_sources_hash;
-        let gen_ok = old_generates_hash == new_generates_hash;
-
-        Ok(TaskStatus {
-            task: self.task.name().to_string(),
-            up_to_date: src_ok && gen_ok,
-            sources_up_to_date: src_ok,
-            generates_up_to_date: gen_ok,
-            checksum_file,
-            sources_hash: old_sources_hash.to_string(),
-            source_files: sources_files,
-            source_data: self.src_data.iter().map(Datum::display).collect(),
-            generates_hash: old_generates_hash.to_string(),
-            generate_files: generates,
-            cache_files,
-        })
+    /// Returns the full fingerprint state for the task, read off the engine's
+    /// thread.
+    pub async fn status(&self) -> std::io::Result<TaskStatus> {
+        let (spec, name, file) = (
+            self.spec.clone(),
+            self.task.name().to_string(),
+            self.checksum_file_path()?,
+        );
+        off_thread(move || spec.status(name, file)).await
     }
 
     /// Returns the sources checksum for use as the `CHECKSUM` template variable,
-    /// lock keys, and cache keys, computing it lazily from disk on first call
-    /// when it was not precomputed during compilation.
-    pub fn source_value(&mut self) -> &str {
-        if self.source_hash.is_empty() && !self.task.sources.is_empty() {
-            self.source_hash = self.sources_checksum().unwrap_or_default();
+    /// lock keys, and cache keys, computing it lazily from disk (off the
+    /// engine's thread) on first call when it was not precomputed during
+    /// compilation. A reading error leaves it empty.
+    pub async fn source_value(&mut self) -> &str {
+        if self.source_hash.is_empty() && self.spec.has_sources {
+            let spec = self.spec.clone();
+            self.source_hash = off_thread(move || Ok(spec.sources_snapshot()?.hash))
+                .await
+                .unwrap_or_default();
         }
         &self.source_hash
     }
 
-    /// Records the current sources and generates hashes as up to date.
+    /// Records the current sources and generates hashes as up to date, read
+    /// on the calling thread: for tests setting up state.
+    #[cfg(test)]
     pub fn set_up_to_date(&self) -> std::io::Result<()> {
-        if self.task.sources.is_empty() {
+        if !self.spec.has_sources {
             return Ok(());
         }
-
-        let new_sources_hash = self.sources_checksum()?;
-        let new_generates_hash = self.generates_checksum()?;
+        let new_sources_hash = self.spec.sources_snapshot()?.hash;
+        let new_generates_hash = self.spec.generates_checksum()?;
         self.write_state(&new_sources_hash, &new_generates_hash)
     }
 
-    /// [`ChecksumChecker::set_up_to_date`] with the generates hash just
-    /// computed by the caller: the sources are read afresh.
-    pub fn set_up_to_date_with_generates(&self, generates: &str) -> std::io::Result<()> {
-        if self.task.sources.is_empty() {
+    /// Records the task as up to date with the generates hash the caller just
+    /// computed and the sources read afresh, off the engine's thread.
+    pub async fn set_up_to_date_with_generates(&self, generates: &str) -> std::io::Result<()> {
+        if !self.spec.has_sources {
             return Ok(());
         }
-        let sources = self.sources_checksum()?;
+        let spec = self.spec.clone();
+        let sources = off_thread(move || Ok(spec.sources_snapshot()?.hash)).await?;
         self.write_state(&sources, generates)
     }
 
@@ -264,15 +291,17 @@ impl ChecksumChecker {
         )
     }
 
-    /// The files a cache entry for the task archives.
-    pub fn cache_files(&self) -> std::io::Result<Vec<String>> {
-        cache_globs(&self.compute_dir(), &self.task.generates)
+    /// The files a cache entry for the task archives, walked off the engine's
+    /// thread.
+    pub async fn cache_files(&self) -> std::io::Result<Vec<String>> {
+        let (dir, generates) = (self.spec.dir.clone(), self.spec.generates.clone());
+        off_thread(move || cache_globs(&dir, &generates)).await
     }
 
     /// Removes the stored checksum after a failed run so the next invocation
     /// re-runs the task.
     pub fn on_error(&self) -> std::io::Result<()> {
-        if self.task.sources.is_empty() {
+        if !self.spec.has_sources {
             return Ok(());
         }
         match std::fs::remove_file(self.checksum_file_path()?) {
@@ -287,25 +316,15 @@ impl ChecksumChecker {
         "checksum"
     }
 
+    /// Computes the current generates hash from disk, off the engine's thread.
+    pub async fn generates_checksum(&self) -> std::io::Result<String> {
+        let spec = self.spec.clone();
+        off_thread(move || spec.generates_checksum()).await
+    }
+
+    #[cfg(test)]
     fn sources_checksum(&self) -> std::io::Result<String> {
-        Ok(self.sources_snapshot()?.hash)
-    }
-
-    fn sources_snapshot(&self) -> std::io::Result<Snapshot> {
-        let dir = self.compute_dir();
-        let files = globs(&dir, &self.sources_globs)?;
-        snapshot_files(&dir, &files, &self.src_data, Workers::Auto)
-    }
-
-    /// Computes the current generates hash from disk.
-    pub fn generates_checksum(&self) -> std::io::Result<String> {
-        self.checksum(&self.task.generates, &[])
-    }
-
-    fn checksum(&self, patterns: &[Glob], data: &[Datum]) -> std::io::Result<String> {
-        let dir = self.compute_dir();
-        let sources = globs(&dir, patterns)?;
-        checksum_files(&dir, &sources, data)
+        Ok(self.spec.sources_snapshot()?.hash)
     }
 
     /// Namespaced copies share state when their compiled build inputs match.
@@ -318,10 +337,37 @@ impl ChecksumChecker {
             .to_string_lossy()
             .into_owned())
     }
+}
 
-    fn compute_dir(&self) -> String {
-        self.task.compute_dir().to_string_lossy().into_owned()
+/// The sources globs to walk and the data the sources checksum covers.
+fn build_checksum_data(dir: &str, task: &Task) -> (Vec<Glob>, Vec<Datum>) {
+    let mut sources = Vec::new();
+    let mut data = Vec::new();
+    for source in &task.sources {
+        if let Some(value) = source.glob.strip_prefix("value:") {
+            data.push(Datum::Value(value.to_string()));
+        } else {
+            sources.push(source.clone());
+            data.push(Datum::SrcRule {
+                group: source.group,
+                negate: source.negate,
+                glob: rel_glob(dir, &source.glob),
+            });
+        }
     }
+    for (i, cmd) in task.raw_cmds.iter().enumerate() {
+        data.push(serialize_cmd(i, cmd));
+    }
+    for g in &task.generates {
+        data.push(Datum::GenRule {
+            group: g.group,
+            negate: g.negate,
+            glob: rel_glob(dir, &g.glob),
+        });
+    }
+    // Shown in this order by `--status`; the checksum sorts by encoding.
+    data.sort_by_cached_key(Datum::display);
+    (sources, data)
 }
 
 fn serialize_cmd(idx: usize, c: &Cmd) -> Datum {
@@ -366,7 +412,7 @@ fn normalize_filename(f: &str) -> String {
 mod tests {
     use super::*;
     use crate::ast::Glob;
-    use crate::fingerprint::testutil::{join, tmp, write_file};
+    use crate::fingerprint::testutil::{join, now, tmp, write_file};
 
     fn new_task(dir: &str, sources: Vec<Glob>, generates: Vec<Glob>) -> Task {
         Task {
@@ -402,7 +448,7 @@ mod tests {
         excluded.group = 1;
         let task = new_task(&dir, vec![g("main.c"), excluded], vec![g("out/*")]);
         let checker = ChecksumChecker::new(tmp(), task);
-        let data = checker.status().unwrap().source_data;
+        let data = now(checker.status()).unwrap().source_data;
         assert_eq!(
             data,
             ["genrule:out/*", "srcrule:main.c", "srcrule@1:!lib/*.tmp"]
@@ -425,7 +471,7 @@ mod tests {
         );
 
         let checker = ChecksumChecker::new(tmp_dir, task);
-        let st = checker.status().unwrap();
+        let st = now(checker.status()).unwrap();
 
         assert_eq!(
             st.generate_files,
@@ -451,7 +497,7 @@ mod tests {
 
         let task = new_task(&dir, vec![g("main.go")], vec![g("build/**/*")]);
         let checker = ChecksumChecker::new(tmp_dir, task);
-        let st = checker.status().unwrap();
+        let st = now(checker.status()).unwrap();
 
         let expected = vec![join(&dir, "build/app"), join(&dir, "build/app.map")];
         assert_eq!(st.generate_files, expected);
@@ -477,17 +523,17 @@ mod tests {
             .unwrap();
 
         let mut checker2 = ChecksumChecker::new(&tmp_dir, task.clone());
-        assert!(checker2.is_up_to_date().unwrap());
+        assert!(now(checker2.is_up_to_date()).unwrap());
 
         // Non-marker change: still up to date.
         write_file(&dir, "node_modules/pkg/index.js", "v2-changed");
         let mut checker3 = ChecksumChecker::new(&tmp_dir, task.clone());
-        assert!(checker3.is_up_to_date().unwrap());
+        assert!(now(checker3.is_up_to_date()).unwrap());
 
         // Marker change: out of date.
         write_file(&dir, "node_modules/.yarn-state.yml", "state-v2");
         let mut checker4 = ChecksumChecker::new(&tmp_dir, task);
-        assert!(!checker4.is_up_to_date().unwrap());
+        assert!(!now(checker4.is_up_to_date()).unwrap());
     }
 
     #[test]
@@ -500,29 +546,29 @@ mod tests {
 
         // No stored checksum yet.
         let mut checker = ChecksumChecker::new(&tmp_dir, task.clone());
-        assert!(!checker.is_up_to_date().unwrap());
+        assert!(!now(checker.is_up_to_date()).unwrap());
 
         // Record and re-check.
         checker.set_up_to_date().unwrap();
         let mut checker2 = ChecksumChecker::new(&tmp_dir, task.clone());
-        assert!(checker2.is_up_to_date().unwrap());
+        assert!(now(checker2.is_up_to_date()).unwrap());
         // No drift after the snapshot was taken.
-        assert!(!checker2.drifted(&checker2.post_run().unwrap()));
+        assert!(!checker2.drifted(&now(checker2.post_run()).unwrap()));
 
         // Modify the source: out of date, and drift detected relative to the
         // snapshot taken above, naming the changed file.
         write_file(&dir, "src.txt", "two");
-        let post = checker2.post_run().unwrap();
+        let post = now(checker2.post_run()).unwrap();
         assert!(checker2.drifted(&post));
         assert_eq!(checker2.changed_sources(&post), vec!["src.txt"]);
         let mut checker3 = ChecksumChecker::new(&tmp_dir, task.clone());
-        assert!(!checker3.is_up_to_date().unwrap());
+        assert!(!now(checker3.is_up_to_date()).unwrap());
 
         // on_error clears the stored checksum.
         checker.set_up_to_date().unwrap();
         checker.on_error().unwrap();
         let mut checker4 = ChecksumChecker::new(&tmp_dir, task);
-        assert!(!checker4.is_up_to_date().unwrap());
+        assert!(!now(checker4.is_up_to_date()).unwrap());
     }
 
     #[test]
@@ -536,13 +582,13 @@ mod tests {
         let task = new_task(&dir, vec![g("*.txt")], vec![]);
         let mut checker = ChecksumChecker::new(&tmp_dir, task);
         checker.set_up_to_date().unwrap();
-        assert!(checker.is_up_to_date().unwrap());
+        assert!(now(checker.is_up_to_date()).unwrap());
 
         write_file(&dir, "a.txt", "one-longer");
         std::fs::remove_file(join(&dir, "b.txt")).unwrap();
         write_file(&dir, "c.txt", "three");
 
-        let post = checker.post_run().unwrap();
+        let post = now(checker.post_run()).unwrap();
         assert!(checker.drifted(&post));
         assert_eq!(
             checker.changed_sources(&post),
@@ -559,14 +605,17 @@ mod tests {
         write_file(&dir, "out.txt", "built");
         let task = new_task(&dir, vec![g("src.txt")], vec![g("out.txt")]);
         let mut checker = ChecksumChecker::new(&tmp_dir, task.clone());
-        assert!(!checker.is_up_to_date().unwrap());
-        let post = checker.post_run().unwrap();
+        assert!(!now(checker.is_up_to_date()).unwrap());
+        let post = now(checker.post_run()).unwrap();
         assert!(!checker.drifted(&post));
         // Changed after the reading: not what is recorded.
         write_file(&dir, "out.txt", "later");
         let recorded = checker.publish(post).unwrap().unwrap();
         assert_eq!(recorded.sources, checker.sources_checksum().unwrap());
-        assert_ne!(recorded.generates, checker.generates_checksum().unwrap());
+        assert_ne!(
+            recorded.generates,
+            now(checker.generates_checksum()).unwrap()
+        );
         let stored = std::fs::read_to_string(checker.checksum_file_path().unwrap()).unwrap();
         assert_eq!(
             stored,
@@ -583,15 +632,12 @@ mod tests {
         write_file(&dir, "src.txt", "one");
         let task = new_task(&dir, vec![g("src.txt")], vec![]);
         let checker = ChecksumChecker::new(&tmp_dir, task.clone());
-        let post = checker.post_run().unwrap();
+        let post = now(checker.post_run()).unwrap();
         assert!(!checker.drifted(&post));
         assert!(checker.changed_sources(&post).is_empty());
         checker.publish(post).unwrap().unwrap();
-        assert!(
-            ChecksumChecker::new(&tmp_dir, task)
-                .is_up_to_date()
-                .unwrap()
-        );
+        let mut again = ChecksumChecker::new(&tmp_dir, task);
+        assert!(now(again.is_up_to_date()).unwrap());
     }
 
     /// An unreadable generate fails the publish, and only the publish.
@@ -606,7 +652,7 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         let task = new_task(&dir, vec![g("src.txt")], vec![g("out.p")]);
         let checker = ChecksumChecker::new(&tmp_dir, task);
-        let post = checker.post_run().unwrap();
+        let post = now(checker.post_run()).unwrap();
         assert!(!checker.drifted(&post));
         let err = checker.publish(post).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -619,7 +665,7 @@ mod tests {
         write_file(&dir, "src.txt", "one");
         let task = new_task(&dir, vec![g("src.txt")], vec![]);
         let checker = ChecksumChecker::new(&tmp_dir, task);
-        checker.set_up_to_date_with_generates("gen").unwrap();
+        now(checker.set_up_to_date_with_generates("gen")).unwrap();
         let stored = std::fs::read_to_string(checker.checksum_file_path().unwrap()).unwrap();
         assert_eq!(
             stored,
@@ -633,10 +679,10 @@ mod tests {
         let tmp_dir = tmp();
         let task = new_task(&dir, vec![], vec![]);
         let mut checker = ChecksumChecker::new(tmp_dir, task);
-        assert!(!checker.is_up_to_date().unwrap());
+        assert!(!now(checker.is_up_to_date()).unwrap());
         // set_up_to_date, publish and on_error are no-ops with no sources.
         assert!(checker.set_up_to_date().is_ok());
-        let post = checker.post_run().unwrap();
+        let post = now(checker.post_run()).unwrap();
         assert!(!checker.drifted(&post));
         assert_eq!(checker.publish(post).unwrap(), None);
         assert!(checker.on_error().is_ok());
@@ -649,7 +695,7 @@ mod tests {
         write_file(&dir, "src.txt", "content");
         let task = new_task(&dir, vec![g("src.txt")], vec![]);
         let mut checker = ChecksumChecker::new(tmp_dir, task);
-        assert!(!checker.source_value().is_empty());
+        assert!(!now(checker.source_value()).is_empty());
     }
 
     #[test]

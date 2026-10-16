@@ -368,7 +368,9 @@ impl Store {
     /// policy on which paths the entry may write (see [`assemble`]).
     pub async fn pull(&self, tag: &str, dir: &Path) -> Result<(Index, BTreeMap<String, String>)> {
         let pulled = self.pull_index(tag).await?;
-        self.assemble_pulled(&pulled, dir, None).await?.commit()?;
+        self.assemble_pulled(&pulled, dir, None)
+            .await?
+            .commit_or_undo()?;
         Ok((pulled.index, pulled.annotations))
     }
 

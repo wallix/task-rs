@@ -38,7 +38,7 @@ impl Executor {
                 continue;
             }
             let checker = ChecksumChecker::new(&self.temp_dir.fingerprint, task.clone());
-            statuses.push(checker.status()?);
+            statuses.push(checker.status().await?);
         }
 
         if as_json {
@@ -104,7 +104,7 @@ impl Executor {
     async fn task_up_to_date(&self, name: &str) -> Option<bool> {
         let task = self.compiled_task(&Call::new(name)).await.ok()?;
         let mut checker = ChecksumChecker::new(&self.temp_dir.fingerprint, task);
-        checker.is_up_to_date().ok()
+        checker.is_up_to_date().await.ok()
     }
 
     fn print_status(&self, st: &TaskStatus) {

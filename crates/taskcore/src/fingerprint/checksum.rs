@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use twox_hash::XxHash3_128;
 
@@ -175,11 +176,20 @@ fn separators(key: String) -> String {
 /// Digests one entry: a symlink's target, or a regular file's content. Any
 /// other kind is an error, as is a file that changes kind while being opened.
 /// Errors keep their kind and name the path.
-pub(crate) fn digest(path: &str, buf: &mut [u8]) -> std::io::Result<(Kind, u128)> {
-    digest_inner(Path::new(path), buf).map_err(|e| with_path(path, e))
+/// A set `cancel` stops it between reads.
+pub(crate) fn digest(
+    path: &str,
+    buf: &mut [u8],
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<(Kind, u128)> {
+    digest_inner(Path::new(path), buf, cancel).map_err(|e| with_path(path, e))
 }
 
-fn digest_inner(path: &Path, buf: &mut [u8]) -> std::io::Result<(Kind, u128)> {
+fn digest_inner(
+    path: &Path,
+    buf: &mut [u8],
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<(Kind, u128)> {
     let meta = std::fs::symlink_metadata(path)?;
     let ft = meta.file_type();
     if ft.is_symlink() {
@@ -192,6 +202,9 @@ fn digest_inner(path: &Path, buf: &mut [u8]) -> std::io::Result<(Kind, u128)> {
     let mut file = open_regular(path)?;
     let mut hasher = XxHash3_128::new();
     loop {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(super::offload::interrupted());
+        }
         let n = file.read(buf)?;
         if n == 0 {
             break;
@@ -340,6 +353,9 @@ pub(crate) fn snapshot_files(
 ) -> std::io::Result<Snapshot> {
     let entries = entries(basedir, files);
     let digests = digest_all(&entries, workers)?;
+    if super::offload::cancelled() {
+        return Err(super::offload::interrupted());
+    }
     let combined: Vec<(&Entry, Kind, u128)> = entries
         .iter()
         .zip(digests)

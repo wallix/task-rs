@@ -638,6 +638,10 @@ impl Walker<'_> {
 /// with a dot; `**` traversal also never crosses into dot directories.
 fn list_dir(dir: &str, dotglob: bool) -> Vec<String> {
     let mut entries = Vec::new();
+    // A cancelled reading ends here: its result is discarded.
+    if super::offload::cancelled() {
+        return entries;
+    }
     let Ok(read) = std::fs::read_dir(dir) else {
         return entries;
     };

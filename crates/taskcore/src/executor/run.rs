@@ -901,7 +901,7 @@ impl Executor {
             };
             let precond_met = precond_met?;
 
-            let up_to_date = checker.is_up_to_date()?;
+            let up_to_date = checker.is_up_to_date().await?;
             if up_to_date && precond_met {
                 self.log_up_to_date(t, call);
                 return Ok(());
@@ -914,7 +914,7 @@ impl Executor {
                 && let Some(url) = cache_url
             {
                 {
-                    let source_value = checker.source_value().to_string();
+                    let source_value = checker.source_value().await.to_string();
                     let restored = {
                         let (mut scratch, sink) = self.scratch_logger();
                         let r = cache::cache_restore(
@@ -935,10 +935,18 @@ impl Executor {
                         r.map_err(|e| ExecutorError::Cache(Box::new(e)))?
                     };
                     if let Some(restored) = restored {
-                        match self.cache_verify_meta(t, &mut checker, &restored.meta) {
-                            Ok(()) => {
-                                // Verified: drop the originals it replaced.
-                                if let Err(e) = restored.written.commit() {
+                        // Verification awaits: a cancelled run drops this,
+                        // undoing the restore.
+                        let written = cache::Unverified::new(restored.written);
+                        match self
+                            .cache_verify_meta(t, &mut checker, &restored.meta)
+                            .await
+                        {
+                            // Verified: keep it, dropping the originals it
+                            // replaced.
+                            Ok(()) => match written.commit() {
+                                Ok(()) => return Ok(()),
+                                Err(cache::CommitFailure::Cleanup(e)) => {
                                     self.logger().borrow_mut().errf(
                                         Color::Yellow,
                                         &format!(
@@ -946,9 +954,29 @@ impl Executor {
                                             t.name()
                                         ),
                                     );
+                                    return Ok(());
                                 }
-                                return Ok(());
-                            }
+                                // Not kept, so undone: the state recorded by
+                                // the verification no longer holds.
+                                Err(cache::CommitFailure::NotKept { error, undo }) => {
+                                    let _ = checker.on_error();
+                                    if let Err(e) = undo {
+                                        return Err(ExecutorError::Cache(Box::new(
+                                            cache::CacheError::msg(format!(
+                                                "undoing the restore of {:?} that could not be kept: {e}",
+                                                t.name()
+                                            )),
+                                        )));
+                                    }
+                                    self.logger().borrow_mut().errf(
+                                        Color::Yellow,
+                                        &format!(
+                                            "task: WARNING: cache for {:?}: could not keep the restore: {error}, running task normally\n",
+                                            t.name()
+                                        ),
+                                    );
+                                }
+                            },
                             Err(e) => {
                                 self.logger().borrow_mut().errf(
                                     Color::Yellow,
@@ -960,7 +988,7 @@ impl Executor {
                                 // Undo unverified output before commands can write
                                 // through a restored link. If undo fails, fail the
                                 // task rather than run among restored entries.
-                                if let Err(e) = restored.written.undo() {
+                                if let Err(e) = written.undo() {
                                     return Err(ExecutorError::Cache(Box::new(
                                         cache::CacheError::msg(format!(
                                             "undoing the unverified restore of {:?}: {e}",
@@ -1055,8 +1083,7 @@ impl Executor {
         // cannot be trusted as the build-once result. Read here, before the
         // early return and before anything that can fail, so the warning also
         // reaches an operator whose task errored out.
-        let lock_lost = lock.is_some_and(cache::Guard::is_lost);
-        if lock_lost {
+        let warn_lost = || {
             self.logger().borrow_mut().errf(
                 Color::Yellow,
                 &format!(
@@ -1065,6 +1092,10 @@ impl Executor {
                     t.name()
                 ),
             );
+        };
+        let mut lock_lost = lock.is_some_and(cache::Guard::is_lost);
+        if lock_lost {
+            warn_lost();
         }
 
         if let Some(e) = run_err {
@@ -1079,8 +1110,14 @@ impl Executor {
             let post = if lock_lost {
                 None
             } else {
-                Some(checker.post_run()?)
+                Some(checker.post_run().await?)
             };
+            // The reading ran off this thread: the lock may have been lost
+            // meanwhile.
+            if !lock_lost && lock.is_some_and(cache::Guard::is_lost) {
+                warn_lost();
+                lock_lost = true;
+            }
             let drifted = post.as_ref().is_some_and(|p| checker.drifted(p));
             if lock_lost {
                 let _ = checker.on_error();
@@ -2045,7 +2082,7 @@ impl Executor {
         files
     }
 
-    fn cache_verify_meta(
+    async fn cache_verify_meta(
         &self,
         t: &Task,
         checker: &mut ChecksumChecker,
@@ -2060,7 +2097,7 @@ impl Executor {
                 ),
             ))));
         }
-        let source_value = checker.source_value().to_string();
+        let source_value = checker.source_value().await.to_string();
         if !meta.sources.is_empty() && meta.sources != source_value {
             return Err(ExecutorError::Cache(Box::new(cache::CacheError::msg(
                 format!(
@@ -2069,7 +2106,7 @@ impl Executor {
                 ),
             ))));
         }
-        let current = checker.generates_checksum()?;
+        let current = checker.generates_checksum().await?;
         if current != meta.generates {
             return Err(ExecutorError::Cache(Box::new(cache::CacheError::msg(
                 format!(
@@ -2080,7 +2117,7 @@ impl Executor {
         }
         // The generates were just read; the sources are read again, as the
         // restore may have written some.
-        checker.set_up_to_date_with_generates(&current)?;
+        checker.set_up_to_date_with_generates(&current).await?;
         Ok(())
     }
 }

@@ -7,6 +7,7 @@
 
 mod checksum;
 mod glob;
+mod offload;
 mod pool;
 mod sources_checksum;
 
@@ -37,6 +38,16 @@ mod testutil {
         ));
         fs::create_dir_all(&d).unwrap();
         d.to_string_lossy().into_owned()
+    }
+
+    /// Polls `f` once, outside a runtime: fingerprint readings then run inline
+    /// and complete at once.
+    pub fn now<F: std::future::Future>(f: F) -> F::Output {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::pin::pin!(f).as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(v) => v,
+            std::task::Poll::Pending => panic!("a reading waited outside a runtime"),
+        }
     }
 
     /// Joins a directory with a relative path.

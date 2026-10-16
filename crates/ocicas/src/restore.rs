@@ -308,6 +308,43 @@ struct Aside {
     id: Id,
 }
 
+/// What a restore wrote at a name it had moved an original away from, as the
+/// journal records it: the evidence a [`recover`] needs before it replaces
+/// that name's occupant with the original. Off unix there is none to record,
+/// and an occupant is never replaced.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Wrote {
+    wrote: Vec<String>,
+    stamp: Stamp,
+}
+
+/// Device, inode, size, and modification and change times of a name, not
+/// followed: an edit in place or a replacement since changes at least one.
+type Stamp = (u64, u64, u64, i64, i64, i64, i64);
+
+#[cfg(unix)]
+fn stamp(dir: &File, leaf: &Path) -> Result<Option<Stamp>> {
+    use capfs::MetadataExt;
+    match capfs::stat(dir, leaf, FollowSymlinks::No) {
+        Ok(m) => Ok(Some((
+            m.dev(),
+            m.ino(),
+            m.size(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn stamp(_dir: &File, _leaf: &Path) -> Result<Option<Stamp>> {
+    Ok(None)
+}
+
 /// A record, under the temp dir, of the originals a restore moved aside, so
 /// that a restore cut short (a crash, a kill) can be cleaned up by the next:
 /// see [`recover`]. Held locked while the restore runs.
@@ -337,16 +374,65 @@ impl Journal {
         Ok(self.file.sync_data()?)
     }
 
+    /// Records what the restore wrote at a name it moved an original from.
+    /// Not synced: losing it to a crash only makes [`recover`] keep both.
+    fn wrote(&mut self, wrote: &Wrote) -> Result<()> {
+        use std::io::Write as _;
+        writeln!(self.file, "{}", serde_json::to_string(wrote)?)?;
+        Ok(())
+    }
+
+    /// Marks the restore as kept, before its originals are dropped: from here
+    /// a recovery keeps the restored entries rather than putting originals
+    /// back over them. Durable (synced) before it returns.
+    fn committing(&mut self) -> Result<()> {
+        use std::io::Write as _;
+        if testing::FAIL_COMMIT_MARK.with(|f| f.replace(false)) {
+            return Err(Error::Io(std::io::Error::other(
+                "injected commit-mark failure",
+            )));
+        }
+        writeln!(self.file, "{}", serde_json::to_string(COMMIT_MARK)?)?;
+        Ok(self.file.sync_data()?)
+    }
+
     fn close(self) {
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
-/// Clean up after restores into `journal_dir`'s journals that were cut short:
-/// put each original a restore moved aside back where its name is free, or
-/// drop it where the name has been filled since. A journal another process
-/// holds is a restore still running, and is left alone. Returns what it did,
-/// for the caller to report.
+/// The journal line [`Journal::committing`] writes.
+const COMMIT_MARK: &str = "commit";
+
+/// Hooks for tests of callers.
+#[doc(hidden)]
+pub mod testing {
+    thread_local! {
+        pub(super) static FAIL_COMMIT_MARK: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// Makes this thread's next commit fail to write its durable mark.
+    pub fn fail_next_commit_mark() {
+        FAIL_COMMIT_MARK.with(|f| f.set(true));
+    }
+}
+
+/// Clean up after restores into `journal_dir`'s journals that were cut short.
+///
+/// A restore that never reached its commit was never verified. Each original
+/// it moved aside goes back where its name is free, and over the occupant
+/// only when the journal shows the occupant is still exactly what the
+/// restore wrote there. Anything else holding the name (an edit since, a
+/// replacement, a directory) is never deleted: both are kept, the original
+/// renamed `.task-restore-original-<name>-<random>` beside it, and the caller
+/// is told both paths.
+///
+/// A restore cut short while committing was verified: its originals go back
+/// only where their names are free, and are dropped elsewhere. Either way the
+/// journal is resolved and removed. A journal another process holds is a
+/// restore still running, and is left alone. Returns what it did, for the
+/// caller to report.
 pub fn recover(journal_dir: &Path) -> Vec<String> {
     let mut done = Vec::new();
     let Ok(entries) = std::fs::read_dir(journal_dir) else {
@@ -376,24 +462,76 @@ pub fn recover(journal_dir: &Path) -> Vec<String> {
             && let Ok(root) =
                 capfs::open_ambient_dir(Path::new(&base), cap_primitives::ambient_authority())
         {
-            for aside in lines
-                .map_while(|l| l.ok())
-                .filter_map(|l| serde_json::from_str::<Aside>(&l).ok())
-            {
+            let mut asides = Vec::new();
+            let mut wrote: Vec<Wrote> = Vec::new();
+            let mut committed = false;
+            for line in lines.map_while(|l| l.ok()) {
+                if let Ok(aside) = serde_json::from_str::<Aside>(&line) {
+                    asides.push(aside);
+                } else if let Ok(w) = serde_json::from_str::<Wrote>(&line) {
+                    wrote.push(w);
+                } else if serde_json::from_str::<String>(&line).is_ok_and(|m| m == COMMIT_MARK) {
+                    committed = true;
+                }
+            }
+            for aside in asides {
                 let name = aside.parts.join("/");
                 let r = in_parent(&root, &aside.parts, |parent, leaf| {
                     let original = Path::new(&aside.aside);
                     if leaf_type(parent, original)?.is_none() {
                         return Ok(());
                     }
-                    if leaf_type(parent, leaf)?.is_none() {
-                        no_replace_move(parent, original, leaf)?;
-                        done.push(format!("put back {name:?} after an interrupted restore"));
-                    } else {
-                        capfs::remove_file(parent, original)?;
-                        done.push(format!(
-                            "dropped the original of {name:?} left by an interrupted restore"
-                        ));
+                    match leaf_type(parent, leaf)? {
+                        None => {
+                            no_replace_move(parent, original, leaf)?;
+                            done.push(format!("put back {name:?} after an interrupted restore"));
+                        }
+                        Some(_) if committed => {
+                            capfs::remove_file(parent, original)?;
+                            done.push(format!(
+                                "dropped the original of {name:?} left by an interrupted restore"
+                            ));
+                        }
+                        Some(t)
+                            if !t.is_dir()
+                                && stamp(parent, leaf)?.is_some_and(|now| {
+                                    wrote
+                                        .iter()
+                                        .any(|w| w.wrote == aside.parts && w.stamp == now)
+                                }) =>
+                        {
+                            // Still exactly what the unverified restore wrote.
+                            capfs::remove_file(parent, leaf)?;
+                            no_replace_move(parent, original, leaf)?;
+                            done.push(format!(
+                                "put back {name:?} over the unverified entry of an interrupted \
+                                 restore"
+                            ));
+                        }
+                        Some(_) => {
+                            // Changed since, or not provably the restore's:
+                            // keep both, under a name that says what it is.
+                            let leaf_name = leaf.to_string_lossy();
+                            let kept = format!(
+                                "{ASIDE_PREFIX}original-{leaf_name}-{}",
+                                aside_name().trim_start_matches(ASIDE_PREFIX)
+                            );
+                            let kept_at = match no_replace_move(parent, original, Path::new(&kept))
+                            {
+                                Ok(()) => kept,
+                                // Too long a name, say: it stays where it is.
+                                Err(_) => aside.aside.clone(),
+                            };
+                            let mut kept_parts = aside.parts.clone();
+                            if let Some(last) = kept_parts.last_mut() {
+                                last.clone_from(&kept_at);
+                            }
+                            done.push(format!(
+                                "WARNING: {name:?} changed after an interrupted restore and is \
+                                 kept; the original it replaced is at {:?}",
+                                kept_parts.join("/")
+                            ));
+                        }
                     }
                     Ok(())
                 });
@@ -429,6 +567,40 @@ fn no_replace_move(dir: &File, from: &Path, to: &Path) -> Result<()> {
                 return Err(Error::format(format!("{} is taken", to.display())));
             }
             Ok(capfs::rename(dir, from, dir, to)?)
+        }
+    }
+}
+
+/// Why [`Written::commit`] failed.
+#[derive(Debug)]
+pub enum CommitError {
+    /// Before the restore was marked kept: nothing was dropped, and the
+    /// restore is handed back for [`Written::undo`].
+    NotKept { written: Box<Written>, error: Error },
+    /// After: the restore is kept, but cleaning up its originals failed.
+    Cleanup(Error),
+}
+
+impl Written {
+    /// [`Written::commit`], undoing a restore that could not be kept. Either
+    /// failure is returned.
+    pub fn commit_or_undo(self) -> Result<()> {
+        match self.commit() {
+            Ok(()) => Ok(()),
+            Err(CommitError::NotKept { written, error }) => {
+                let _ = written.undo();
+                Err(error)
+            }
+            Err(CommitError::Cleanup(e)) => Err(e),
+        }
+    }
+}
+
+impl std::fmt::Display for CommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotKept { error, .. } => write!(f, "could not keep the restore: {error}"),
+            Self::Cleanup(e) => write!(f, "{e}"),
         }
     }
 }
@@ -489,11 +661,30 @@ impl Written {
         first.map_or(Ok(()), Err)
     }
 
-    /// Keep the restore: apply the restored directories' modes, innermost
-    /// first, and drop the originals it moved aside (each only if its name
-    /// still holds that original).
-    pub fn commit(self) -> Result<()> {
-        let root = capfs::open_ambient_dir(&self.base, cap_primitives::ambient_authority())?;
+    /// Keep the restore: durably mark it kept, then apply the restored
+    /// directories' modes, innermost first, and drop the originals it moved
+    /// aside (each only if its name still holds that original). A failure
+    /// before the mark hands the restore back, still to be undone
+    /// ([`CommitError::NotKept`]); one after leaves it kept
+    /// ([`CommitError::Cleanup`]).
+    pub fn commit(mut self) -> std::result::Result<(), CommitError> {
+        let root = match capfs::open_ambient_dir(&self.base, cap_primitives::ambient_authority()) {
+            Ok(root) => root,
+            Err(e) => {
+                return Err(CommitError::NotKept {
+                    written: Box::new(self),
+                    error: e.into(),
+                });
+            }
+        };
+        if let Some(j) = &mut self.journal
+            && let Err(error) = j.committing()
+        {
+            return Err(CommitError::NotKept {
+                written: Box::new(self),
+                error,
+            });
+        }
         let mut first = None;
         let mut note = |r: Result<()>| {
             if let Err(e) = r
@@ -520,7 +711,7 @@ impl Written {
         if let Some(j) = self.journal {
             j.close();
         }
-        first.map_or(Ok(()), Err)
+        first.map_or(Ok(()), |e| Err(CommitError::Cleanup(e)))
     }
 }
 
@@ -795,9 +986,9 @@ impl Tree {
     /// Move the file or link `leaf` names in `parent` aside, so the entry
     /// written next gets a fresh inode and the original can be put back. A
     /// directory there is an error: the entry cannot replace it.
-    fn move_aside(&mut self, parent: &File, leaf: &Path, parts: &[String]) -> Result<()> {
+    fn move_aside(&mut self, parent: &File, leaf: &Path, parts: &[String]) -> Result<bool> {
         match leaf_type(parent, leaf)? {
-            None => Ok(()),
+            None => Ok(false),
             Some(t) if t.is_dir() => Err(Error::format(format!(
                 "entry {:?}: a directory is in the way",
                 parts.join("/")
@@ -814,9 +1005,22 @@ impl Tree {
                 }
                 no_replace_move(parent, leaf, Path::new(&aside.aside))?;
                 self.written.asides.push(aside);
-                Ok(())
+                Ok(true)
             }
         }
+    }
+
+    /// Journals what was written at `parts`, which displaced an original.
+    fn journal_wrote(&mut self, parent: &File, leaf: &Path, parts: &[String]) -> Result<()> {
+        if let Some(j) = &mut self.written.journal
+            && let Some(stamp) = stamp(parent, leaf)?
+        {
+            j.wrote(&Wrote {
+                wrote: parts.to_vec(),
+                stamp,
+            })?;
+        }
+        Ok(())
     }
 
     /// The handle on the directory holding entry `parts`, walked from the root
@@ -873,12 +1077,15 @@ impl Tree {
         {
             return Ok(());
         }
-        self.move_aside(&parent, &leaf, parts)?;
+        let displaced = self.move_aside(&parent, &leaf, parts)?;
         make_symlink(target, &parent, &leaf, &self.base, parts)?;
         self.written.leaves.push(Owned {
             parts: parts.to_vec(),
             id: leaf_id(&parent, &leaf)?.flatten(),
         });
+        if displaced {
+            self.journal_wrote(&parent, &leaf, parts)?;
+        }
         Ok(())
     }
 
@@ -903,7 +1110,7 @@ impl Tree {
     /// which must not run past `size` bytes, with permission bits `mode`.
     pub fn file(&mut self, parts: &[String], mode: u32, size: u64, data: impl Read) -> Result<()> {
         let (parent, leaf) = self.parent(parts, true)?;
-        self.move_aside(&parent, &leaf, parts)?;
+        let displaced = self.move_aside(&parent, &leaf, parts)?;
         // `create_new` fails on anything at `leaf`, a symlink included, so the
         // file is never opened through a link swapped in meanwhile.
         let mut out = capfs::open(
@@ -923,6 +1130,10 @@ impl Tree {
             )));
         }
         set_mode(&out, mode & MODE_MASK)?;
+        drop(out);
+        if displaced {
+            self.journal_wrote(&parent, &leaf, parts)?;
+        }
         Ok(())
     }
 
@@ -1384,13 +1595,94 @@ mod tests {
         let done = recover(&journal);
         assert_eq!(done.len(), 2, "{done:?}");
         assert_eq!(std::fs::read(base.join("free")).unwrap(), b"mine");
-        assert_eq!(std::fs::read(base.join("filled")).unwrap(), b"x");
+        // Never committed, so never verified: the original wins.
+        assert_eq!(std::fs::read(base.join("filled")).unwrap(), b"mine");
         let names: Vec<String> = std::fs::read_dir(&base)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert!(!names.iter().any(|n| is_aside_name(n)), "{names:?}");
+        assert_eq!(std::fs::read_dir(&journal).unwrap().count(), 0);
+    }
+
+    /// An entry edited after the crash is never deleted: it stays, and the
+    /// original is kept beside it under a name saying what it is.
+    #[cfg(unix)]
+    #[test]
+    fn recover_keeps_an_entry_changed_since() {
+        let base = tmp("edited");
+        let journal = tmp("edited-journal");
+        std::fs::write(base.join("edited"), b"mine").unwrap();
+        std::fs::write(base.join("replaced"), b"mine").unwrap();
+        let mut tree = Tree::open(&base).unwrap();
+        tree.journal_in(&journal).unwrap();
+        tree.file(&p("edited"), 0o644, 1, &b"x"[..]).unwrap();
+        tree.file(&p("replaced"), 0o644, 1, &b"x"[..]).unwrap();
+        let Written { journal: held, .. } = tree.finish();
+        drop(held.map(|j| j.file));
+        // Edited in place, and replaced by a rename.
+        std::fs::write(base.join("edited"), b"my edit").unwrap();
+        std::fs::write(base.join("new"), b"theirs").unwrap();
+        std::fs::rename(base.join("new"), base.join("replaced")).unwrap();
+        let done = recover(&journal);
+        assert_eq!(done.len(), 2, "{done:?}");
+        assert!(done.iter().all(|d| d.starts_with("WARNING")), "{done:?}");
+        assert_eq!(std::fs::read(base.join("edited")).unwrap(), b"my edit");
+        assert_eq!(std::fs::read(base.join("replaced")).unwrap(), b"theirs");
+        let originals: Vec<_> = std::fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".task-restore-original-")
+            })
+            .map(|e| std::fs::read(e.path()).unwrap())
+            .collect();
+        assert_eq!(originals, [b"mine".to_vec(), b"mine".to_vec()]);
+        assert_eq!(std::fs::read_dir(&journal).unwrap().count(), 0);
+    }
+
+    /// A commit that cannot write its durable mark keeps nothing: the restore
+    /// comes back to be undone, originals intact.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_commit_mark_hands_the_restore_back() {
+        let base = tmp("nomark");
+        let journal = tmp("nomark-journal");
+        std::fs::write(base.join("f"), b"mine").unwrap();
+        let mut tree = Tree::open(&base).unwrap();
+        tree.journal_in(&journal).unwrap();
+        tree.file(&p("f"), 0o644, 1, &b"x"[..]).unwrap();
+        testing::fail_next_commit_mark();
+        match tree.finish().commit() {
+            Err(CommitError::NotKept { written, .. }) => written.undo().unwrap(),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read(base.join("f")).unwrap(), b"mine");
+        assert_eq!(std::fs::read_dir(&journal).unwrap().count(), 0);
+    }
+
+    /// A restore cut short while committing was verified: its entries stay
+    /// where they hold their names.
+    #[cfg(unix)]
+    #[test]
+    fn recover_keeps_a_committing_restore() {
+        let base = tmp("committing");
+        let journal = tmp("committing-journal");
+        std::fs::write(base.join("filled"), b"mine").unwrap();
+        let mut tree = Tree::open(&base).unwrap();
+        tree.journal_in(&journal).unwrap();
+        tree.file(&p("filled"), 0o644, 1, &b"x"[..]).unwrap();
+        let written = tree.finish();
+        let Written { journal: held, .. } = written;
+        let mut held = held.unwrap();
+        held.committing().unwrap();
+        drop(held.file);
+        let done = recover(&journal);
+        assert_eq!(done.len(), 1, "{done:?}");
+        assert_eq!(std::fs::read(base.join("filled")).unwrap(), b"x");
         assert_eq!(std::fs::read_dir(&journal).unwrap().count(), 0);
     }
 

@@ -132,6 +132,64 @@ pub struct Restored {
     pub written: ocicas::restore::Written,
 }
 
+/// A restore awaiting its verification, undone if dropped first: a run
+/// cancelled meanwhile (a fail-fast sibling) must not leave unverified
+/// entries installed with their originals moved aside. An undo failing in
+/// `drop` leaves the restore's journal, whose recovery puts the originals back
+/// over entries still as the restore wrote them, and keeps both elsewhere.
+pub struct Unverified(Option<ocicas::restore::Written>);
+
+impl Unverified {
+    pub fn new(written: ocicas::restore::Written) -> Self {
+        Self(Some(written))
+    }
+
+    /// Keeps the restore: see [`ocicas::restore::Written::commit`]. One that
+    /// could not be marked kept is undone here, and reported with the undo's
+    /// result.
+    pub fn commit(mut self) -> Result<(), CommitFailure> {
+        let Some(written) = self.0.take() else {
+            return Ok(());
+        };
+        match written.commit() {
+            Ok(()) => Ok(()),
+            Err(ocicas::restore::CommitError::Cleanup(e)) => Err(CommitFailure::Cleanup(e)),
+            Err(ocicas::restore::CommitError::NotKept { written, error }) => {
+                Err(CommitFailure::NotKept {
+                    error,
+                    undo: written.undo(),
+                })
+            }
+        }
+    }
+
+    /// Takes the restore back: see [`ocicas::restore::Written::undo`].
+    pub fn undo(mut self) -> ocicas::Result<()> {
+        self.0.take().map_or(Ok(()), ocicas::restore::Written::undo)
+    }
+}
+
+/// Why [`Unverified::commit`] failed.
+#[derive(Debug)]
+pub enum CommitFailure {
+    /// The restore is kept; dropping the originals it replaced failed.
+    Cleanup(ocicas::Error),
+    /// The restore could not be marked kept, so it was undone: `undo` says
+    /// whether that worked.
+    NotKept {
+        error: ocicas::Error,
+        undo: ocicas::Result<()>,
+    },
+}
+
+impl Drop for Unverified {
+    fn drop(&mut self) {
+        if let Some(written) = self.0.take() {
+            let _ = written.undo();
+        }
+    }
+}
+
 /// Attempt to download and restore a cached entry for `task` into `dir`. On
 /// success returns what was restored; the caller verifies the generates
 /// checksum against the restored files, and undoes the restore if it does not
@@ -531,7 +589,7 @@ pub async fn cache_save(
     let entry_task = task.local_name();
     let mut checker = ChecksumChecker::new(temp_dir, task.clone());
     // The hashes the run just recorded, not a fresh reading.
-    let st = match checker.cache_files() {
+    let st = match checker.cache_files().await {
         Ok(cache_files) if !cache_files.is_empty() => crate::fingerprint::TaskStatus {
             up_to_date: true,
             sources_hash: recorded.sources.clone(),
@@ -548,7 +606,7 @@ pub async fn cache_save(
             return;
         }
     };
-    let source_value = checker.source_value().to_string();
+    let source_value = checker.source_value().await.to_string();
     let (files, refused) = archive::split_unrestorable(dir, &st.cache_files);
     if !refused.is_empty() {
         logger.errf(
@@ -754,6 +812,74 @@ fn rename_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A verified restore that cannot be marked kept is undone, not kept with
+    /// a warning: its originals are back.
+    #[test]
+    fn a_restore_that_cannot_be_kept_is_undone() {
+        let base = std::env::temp_dir().join(format!(
+            "taskcore-unkept-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let journal = base.with_extension("journal");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("out"), b"original").unwrap();
+        let mut tree = ocicas::restore::Tree::open(&base).unwrap();
+        tree.journal_in(&journal).unwrap();
+        tree.file(&["out".to_string()], 0o644, 8, &b"restored"[..])
+            .unwrap();
+        let pending = Unverified::new(tree.finish());
+        ocicas::restore::testing::fail_next_commit_mark();
+        match pending.commit() {
+            Err(CommitFailure::NotKept { undo, .. }) => undo.unwrap(),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read(base.join("out")).unwrap(), b"original");
+    }
+
+    /// A restore whose verification is cancelled at an await (here a barrier
+    /// never released) is undone: the original is back, the entry gone.
+    #[tokio::test]
+    async fn a_restore_dropped_while_verifying_is_undone() {
+        let base = std::env::temp_dir().join(format!(
+            "taskcore-unverified-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("out"), b"original").unwrap();
+        let mut tree = ocicas::restore::Tree::open(&base).unwrap();
+        tree.file(&["out".to_string()], 0o644, 8, &b"restored"[..])
+            .unwrap();
+        let written = tree.finish();
+        assert_eq!(std::fs::read(base.join("out")).unwrap(), b"restored");
+
+        let barrier = std::sync::Arc::new(tokio::sync::Notify::new());
+        let verify = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            async move {
+                let pending = Unverified::new(written);
+                barrier.notified().await;
+                pending.commit()
+            }
+        };
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(20), verify).await;
+        assert!(cancelled.is_err());
+        assert_eq!(std::fs::read(base.join("out")).unwrap(), b"original");
+        let names: Vec<String> = std::fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["out"]);
+    }
 
     fn oci_index(paths: &[&str]) -> ocicas::Index {
         let mut idx: ocicas::Index = serde_json::from_value(serde_json::json!({

@@ -127,14 +127,30 @@ impl Executor {
         };
         match archive::extract_archive(zip_path, Path::new(&self.dir), &policy) {
             // Nothing to verify an import against: keep it.
-            Ok(extracted) => {
-                if let Err(e) = extracted.written.commit() {
+            Ok(extracted) => match extracted.written.commit() {
+                Ok(()) => {}
+                Err(ocicas::restore::CommitError::Cleanup(e)) => {
                     self.logger().borrow_mut().errf(
                         Color::Yellow,
                         &format!("task: cleaning up after the import: {e}\n"),
                     );
                 }
-            }
+                // Not marked kept: take it back, and fail the import.
+                Err(ocicas::restore::CommitError::NotKept { written, error }) => {
+                    let undo = written.undo();
+                    self.discard_checksums(cleanup);
+                    let undo = undo
+                        .err()
+                        .map(|e| format!("; undoing it: {e}"))
+                        .unwrap_or_default();
+                    return Err(ExecutorError::Cache(Box::new(
+                        crate::cache::CacheError::msg(format!(
+                            "importing {:?}: could not keep the import: {error}{undo}",
+                            zip_path.display()
+                        )),
+                    )));
+                }
+            },
             Err(e) => {
                 self.discard_checksums(cleanup);
                 return Err(e.into());
@@ -194,7 +210,7 @@ impl Executor {
                 continue;
             }
             let checker = ChecksumChecker::new(&self.temp_dir.fingerprint, task.clone());
-            let st = checker.status()?;
+            let st = checker.status().await?;
             if !st.up_to_date {
                 self.logger().borrow_mut().errf(
                     Color::Yellow,

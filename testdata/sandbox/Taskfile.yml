@@ -16,6 +16,22 @@ tasks:
       # src holds only sources, so the command may create and remove files in it
       - echo tmp > src/b.tmp && rm src/b.tmp
 
+  # The fingerprints of an unsandboxed task are read while a sandboxed
+  # command runs, and may read what that sandbox denies.
+  hash-beside-sandbox:
+    deps: [sandboxed-slow, secret-hasher]
+
+  sandboxed-slow:
+    sources: [src/**]
+    sandbox: true
+    cmds:
+      - sleep 0.5
+
+  secret-hasher:
+    sources: [secret/**]
+    cmds:
+      - 'true'
+
   fingerprinted-sources:
     sources:
       - glob: src/**/*

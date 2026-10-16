@@ -464,7 +464,7 @@ pub async fn compiled_task(
         if widened && !orig_task.sources.is_empty() {
             new.source_hash.clear();
             let mut checker = ChecksumChecker::new(ctx.fingerprint_temp_dir, new.clone());
-            let source_hash = checker.source_value().to_string();
+            let source_hash = checker.source_value().await.to_string();
             new.cache_checksum = cache_checksum(orig_task, &source_hash)?;
             new.source_hash = source_hash.clone();
             vars.set(
@@ -656,7 +656,7 @@ async fn compile_run(
     // variable set, so the cache is rebuilt afterwards.
     if !orig_task.sources.is_empty() {
         let mut checker = ChecksumChecker::new(ctx.fingerprint_temp_dir, new.clone());
-        let source_hash = checker.source_value().to_string();
+        let source_hash = checker.source_value().await.to_string();
         new.cache_checksum = cache_checksum(orig_task, &source_hash)?;
         new.source_hash = source_hash.clone();
         vars.set(

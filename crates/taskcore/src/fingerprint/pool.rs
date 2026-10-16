@@ -63,6 +63,9 @@ pub(crate) fn digest_in(
         Workers::Exactly(n) => (n.max(1), None),
     };
 
+    // Helper threads do not see the job's thread-local flag: hand it over.
+    let cancel = super::offload::cancel_flag();
+    let cancel = cancel.as_deref();
     let next = AtomicUsize::new(0);
     // The lowest failing index so far: entries above it cannot change the
     // result, entries below it are still digested.
@@ -72,7 +75,7 @@ pub(crate) fn digest_in(
         let mut out = Vec::new();
         loop {
             let claim = next.fetch_add(1, Ordering::Relaxed);
-            if claim >= entries.len() {
+            if claim >= entries.len() || cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                 break;
             }
             let i = order(claim, entries.len());
@@ -80,7 +83,7 @@ pub(crate) fn digest_in(
             if i > first_err.load(Ordering::Relaxed) {
                 continue;
             }
-            let r = digest(&e.path, &mut buf);
+            let r = digest(&e.path, &mut buf, cancel);
             if r.is_err() {
                 first_err.fetch_min(i, Ordering::Relaxed);
             }
@@ -107,6 +110,9 @@ pub(crate) fn digest_in(
         })
     };
 
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(super::offload::interrupted());
+    }
     let mut slots: Vec<Option<std::io::Result<(Kind, u128)>>> = std::iter::repeat_with(|| None)
         .take(entries.len())
         .collect();
