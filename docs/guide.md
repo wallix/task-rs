@@ -824,7 +824,10 @@ glob or add an `exclude:` for those generated paths.
 
 Each source is fingerprinted by its content, a symlink by its target (it is
 not followed). A source of any other kind, such as a named pipe or a device,
-fails the task.
+fails the task. Wildcards follow symlinks to directories, but not back into a
+directory they are already in: a symlink loop is cut there, the link counted
+as an entry. A name that is gone or unreadable is skipped, as by the shell;
+any other error reading the tree fails the task.
 
 In situations where you need more flexibility the `status` keyword can be used.
 You can even combine the two. See the documentation for

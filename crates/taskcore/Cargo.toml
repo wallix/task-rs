@@ -49,5 +49,8 @@ tokio = { workspace = true, features = [
     "fs",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [lints]
 workspace = true

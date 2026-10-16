@@ -2724,6 +2724,7 @@ dependencies = [
  "ocicas",
  "redis",
  "regex",
+ "rustix",
  "ryu",
  "semver",
  "serde",

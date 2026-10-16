@@ -131,9 +131,9 @@ impl Spec {
         let current_sources_hash = self.sources_snapshot()?.hash;
         let new_generates_hash = self.generates_checksum()?;
 
-        let sources_files = globs(&self.dir, &self.sources).unwrap_or_default();
-        let generates = globs(&self.dir, &self.generates).unwrap_or_default();
-        let cache_files = cache_globs(&self.dir, &self.generates).unwrap_or_default();
+        let sources_files = globs(&self.dir, &self.sources)?;
+        let generates = globs(&self.dir, &self.generates)?;
+        let cache_files = cache_globs(&self.dir, &self.generates)?;
 
         let src_ok = old_sources_hash == current_sources_hash;
         let gen_ok = old_generates_hash == new_generates_hash;
@@ -519,6 +519,22 @@ mod tests {
                 join(&dir, "node_modules/vite/bin/vite.js"),
             ]
         );
+    }
+
+    /// A walk failing while `--status` lists files fails the status, rather
+    /// than reporting an empty list.
+    #[test]
+    fn status_reports_walk_errors() {
+        let dir = tmp();
+        write_file(&dir, "main.go", "package main");
+        write_file(&dir, "build/sub/app", "binary");
+        let task = new_task(&dir, vec![g("main.go")], vec![g("build/**/*")]);
+        let checker = ChecksumChecker::new(tmp(), task);
+        crate::fingerprint::glob::fail_listing(Some("/build/sub"));
+        let r = now(checker.status());
+        crate::fingerprint::glob::fail_listing(None);
+        let err = r.unwrap_err();
+        assert!(err.to_string().contains("build/sub"), "{err}");
     }
 
     #[test]

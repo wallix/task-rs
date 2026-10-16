@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **A walk of `sources` or `generates` no longer leaves files out on an error.**
+  It moves from directory to directory by handle, one name per lookup, so the
+  symlinks along a path no longer add up to the kernel's limit (a single link
+  whose own target spells out a long chain still can, and then ends its branch),
+  and a wildcard stops at the first directory it would revisit: a symlink loop
+  is cut there, the link kept as an entry. 4.8.x followed a loop until the
+  kernel refused, which past about 20 links happens at a varying depth on a busy
+  machine and changed the fingerprint from run to run. A name that is gone,
+  unreadable or not a directory (ENOENT, EACCES, ENOTDIR), or a link the kernel
+  will not resolve (ELOOP), ends a branch as in the shell; a directory removed
+  or made unreadable between its listing and its opening is skipped that way.
+  Any other error (too many open files, an I/O error) fails the task, naming the
+  path, where 4.8.x silently skipped the directory. `--status` reports such
+  errors too, instead of empty file lists. On Linux, a directory that can be
+  searched but not read is still crossed by a literal path, as by the shell.
+  Hashing still opens each file by its path, so a file behind more than about 20
+  nested links can fail to hash on a busy machine: an error, never an omission.
+  On Windows lookups still go through paths, and a loop is recognised by its
+  canonical path (type-checked, not run-tested).
 - **Sources are hashed at compile time only when something reads
   `{{.CHECKSUM}}`.** Compiling a task, the quick compile that checks its
   platforms and required vars, and compiling every task a `task:` or `from:`
@@ -21,14 +40,13 @@
   (noted with `-v`), for these tasks and for those keeping the compile-time
   value alike.
 - **Fingerprinting walks each directory once and takes file types from the
-  listing,** so hashing a regular file costs one `stat` instead of about four.
-  A source or generated file removed after its directory was listed now fails
-  the task, naming it, where it could be left out before, and so does one
-  whose type changed in between (a file replaced by a symlink, say). On
+  listing,** so hashing a regular file costs one `stat` instead of about four. A
+  source or generated file matched by the walk and removed before it is hashed
+  now fails the task, naming it, where it could be left out before, and so does
+  one whose type changed in between (a file replaced by a symlink, say). On
   Windows that check opens reparse points without following them; it is
-  type-checked there but not run-tested, and reading files behind
-  filter-driver reparse points (deduplicated files, OneDrive placeholders) is
-  unverified.
+  type-checked there but not run-tested, and reading files behind filter-driver
+  reparse points (deduplicated files, OneDrive placeholders) is unverified.
 - **A cache restore cancelled before it is verified is undone,** and so is one
   that cannot durably mark itself kept: the task then runs normally, and an
   `--import-cache` fails. Recovering a restore cut short by a crash puts back

@@ -70,6 +70,9 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2", "
 # checksum cleanup after untrusted cache imports, including on Windows; std has
 # no such API.
 cap-primitives = "4"
+# Handle-relative directory walks (openat/fstatat/getdents) for fingerprinting, so
+# no lookup crosses many links; already in the tree through cap-primitives.
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 # gzip decoding for the release archive `task --update` installs from (the tar
 # walk itself is hand-rolled in `crates/task/src/update.rs`). Already in the tree
 # as zip's deflate backend, and pure Rust (miniz_oxide), so the musl-static build
