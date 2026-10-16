@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.8.1 - 2026-10-16
+
 - **`sandbox.writes: [{task: X}]` now grants what X and the tasks it runs
   write:** their `generates` and `sandbox.writes` directories, and reading their
   dotenv files, so a sandboxed task running X, with `task:` or as a nested
