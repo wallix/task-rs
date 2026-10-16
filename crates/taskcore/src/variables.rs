@@ -89,6 +89,10 @@ pub enum CompileError {
         /// The referenced task name.
         name: String,
     },
+    /// A deferred `task:` call a reference reaches depends on what only the
+    /// run knows (`EXIT_CODE`), or on a `CHECKSUM` covering the task's own
+    /// references.
+    DeferredCallUnsupported(Box<DeferredCall>),
     /// A `task:` entry in sources/generates rendered to an empty name.
     EmptyTaskReference {
         /// The task whose entry it is.
@@ -133,6 +137,23 @@ pub enum CompileError {
     },
 }
 
+/// The details of [`CompileError::DeferredCallUnsupported`].
+#[derive(Debug)]
+pub struct DeferredCall {
+    /// The task whose entry it is.
+    pub task: String,
+    /// The field.
+    pub field: String,
+    /// How the entry reached the task holding the call, outermost first.
+    pub via: Vec<String>,
+    /// The task holding the call.
+    pub owner: String,
+    /// The call's unrendered task name.
+    pub template: String,
+    /// The variable it depends on.
+    pub var: String,
+}
+
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -153,6 +174,34 @@ impl std::fmt::Display for CompileError {
             Self::TaskNotFound { name } => write!(f, "task: Task {name:?} does not exist"),
             Self::ReferencedTaskNotFound { task, field, name } => {
                 write!(f, "task: {task}: {field}: task {name:?} does not exist")
+            }
+            Self::DeferredCallUnsupported(e) => {
+                let DeferredCall {
+                    task,
+                    field,
+                    via,
+                    owner,
+                    template,
+                    var,
+                } = &**e;
+                let via = if via.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}: ", via.join(" → "))
+                };
+                let why = if var == "CHECKSUM" {
+                    format!(
+                        "{var}, which covers {owner:?}'s own references only once they are \
+                         resolved"
+                    )
+                } else {
+                    var.clone()
+                };
+                write!(
+                    f,
+                    "task: {task}: {field}: {via}{owner:?}'s deferred call {template:?} depends \
+                     on {why}: list its targets with explicit `task:` entries"
+                )
             }
             Self::EmptyTaskReference {
                 task,
@@ -489,8 +538,14 @@ pub async fn compiled_task(
         return Err(CompileError::Template(err.clone()));
     }
     if let Some(resolver) = resolver.filter(|_| evaluate_sh_vars) {
-        resolve_globs_from(&mut new, GlobField::Sources, resolver, ctx.folded).await?;
-        resolve_globs_from(&mut new, GlobField::Generates, resolver, ctx.folded).await?;
+        let has_refs =
+            has_from_entries(&orig_task.sources) || has_from_entries(&orig_task.generates);
+        let how = Folding {
+            folded: ctx.folded,
+            has_refs,
+        };
+        resolve_globs_from(&mut new, GlobField::Sources, resolver, how).await?;
+        resolve_globs_from(&mut new, GlobField::Generates, resolver, how).await?;
         // The resolved entries feed the checksum: sources as files and rules,
         // generates as rules. Cleared first, as the checker would reuse it;
         // empty when the references resolved to no sources. Without sources
@@ -693,6 +748,15 @@ fn has_from_entries(globs: &[Glob]) -> bool {
     globs.iter().any(Glob::is_reference)
 }
 
+/// How [`resolve_globs_from`] folds a task's references in.
+#[derive(Clone, Copy)]
+struct Folding {
+    /// The task is folded into a referrer in turn (see [`CompileContext`]).
+    folded: bool,
+    /// The task has `from:` or `task:` entries in `sources` or `generates`.
+    has_refs: bool,
+}
+
 /// Selects which glob list of a task `resolve_globs_from` operates on.
 #[derive(Clone, Copy)]
 enum GlobField {
@@ -719,7 +783,7 @@ async fn resolve_globs_from(
     task: &mut Task,
     field: GlobField,
     resolver: &dyn TaskResolver,
-    folded: bool,
+    how: Folding,
 ) -> Result<(), CompileError> {
     let globs = match field {
         GlobField::Sources => task.sources.clone(),
@@ -747,12 +811,14 @@ async fn resolve_globs_from(
                 .iter()
                 .map(|d| (d.task.clone(), d.vars.clone().unwrap_or_default()))
                 .collect(),
-            "cmds" => task
-                .cmds
-                .iter()
-                .filter(|c| !c.task.is_empty())
-                .map(|c| (c.task.clone(), c.vars.clone().unwrap_or_default()))
-                .collect(),
+            "cmds" => crate::reach::cmd_calls(task, how.has_refs).map_err(|e| match e {
+                CompileError::DeferredCallUnsupported(mut e) => {
+                    e.task = task.name().to_string();
+                    e.field = field.name().to_string();
+                    CompileError::DeferredCallUnsupported(e)
+                }
+                other => other,
+            })?,
             other => {
                 return Err(CompileError::UnsupportedFrom {
                     task: task.task.clone(),
@@ -776,7 +842,7 @@ async fn resolve_globs_from(
             }
         }
     }
-    let resolved = if folded {
+    let resolved = if how.folded {
         dedup(resolved, true)
     } else {
         finish_groups(resolved)

@@ -1,0 +1,16 @@
+version: '3'
+
+tasks:
+  # The deferred call is a template: watched as it runs, it covers leaf.txt.
+  # No sources of its own, so each change runs it again.
+  watched:
+    watch: true
+    vars: {T: leaf}
+    cmds:
+      - defer: {task: '{{.T}}'}
+      - echo run >> runs.txt
+
+  leaf:
+    sources: [leaf.txt]
+    cmds:
+      - echo leaf

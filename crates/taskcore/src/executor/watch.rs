@@ -235,10 +235,20 @@ impl Executor {
                 }
             }
             for cmd in &task.cmds {
-                if !cmd.task.is_empty() {
+                // A deferred call is still a template: rendered as it would
+                // run after a success. One that cannot render is not watched.
+                let (name, vars) = if cmd.defer {
+                    match crate::reach::deferred_call(&task, cmd) {
+                        Ok(call) => call,
+                        Err(_) => continue,
+                    }
+                } else {
+                    (cmd.task.clone(), cmd.vars.clone())
+                };
+                if !name.is_empty() {
                     stack.push(Call {
-                        task: cmd.task.clone(),
-                        vars: cmd.vars.clone().unwrap_or_default(),
+                        task: name,
+                        vars: vars.unwrap_or_default(),
                         ..Default::default()
                     });
                 }

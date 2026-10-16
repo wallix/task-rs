@@ -935,3 +935,44 @@ fn parallel_from_deps_globs_are_not_cyclic() {
         o.combined()
     );
 }
+
+// Watch mode follows a task's deferred `task:` calls as they run, rendered,
+// rather than looking up their unrendered name: a change to what such a call
+// reads re-runs the task.
+#[cfg(unix)]
+#[test]
+fn watch_follows_a_templated_deferred_call() {
+    let dir = stage("ref_follows_runs/watch");
+    let child = spawn_in_own_group(&dir, "watched");
+    let runs = dir.join("runs.txt");
+    wait_for(&runs);
+    let count = || {
+        std::fs::read_to_string(&runs)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    // Changed until it re-runs: the watch registers its directories after
+    // the first run.
+    let mut rerun = false;
+    for i in 0..40 {
+        std::fs::write(dir.join("leaf.txt"), format!("{i}\n")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if count() > 1 {
+            rerun = true;
+            break;
+        }
+    }
+    signal_pid(&child, "TERM");
+    let o = child.wait_with_output().expect("wait for task");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        rerun,
+        "no re-run on a change the deferred call reads: {out}"
+    );
+    assert!(!out.contains("does not exist"), "{out}");
+}

@@ -849,6 +849,11 @@ tasks:
       - task: build
 ```
 
+`from: cmds` reads a deferred `task:` command as it runs after a success; one
+whose name or `vars` mention `{{.EXIT_CODE}}`, or `{{.CHECKSUM}}` in a task
+with `from:` or `task:` entries itself, is an error, as is one whose template
+fails to render (a run would ignore it): list its targets explicitly.
+
 A `task:` entry copies the same field of one named task, which need not be a
 dependency or be called. It takes optional `vars`, as a dependency call does,
 and nothing else. The referenced task does not run. Use it to keep a task that

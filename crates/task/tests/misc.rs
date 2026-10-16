@@ -1160,3 +1160,27 @@ fn grouped_fingerprints_are_stable() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// `from: cmds` reads a templated deferred call as it runs after a success;
+/// one depending on the exit code is refused.
+#[test]
+fn from_cmds_renders_deferred_calls() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  wrapper:\n    vars: {T: leaf}\n    sources: [from: cmds]\n    cmds:\n      - defer: {task: '{{.T}}'}\n      - 'true'\n\n  on-exit:\n    sources: [from: cmds]\n    cmds:\n      - defer: {task: leaf, vars: {E: '{{.EXIT_CODE}}'}}\n      - 'true'\n\n  leaf:\n    sources: [leaf.txt]\n",
+    );
+    write(&dir, "leaf.txt", "l\n");
+    let status = run(&dir, &["--status", "wrapper"]);
+    assert!(status.ok(), "{}", status.combined());
+    assert!(
+        status.stdout.contains(&status_file(&dir.join("leaf.txt"))),
+        "{}",
+        status.combined()
+    );
+    let out = run(&dir, &["on-exit"]);
+    assert_eq!(
+        out.stderr,
+        "task: on-exit: sources: \"on-exit\"'s deferred call \"leaf\" depends on EXIT_CODE: \
+         list its targets with explicit `task:` entries\n"
+    );
+    assert_eq!(out.code, 1);
+}

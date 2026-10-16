@@ -28,6 +28,7 @@ pub mod logger;
 pub mod migrate;
 pub mod output;
 pub mod precondition;
+pub(crate) mod reach;
 pub mod reader;
 pub(crate) mod reap;
 pub mod requires;

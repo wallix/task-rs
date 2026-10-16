@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **`from: cmds` now reads templated deferred calls,** as they run after a
+  success, instead of looking up their unrendered name; one depending on
+  `EXIT_CODE`, or on `{{.CHECKSUM}}` in a task with `from:` or `task:` entries
+  of its own, is refused. `--watch` follows them the same way.
 - **A folded task's `exclude:` entries no longer remove other tasks' files.**
   In `sources` and `generates`, the exclusions of a task folded in by `from:`
   or `task:` apply to that task's own entries only; the referring task's own
