@@ -115,3 +115,30 @@ fn checksums_without_dot_contradictions_are_unchanged() {
         ]
     );
 }
+
+/// A task's own exclusions prune the walks of the sources it takes from
+/// other tasks without changing what they list.
+#[cfg(unix)]
+#[test]
+fn exclusions_prune_referenced_sources_alike() {
+    let dir = staged();
+    // As 4.9.0 lists them; `link` is a link to `src`.
+    assert_eq!(
+        sources(&dir, "folded"),
+        [
+            "link/lib.rs",
+            "link/node_modules/p/x.rs",
+            "src/a.txt",
+            "src/lib.rs"
+        ]
+    );
+    assert_eq!(
+        sources(&dir, "rust"),
+        [
+            "link/lib.rs",
+            "link/node_modules/p/x.rs",
+            "src/lib.rs",
+            "src/node_modules/p/x.rs"
+        ]
+    );
+}

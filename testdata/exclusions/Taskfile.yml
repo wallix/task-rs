@@ -87,3 +87,18 @@ tasks:
       - exclude: 'fixture/**/node_modules/**'
       - exclude: 'fixture/src/.cache/**'
     cmds: ['true']
+
+  # `folded` takes `rust`'s sources; its own exclusion also keeps their walk
+  # out of `node_modules`, with the same result.
+  rust:
+    sources:
+      - '**/*.rs'
+      - exclude: '**/target/**'
+    cmds: ['true']
+
+  folded:
+    sources:
+      - src/*.txt
+      - task: rust
+      - exclude: src/**/node_modules/**
+    cmds: ['true']

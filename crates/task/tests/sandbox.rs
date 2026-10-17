@@ -1205,3 +1205,25 @@ fn reached_sources_generated_during_the_run_are_reported() {
     assert!(checksum_file(&dir, "stage-mid").is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A task's own exclusions revoke read access only to what they exclude, even
+/// though they also prune the walks of a referenced task's sources.
+#[test]
+fn exclusions_keep_other_read_grants() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        let dir = stage("sandbox");
+        std::fs::create_dir_all(dir.join("src/skip")).unwrap();
+        std::fs::write(dir.join("src/skip/x.txt"), "x\n").unwrap();
+        let env = [("TASK_SANDBOX", mode)];
+        let r = run_with_env(&dir, &["reads-past-exclusions"], &env);
+        assert!(r.ok(), "{mode}: {}", r.combined());
+        let r = run_with_env(&dir, &["reads-excluded"], &env);
+        assert!(!r.ok(), "{mode}: expected a failure: {}", r.combined());
+        assert!(
+            r.combined().contains("Permission denied"),
+            "{mode}: {}",
+            r.combined()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

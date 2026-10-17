@@ -61,11 +61,23 @@ pub(crate) fn hinted_globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<(St
 }
 
 fn globs_scanned(dir: &str, globs: &[Glob], scan: &mut Scan) -> Vec<String> {
+    // A negated entry with a fingerprint excludes that file alone.
+    let pruners = own_pruners(dir, globs, |g| g.fingerprint.is_empty());
     let mut folded = BTreeSet::new();
     for group in folded_groups(globs) {
-        folded.extend(shell_globs(dir, group, BTreeSet::new(), scan));
+        folded.extend(shell_globs(dir, group, BTreeSet::new(), &pruners, scan));
     }
-    shell_globs(dir, own(globs), folded, scan)
+    shell_globs(dir, own(globs), folded, &[], scan)
+}
+
+/// Pruners for the walks of folded groups, from the task's own whole-tree
+/// exclusions (those `is_pattern` says match by their glob): whatever those
+/// walks find in the directories they cover is removed afterwards anyway.
+fn own_pruners(dir: &str, globs: &[Glob], is_pattern: impl Fn(&Glob) -> bool) -> Vec<Pruner> {
+    own(globs)
+        .filter(|g| g.negate && is_pattern(g))
+        .filter_map(|g| Pruner::new(&join_pattern(dir, &g.glob)))
+        .collect()
 }
 
 /// What the walk of one [`globs`] or [`cache_globs`] call learned.
@@ -177,6 +189,7 @@ fn shell_globs<'a>(
     dir: &str,
     globs: impl Iterator<Item = &'a Glob>,
     mut included: BTreeSet<String>,
+    pruners: &[Pruner],
     scan: &mut Scan,
 ) -> Vec<String> {
     let mut excluded: BTreeSet<String> = BTreeSet::new();
@@ -210,6 +223,7 @@ fn shell_globs<'a>(
         named,
         &mut included,
         &mut excluded,
+        pruners,
         Options::SHELL,
         scan,
     );
@@ -225,11 +239,12 @@ fn shell_globs<'a>(
 /// [`globs`].
 pub fn cache_globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<String>> {
     let scan = &mut Scan::default();
+    let pruners = own_pruners(dir, globs, |_| true);
     let mut folded = BTreeSet::new();
     for group in folded_groups(globs) {
-        folded.extend(tree_globs(dir, group, BTreeSet::new(), scan));
+        folded.extend(tree_globs(dir, group, BTreeSet::new(), &pruners, scan));
     }
-    let files = tree_globs(dir, own(globs), folded, scan);
+    let files = tree_globs(dir, own(globs), folded, &[], scan);
     scan.result(files)
 }
 
@@ -364,6 +379,7 @@ fn tree_globs<'a>(
     dir: &str,
     globs: impl Iterator<Item = &'a Glob>,
     mut included: BTreeSet<String>,
+    pruners: &[Pruner],
     scan: &mut Scan,
 ) -> Vec<String> {
     let mut excluded: BTreeSet<String> = BTreeSet::new();
@@ -396,6 +412,7 @@ fn tree_globs<'a>(
         named,
         &mut included,
         &mut excluded,
+        pruners,
         Options::TREE,
         scan,
     );
@@ -466,7 +483,7 @@ impl Pattern {
 /// included path its pattern matches, however the include reached it, dot
 /// names included. A whole-tree exclusion (`<prefix>/**/*` or `<prefix>/**`)
 /// also becomes a [`Pruner`] that keeps positive walks out of the directories
-/// it covers.
+/// it covers, as do the `extra` pruners of exclusions applied afterwards.
 ///
 /// The paths in `named`, which entries name explicitly ([`Glob::is_named`])
 /// and were looked up past every pruner, are kept unless an exclusion
@@ -476,6 +493,7 @@ fn expand_patterns(
     named: Vec<String>,
     included: &mut BTreeSet<String>,
     excluded: &mut BTreeSet<String>,
+    extra: &[Pruner],
     opts: Options,
     scan: &mut Scan,
 ) {
@@ -490,6 +508,9 @@ fn expand_patterns(
         let pruner = Pruner::new(&p.path).filter(|_| pruning());
         exclusions.push(Exclusion::new(&p.path, p.literal, true, pruner.is_some()));
         pruners.extend(pruner);
+    }
+    if pruning() {
+        pruners.extend(extra.iter().cloned());
     }
 
     let mut exclusions = Exclusions::new(exclusions);
@@ -867,6 +888,7 @@ fn expand(pattern: &str, pruners: &[Pruner], opts: Options, scan: &mut Scan) -> 
 /// below a covered directory, dot names included, which is all the pruned walk
 /// leaves out. A link to a covered directory that the walk would list from
 /// inside it is listed by [`Walker::pruned_link`].
+#[derive(Clone)]
 struct Pruner {
     /// Pattern segments before the trailing `**`, including the walk's root
     /// marker (`""` for absolute patterns and `"."` for relative ones),
@@ -3661,5 +3683,33 @@ mod tests {
         ] {
             assert_eq!(agreed(&dir, &list).0, want, "{list:?}");
         }
+    }
+
+    /// The task's own whole-tree exclusions also keep folded groups' walks
+    /// out of what they cover: those matches would be removed anyway.
+    #[test]
+    fn own_exclusions_prune_folded_groups() {
+        let dir = tmp();
+        write_file(&dir, "src/a.rs", "a");
+        write_file(&dir, "src/web/.yarnrc.yml", "y");
+        for i in 0..20 {
+            write_file(&dir, &format!("src/web/node_modules/p{i}/q/i.rs"), "i");
+            write_file(&dir, &format!("src/web/node_modules/p{i}/.bin/b.rs"), "b");
+        }
+        let list = [
+            grouped(g("**/*.rs"), 1),
+            grouped(g("src/web/node_modules/p0/.bin/b.rs"), 1),
+            grouped(g_neg("target/**"), 1),
+            grouped(g("src/**/node_modules/p1/**"), 2),
+            g("src/web/.yarnrc.yml"),
+            g_neg("src/**/node_modules/**"),
+        ];
+        let (shell, tree, with, without) = agreed(&dir, &list);
+        assert_eq!(
+            shell,
+            [join(&dir, "src/a.rs"), join(&dir, "src/web/.yarnrc.yml")]
+        );
+        assert_eq!(tree, shell);
+        assert!(with < without / 4, "{with} listings vs {without}");
     }
 }

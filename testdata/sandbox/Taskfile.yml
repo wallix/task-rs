@@ -490,3 +490,30 @@ tasks:
     sandbox: true
     cmds:
       - mkdir -p fp && cat src/a.txt > fp/a.txt
+
+  # A referenced task's sources stay readable although this task's own
+  # exclusions prune their walk; only what the exclusion removes is not.
+  reads-past-exclusions:
+    sources:
+      - src/**
+      - task: excluding-reader
+      - exclude: src/**/skip/**
+    sandbox: true
+    cmds:
+      - cat src/a.txt secret/key
+
+  reads-excluded:
+    sources:
+      - src/**
+      - task: excluding-reader
+      - exclude: src/**/skip/**
+    sandbox: true
+    cmds:
+      - cat src/skip/x.txt
+
+  excluding-reader:
+    sources:
+      - secret/**
+      - exclude: secret/**/none/**
+    cmds:
+      - cat secret/key

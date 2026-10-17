@@ -23,6 +23,10 @@
   `exclude: link/**` drops `link` when it is a symlink to a directory. Tasks
   with such paths see their checksum change once. Exclusions no longer walk
   the tree themselves, which speeds up patterns such as `exclude: '**/*.pyc'`.
+- **A task's own `exclude: dir/**` also keeps the sources and generates it
+  takes from other tasks (`task:`, `from:`) from scanning `dir`.** A task
+  taking `**/*.rs` sources from another no longer scans the `node_modules`
+  trees it excludes; the file lists are unchanged.
 
 ## v4.9.0 - 2026-10-16
 
