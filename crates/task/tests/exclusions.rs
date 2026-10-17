@@ -1,5 +1,5 @@
 //! `exclude:` in `sources`: what an exclusion removes (fork behaviour; Go Task
-//! expands an exclusion as a shell glob, which skips dot entries).
+//! expands an exclusion with a walk of its own).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -33,6 +33,35 @@ fn sources(dir: &Path, task: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The fixture with its links: `build/again` back to `build`, `link` to
+/// `src`.
+#[cfg(unix)]
+fn staged() -> std::path::PathBuf {
+    let dir = stage("exclusions");
+    std::os::unix::fs::symlink(".", dir.join("build/again")).unwrap();
+    std::os::unix::fs::symlink("src", dir.join("link")).unwrap();
+    dir
+}
+
+#[cfg(unix)]
+#[test]
+fn exclusions_match_paths_however_reached() {
+    let dir = staged();
+    assert_eq!(sources(&dir, "through-loop"), ["src/a.txt"]);
+    assert_eq!(
+        sources(&dir, "link-to-excluded"),
+        ["Taskfile.yml", "gen", "input.txt"]
+    );
+}
+
+#[test]
+fn trailing_slash_and_empty_trees_match_directories_only() {
+    let dir = stage("exclusions");
+    assert_eq!(sources(&dir, "slash-absolute"), ["input.txt"]);
+    assert_eq!(sources(&dir, "slash-relative"), ["src/a.txt"]);
+    assert_eq!(sources(&dir, "tree-of-a-file"), ["gen"]);
 }
 
 /// Exclusions match dot entries, which includes still skip unless named.

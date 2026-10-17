@@ -1,7 +1,46 @@
 version: '3'
 
-# Each task's sources are read with `--status --json`.
+# Each task's sources are read with `--status --json`; links are made by the
+# test (crates/task/tests/exclusions.rs).
 tasks:
+  # `build/again` links back to `build`: `build/**` still excludes the file
+  # reached through it.
+  through-loop:
+    sources:
+      - build/again/*.o
+      - src/*.txt
+      - exclude: build/**
+    cmds: ['true']
+
+  # A trailing `/` matches only a directory. A relative pattern loses it
+  # when joined to the task directory.
+  slash-absolute:
+    sources:
+      - input.txt
+      - exclude: '{{.TASKFILE_DIR}}/input.txt/'
+    cmds: ['true']
+
+  slash-relative:
+    sources:
+      - input.txt
+      - src/a.txt
+      - exclude: input.txt/
+    cmds: ['true']
+
+  # `gen/**` matching nothing below matches `gen` only as a directory.
+  tree-of-a-file:
+    sources:
+      - gen
+      - exclude: gen/**
+    cmds: ['true']
+
+  # `link` is made a symlink to `src`: as a directory it is excluded.
+  link-to-excluded:
+    sources:
+      - '*'
+      - exclude: link/**
+    cmds: ['true']
+
   # Exclusions match dot entries; includes skip them unless named.
   dot-entries:
     sources:

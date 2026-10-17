@@ -10,6 +10,12 @@
   change, once. Tasks with a dot-file include elsewhere, such as
   `web/.yarnrc.yml` next to `exclude: '**/node_modules/**'`, no longer scan the
   excluded trees, which could make them twice as slow.
+- **An `exclude:` removes every path its pattern matches, however an include
+  reached it:** through a symlink, a link back up, or a directory that can be
+  searched but not read. `exclude: a//b/**` now excludes `a/b/**`, and
+  `exclude: link/**` drops `link` when it is a symlink to a directory. Tasks
+  with such paths see their checksum change once. Exclusions no longer walk
+  the tree themselves, which speeds up patterns such as `exclude: '**/*.pyc'`.
 
 ## v4.9.0 - 2026-10-16
 

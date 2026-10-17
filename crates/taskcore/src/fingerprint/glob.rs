@@ -93,11 +93,11 @@ impl Scan {
     }
 
     /// Whether `path` names anything, following links, looked up one name at
-    /// a time ([`exists_by_handles`]): a lookup error that does not just end
+    /// a time ([`lookup_by_handles`]): a lookup error that does not just end
     /// the branch fails the call.
     fn exists(&mut self, path: &str) -> bool {
-        match exists_by_handles(path) {
-            Ok(found) => found,
+        match lookup_by_handles(path) {
+            Ok(found) => found.is_some(),
             Err(e) => {
                 self.fail(path, e);
                 false
@@ -186,6 +186,8 @@ fn shell_globs<'a>(
         if !g.fingerprint.is_empty() {
             let fp = join_pattern(dir, &g.fingerprint);
             if scan.exists(&fp) {
+                #[cfg(test)]
+                hit("fingerprint");
                 mark(&mut included, &mut excluded, fp, g.negate);
             }
             continue;
@@ -224,6 +226,11 @@ pub fn cache_globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<String>> {
 /// so a restore can reject entries outside the task's generates before writing.
 /// Matches every path the walk lists, but may also match paths below directory
 /// symlinks that a wildcard would not cross. A restore rejects those separately.
+///
+/// It also matches a link at a directory an exclusion names (a trailing `/`,
+/// or a trailing `**` matching nothing): the walk drops it only when it leads
+/// to a directory, which a name cannot tell. A restore checks every link's
+/// target separately.
 pub struct CacheMatcher {
     own: MatchGroup,
     folded: Vec<MatchGroup>,
@@ -256,8 +263,19 @@ impl MatchGroup {
             fingerprints: Vec::new(),
         };
         for g in globs {
-            let segments = normalized_segments(&join_pattern(dir, &g.glob));
+            let pattern = join_pattern(dir, &g.glob);
+            let mut segments = normalized_segments(&pattern);
             if g.negate {
+                // A trailing `/`, or a `**` matching nothing, matches only a
+                // directory ([`Exclusion`]), and archive entries are files and
+                // links: keep only what matches below it, so a link at such a
+                // directory is accepted (see [`CacheMatcher`]).
+                if pattern.ends_with('/') {
+                    continue;
+                }
+                if segments.len() > 1 && segments.last().is_some_and(|s| s == "**") {
+                    segments.push("*".to_string());
+                }
                 group.excludes.push(segments);
             } else {
                 group.includes.push(segments);
@@ -324,6 +342,8 @@ fn tree_globs<'a>(
         if !g.fingerprint.is_empty() && !g.negate {
             let fp = join_pattern(dir, &g.fingerprint);
             if scan.exists(&fp) {
+                #[cfg(test)]
+                hit("fingerprint");
                 mark(&mut included, &mut excluded, fp, false);
             }
         }
@@ -374,10 +394,12 @@ impl Options {
 
 /// Expands joined `(pattern, negate)` entries into the working sets.
 ///
-/// The result is the order-independent `included - excluded`. Exclusions
-/// expand with `dotglob`. A negated whole-tree pattern (`<prefix>/**/*`)
-/// becomes a [`Pruner`] that keeps positive walks out of covered directories.
-/// Other excludes expand normally.
+/// The result is the order-independent `included - excluded`. Exclusions are
+/// matched against paths rather than walked ([`Exclusion`]): one removes every
+/// included path its pattern matches, however the include reached it, dot
+/// names included. A whole-tree exclusion (`<prefix>/**/*` or `<prefix>/**`)
+/// also becomes a [`Pruner`] that keeps positive walks out of the directories
+/// it covers.
 fn expand_patterns(
     patterns: &[(String, bool)],
     included: &mut BTreeSet<String>,
@@ -390,50 +412,303 @@ fn expand_patterns(
         .filter(|(_, negate)| !negate)
         .map(|(p, _)| p.as_str())
         .collect();
-    let fingerprints: Vec<String> = included
-        .iter()
-        .filter(|_| !opts.follow_symlinks)
-        .cloned()
-        .collect();
-    let pruning_includes: Vec<&str> = includes
-        .iter()
-        .copied()
-        .chain(fingerprints.iter().map(String::as_str))
-        .collect();
-
-    let exclusion = Options {
-        dotglob: true,
-        ..opts
-    };
     let mut pruners = Vec::new();
+    let mut exclusions = Vec::new();
     for (pattern, _) in patterns.iter().filter(|(_, negate)| *negate) {
-        match Pruner::new(pattern, &pruning_includes, opts) {
-            Some(pruner) => {
-                // Pruning only affects walks. Subtract covered fingerprint paths
-                // inserted directly into `included` to preserve expanded-exclude
-                // behavior.
-                let segments = rooted_segments(pattern);
-                let covered: Vec<String> = included
-                    .iter()
-                    .filter(|p| match_segments(&segments, &rooted_segments(p), true))
-                    .cloned()
-                    .collect();
-                for path in covered {
-                    mark(included, excluded, path, true);
-                }
-                pruners.push(pruner);
+        let pruner = Pruner::new(pattern).filter(|_| pruning());
+        exclusions.push(Exclusion::new(pattern, true, pruner.is_some()));
+        pruners.extend(pruner);
+    }
+
+    let mut exclusions = Exclusions::new(exclusions);
+    // Paths already included (fingerprints, folded groups' matches) may lie
+    // anywhere, pruned directories included.
+    if !exclusions.is_empty() {
+        let matched: Vec<String> = included
+            .iter()
+            .filter(|p| exclusions.excludes(p, false, scan))
+            .cloned()
+            .collect();
+        for path in matched {
+            #[cfg(test)]
+            hit("included before, excluded");
+            mark(included, excluded, path, true);
+        }
+    }
+    for pattern in includes {
+        for m in expand(pattern, &pruners, opts, scan) {
+            let decided = || included.contains(&m) || excluded.contains(&m);
+            if exclusions.is_empty() || decided() {
+                mark(included, excluded, m, false);
+                continue;
             }
-            None => {
-                for m in expand(pattern, &[], exclusion, scan) {
-                    mark(included, excluded, m, true);
-                }
+            let negate = exclusions.excludes(&m, true, scan);
+            mark(included, excluded, m, negate);
+        }
+    }
+}
+
+/// An exclusion, compiled for matching listed paths.
+///
+/// It matches a path as the walk of its pattern would have listed it, by
+/// name: `**` and wildcards per [`match_segments`], empty segments skipped,
+/// except that a trailing `/`, or a trailing `**` matching nothing, matches
+/// only a directory (an included path is one only as a link to it).
+struct Exclusion {
+    /// Segments with the root marker and without empty ones; for a trailing
+    /// `**`, the base before it.
+    segments: Vec<String>,
+    /// For a trailing `**`: the segments matching anything below the base.
+    below: Option<Vec<String>>,
+    tail: Tail,
+    /// The pattern without wildcards, as a path: matched by equality.
+    literal: Option<String>,
+    /// The leading literal segments and `/`: every matched path starts with
+    /// it or equals `base`.
+    prefix: String,
+    /// `prefix` without its trailing `/`.
+    base: String,
+    /// Literal segments past the prefix, as `/name/`: a matched path has
+    /// each, or ends with it (without the last `/`).
+    needles: Vec<String>,
+    /// The last segment, as `/name`, when literal: what a path matched by
+    /// `segments` ends with.
+    last: Option<String>,
+    /// For a wildcard last segment, its literal start and end (end empty when
+    /// it has a `[`): the last name of a path `segments` match has both.
+    affix: Option<(String, String)>,
+    dotglob: bool,
+    /// Whether a [`Pruner`] keeps walks out of every directory it covers.
+    pruned: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    /// Matches by its segments only.
+    Name,
+    /// Ends in `/`: a directory its segments match.
+    Dir,
+    /// Ends in `**`: a directory its segments match, or anything below one.
+    Tree,
+}
+
+impl Exclusion {
+    fn new(pattern: &str, dotglob: bool, pruned: bool) -> Self {
+        let mut segments: Vec<String> = normalized(pattern)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut tail = if pattern.ends_with('/') {
+            Tail::Dir
+        } else {
+            Tail::Name
+        };
+        if tail == Tail::Name && segments.len() > 1 && segments.last().is_some_and(|s| s == "**") {
+            while segments.len() > 1 && segments.last().is_some_and(|s| s == "**") {
+                segments.pop();
             }
+            tail = Tail::Tree;
+        }
+        let below = (tail == Tail::Tree).then(|| {
+            segments
+                .iter()
+                .cloned()
+                .chain(["*".to_string(), "**".to_string()])
+                .collect()
+        });
+        let lead = segments.iter().take_while(|s| !has_meta(s)).count();
+        let literal = (lead == segments.len() && tail == Tail::Name).then(|| segments.join("/"));
+        let base = segments.get(..lead).unwrap_or_default().join("/");
+        let prefix = format!("{base}/");
+        let needles = segments
+            .get(lead..)
+            .unwrap_or_default()
+            .iter()
+            .filter(|s| !has_meta(s))
+            .map(|s| format!("/{s}/"))
+            .collect();
+        let last = segments
+            .last()
+            .filter(|s| segments.len() > 1 && !has_meta(s) && s.as_str() != "**")
+            .map(|s| format!("/{s}"));
+        let affix = segments
+            .last()
+            .filter(|s| segments.len() > 1 && has_meta(s) && s.as_str() != "**")
+            .map(|s| {
+                let start = s.split(['*', '?', '[']).next().unwrap_or_default();
+                let end = if s.contains('[') {
+                    ""
+                } else {
+                    s.rsplit(['*', '?']).next().unwrap_or_default()
+                };
+                (start.to_string(), end.to_string())
+            });
+        Self {
+            segments,
+            below,
+            tail,
+            literal,
+            prefix,
+            base,
+            needles,
+            last,
+            affix,
+            dotglob,
+            pruned,
+        }
+    }
+}
+
+/// A group's exclusions: those without wildcards looked up by path, the
+/// others matched in turn.
+struct Exclusions {
+    literal: std::collections::HashSet<String>,
+    others: Vec<Exclusion>,
+    matcher: Matcher,
+}
+
+impl Exclusions {
+    fn new(all: Vec<Exclusion>) -> Self {
+        let (literal, others): (Vec<Exclusion>, Vec<Exclusion>) =
+            all.into_iter().partition(|e| e.literal.is_some());
+        Self {
+            literal: literal.into_iter().filter_map(|e| e.literal).collect(),
+            others,
+            matcher: Matcher::default(),
         }
     }
 
-    for pattern in includes {
-        for m in expand(pattern, &pruners, opts, scan) {
-            mark(included, excluded, m, false);
+    fn is_empty(&self) -> bool {
+        self.literal.is_empty() && self.others.is_empty()
+    }
+
+    /// Whether one excludes `path` (see [`Matcher::excludes`]).
+    fn excludes(&mut self, path: &str, walked: bool, scan: &mut Scan) -> bool {
+        let clean = clean_path(path);
+        self.literal.contains(clean.as_ref())
+            || self
+                .others
+                .iter()
+                .any(|e| self.matcher.excludes_clean(e, &clean, path, walked, scan))
+    }
+}
+
+/// `path` as the walk spells it: rooted, without empty segments. The walk's
+/// own paths already are.
+fn clean_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if (path.starts_with('/') || path.starts_with("./"))
+        && !path.contains("//")
+        && !path.ends_with('/')
+    {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        std::borrow::Cow::Owned(path_segments(path).join("/"))
+    }
+}
+
+/// Matches paths against [`Exclusion`]s, reusing its buffers.
+#[derive(Default)]
+struct Matcher {
+    rows: (Vec<bool>, Vec<bool>),
+}
+
+impl Matcher {
+    /// Whether `e` excludes `path`: one a walk listed when `walked` (so not
+    /// below a directory a pruner covers), else one included before.
+    #[cfg(test)]
+    fn excludes(&mut self, e: &Exclusion, path: &str, walked: bool, scan: &mut Scan) -> bool {
+        self.excludes_clean(e, &clean_path(path), path, walked, scan)
+    }
+
+    /// [`Self::excludes`] of `raw`, spelled as its [`clean_path`] `path`.
+    /// Cheap checks on the path's text reject most paths first; `raw` is
+    /// what a directory check looks up.
+    fn excludes_clean(
+        &mut self,
+        e: &Exclusion,
+        path: &str,
+        raw: &str,
+        walked: bool,
+        scan: &mut Scan,
+    ) -> bool {
+        // Below a covered directory, the only paths `<prefix>/**/*` matches.
+        let below = e.below.as_ref().filter(|_| !(walked && e.pruned));
+        if walked && e.pruned && e.tail == Tail::Name {
+            return false;
+        }
+        if let Some(literal) = &e.literal {
+            return literal == path;
+        }
+        if !path.starts_with(&e.prefix) && path != e.base {
+            return false;
+        }
+        let ends = |n: &str| path.ends_with(n.get(..n.len().saturating_sub(1)).unwrap_or(n));
+        if !e
+            .needles
+            .iter()
+            .all(|n| path.contains(n.as_str()) || ends(n))
+        {
+            return false;
+        }
+        // Whether the last segment can match the path's last name.
+        let last_fits = |path: &str| {
+            let name = path.rsplit('/').next().unwrap_or_default();
+            e.last.as_ref().is_none_or(|l| path.ends_with(l.as_str()))
+                && e.affix.as_ref().is_none_or(|(start, end)| {
+                    name.starts_with(start.as_str()) && name.ends_with(end.as_str())
+                })
+        };
+        if below.is_none() && !last_fits(path) {
+            return false;
+        }
+
+        let segments = path_segments(path);
+        let dotglob = e.dotglob;
+        let rows = &mut self.rows;
+        let mut matches = |pat: &[String]| {
+            star_match_with(
+                pat,
+                &segments,
+                |seg| seg == "**",
+                |name| dotglob || !name.starts_with('.'),
+                |seg, name| {
+                    if has_meta(seg) {
+                        matches_segment(seg, name, dotglob)
+                    } else {
+                        seg == name
+                    }
+                },
+                rows,
+            )
+        };
+        match e.tail {
+            Tail::Name => matches(&e.segments),
+            Tail::Dir => matches(&e.segments) && is_dir(raw, scan),
+            Tail::Tree => {
+                if below.is_some_and(|b| matches(b)) {
+                    return true;
+                }
+                last_fits(path) && matches(&e.segments) && is_dir(raw, scan)
+            }
+        }
+    }
+}
+
+/// Whether `path`, an included entry as its walk spelled it, is a directory
+/// or a link to one. A file listed as such is not; anything else is looked
+/// up one name at a time ([`lookup_by_handles`]), following links. A lookup
+/// error the shell shrugs off means not; any other fails the walk.
+fn is_dir(path: &str, scan: &mut Scan) -> bool {
+    if scan.hints.get(path) == Some(&Hint::File) {
+        return false;
+    }
+    #[cfg(test)]
+    hit("directory check");
+    match lookup_by_handles(path) {
+        Ok(kind) => kind == Some(Ty::Dir),
+        Err(e) => {
+            scan.fail(path, e);
+            false
         }
     }
 }
@@ -489,17 +764,24 @@ fn expand(pattern: &str, pruners: &[Pruner], opts: Options, scan: &mut Scan) -> 
 /// Skips directories covered by a negated `<prefix>/**/*` or `<prefix>/**`
 /// pattern while walking includes.
 ///
-/// Pruning preserves `included - excluded`: the exclusion, expanded with
-/// `dotglob`, would remove every skipped path, dot names included.
+/// Pruning preserves `included - excluded`: the exclusion matches every path
+/// below a covered directory, dot names included, which is all the pruned walk
+/// leaves out. A link to a covered directory that the walk would list from
+/// inside it is listed by [`Walker::pruned_link`].
 struct Pruner {
     /// Pattern segments before the trailing `**`, including the walk's root
-    /// marker (`""` for absolute patterns and `"."` for relative ones).
+    /// marker (`""` for absolute patterns and `"."` for relative ones),
+    /// without empty segments.
     prefix: Vec<String>,
 }
 
 impl Pruner {
-    fn new(pattern: &str, includes: &[&str], opts: Options) -> Option<Self> {
-        let segments = rooted_segments(pattern);
+    fn new(pattern: &str) -> Option<Self> {
+        // `<prefix>/**/` matches directories only, not the files below.
+        if pattern.ends_with('/') {
+            return None;
+        }
+        let segments = normalized(pattern);
         let mut prefix = segments.as_slice();
         if let Some((&"*", rest)) = prefix.split_last() {
             prefix = rest;
@@ -519,43 +801,6 @@ impl Pruner {
             return None;
         }
 
-        if !opts.follow_symlinks {
-            // A trailing `**` also emits its base. A literal base may be a
-            // symlink, which must be subtracted as an entry, not just pruned
-            // as a directory. Wildcard bases never traverse symlinks here.
-            if segments.last() == Some(&"**") && prefix.last().is_some_and(|s| !has_meta(s)) {
-                return None;
-            }
-            for include in includes {
-                let segments = rooted_segments(include);
-                let Some((last, directories)) = segments.split_last() else {
-                    continue;
-                };
-                // Pruning the base would also suppress an included symlink
-                // emitted by a trailing `**`.
-                if *last == "**"
-                    && directories
-                        .iter()
-                        .rev()
-                        .find(|s| **s != "**")
-                        .is_some_and(|s| !has_meta(s))
-                {
-                    return None;
-                }
-                // Beyond a shared literal prefix, a literal include can cross
-                // a directory symlink that the exclusion's wildcard skips.
-                // Expand that exclusion normally to preserve set subtraction.
-                let shared = directories
-                    .iter()
-                    .zip(prefix)
-                    .take_while(|(a, b)| a == b && !has_meta(a))
-                    .count();
-                if directories.iter().skip(shared).any(|s| !has_meta(s)) {
-                    return None;
-                }
-            }
-        }
-
         Some(Self {
             prefix: prefix.iter().map(|s| (*s).to_string()).collect(),
         })
@@ -567,6 +812,33 @@ impl Pruner {
         let path: Vec<&str> = dir.split('/').collect();
         match_segments(&self.prefix, &path, true)
     }
+}
+
+/// [`rooted_segments`] without the empty segments past the root marker,
+/// which the walk skips (`a//b` is `a/b`).
+fn normalized(path: &str) -> Vec<&str> {
+    rooted_segments(path)
+        .into_iter()
+        .enumerate()
+        .filter(|(i, s)| *i == 0 || !s.is_empty())
+        .map(|(_, s)| s)
+        .collect()
+}
+
+/// Splits a listed path into segments as [`rooted_segments`] splits its
+/// pattern: the walk lists a relative pattern's matches under `./`. Empty
+/// segments are dropped past the root marker.
+fn path_segments(path: &str) -> Vec<&str> {
+    let mut segments: Vec<&str> = path.split('/').collect();
+    if !matches!(segments.first(), Some(&"" | &".")) {
+        segments.insert(0, ".");
+    }
+    segments
+        .into_iter()
+        .enumerate()
+        .filter(|(i, s)| *i == 0 || !s.is_empty())
+        .map(|(_, s)| s)
+        .collect()
 }
 
 /// Splits a pattern into segments with its walk root: `""` for absolute
@@ -613,13 +885,35 @@ fn star_match<T, U>(
     star_ok: impl Fn(&U) -> bool,
     hit: impl Fn(&T, &U) -> bool,
 ) -> bool {
+    star_match_with(
+        toks,
+        text,
+        is_star,
+        star_ok,
+        hit,
+        &mut (Vec::new(), Vec::new()),
+    )
+}
+
+/// [`star_match`] in the given row buffers, which it reuses.
+fn star_match_with<T, U>(
+    toks: &[T],
+    text: &[U],
+    is_star: impl Fn(&T) -> bool,
+    star_ok: impl Fn(&U) -> bool,
+    hit: impl Fn(&T, &U) -> bool,
+    rows: &mut (Vec<bool>, Vec<bool>),
+) -> bool {
+    let (next, cur) = rows;
     // `next[j]`: whether the tokens after the current one match `text[j..]`.
-    let mut next = vec![false; text.len().saturating_add(1)];
+    next.clear();
+    next.resize(text.len().saturating_add(1), false);
     if let Some(end) = next.last_mut() {
         *end = true;
     }
     for tok in toks.iter().rev() {
-        let mut cur = vec![false; next.len()];
+        cur.clear();
+        cur.resize(next.len(), false);
         if is_star(tok) {
             // Fill from the end: `cur[j]` needs `cur[j + 1]`.
             let mut after = false;
@@ -639,7 +933,7 @@ fn star_match<T, U>(
                 }
             }
         }
-        next = cur;
+        std::mem::swap(next, cur);
     }
     next.first().copied().unwrap_or(false)
 }
@@ -743,12 +1037,23 @@ struct Walker<'a> {
 enum Child {
     /// A directory to descend into: opened, with its identity and type.
     Dir(handle::Handle, handle::Id, Ty),
-    /// A directory not to descend into: pruned, gone or unreadable since its
+    /// A directory not to descend into: gone or unreadable since its
     /// listing.
     Skip,
+    /// A directory a pruner covers, of this type (a directory, or a link
+    /// followed to one).
+    Pruned(Ty),
     /// Not a directory to this walk: a file, a link not followed or not to a
     /// directory, or one back to a directory on the way down.
     NotDir,
+}
+
+/// The pattern step that reached an entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Literal,
+    Wildcard,
+    DoubleStar,
 }
 
 impl Walker<'_> {
@@ -861,7 +1166,9 @@ impl Walker<'_> {
             _ => return Child::NotDir,
         }
         if !self.enter(&child.path) {
-            return Child::Skip;
+            #[cfg(test)]
+            hit("pruned");
+            return Child::Pruned(kind);
         }
         let opened = dir
             .child(&child.name, kind == Ty::Link)
@@ -891,6 +1198,8 @@ impl Walker<'_> {
         let l: Rc<[Listed]> = match list_dir(base, &dir) {
             Ok(l) => l.into(),
             Err(e) => {
+                #[cfg(test)]
+                hit("unlisted directory");
                 self.ends(base, e);
                 Rc::from([])
             }
@@ -975,11 +1284,24 @@ impl Walker<'_> {
             let Some(dir) = self.current(base) else {
                 return;
             };
-            if let Child::Dir(h, id, kind) = self.child(&dir, child) {
-                drop(dir);
-                self.down(&child.path, &child.name, h, id, kind, |w, p| {
-                    w.walk(p, rest)
-                });
+            match self.child(&dir, child) {
+                Child::Dir(h, id, kind) => {
+                    drop(dir);
+                    self.down(&child.path, &child.name, h, id, kind, |w, p| {
+                        w.walk(p, rest)
+                    });
+                }
+                Child::Pruned(Ty::Link) => {
+                    self.pruned_link(
+                        &dir,
+                        &child.name,
+                        Some(Ty::Link),
+                        &child.path,
+                        rest,
+                        Step::Wildcard,
+                    );
+                }
+                Child::Pruned(_) | Child::Skip | Child::NotDir => {}
             }
         }
     }
@@ -1006,6 +1328,7 @@ impl Walker<'_> {
             return;
         }
         if !self.enter(&next) {
+            self.pruned_link(&dir, segment, None, &next, rest, Step::Literal);
             return;
         }
         let opened = dir.child(segment, true).and_then(|h| {
@@ -1020,6 +1343,56 @@ impl Walker<'_> {
             Err(e) => {
                 self.ends(&next, e);
             }
+        }
+    }
+
+    /// Lists what an unpruned walk would list at `name`, a link in the
+    /// current directory `dir` to a directory a pruner covers, with `rest`
+    /// left to match after a `step` of the pattern: the link itself, as an
+    /// entry, when `rest` can match nothing below it (all `**`), or when a
+    /// final `**` stops at a wildcard's link back to a directory on the way
+    /// down. Whatever else it would list below is excluded.
+    ///
+    /// `kind` is `name`'s own type when its listing gave it; only a link is
+    /// opened, for its identity.
+    fn pruned_link(
+        &mut self,
+        dir: &handle::Handle,
+        name: &str,
+        kind: Option<Ty>,
+        path: &str,
+        rest: &[&str],
+        step: Step,
+    ) {
+        let kind = match kind.map_or_else(|| dir.stat(name, false), Ok) {
+            Ok(kind) => kind,
+            Err(e) => {
+                self.ends(path, e);
+                return;
+            }
+        };
+        if kind != Ty::Link {
+            return;
+        }
+        let id = match dir.child(name, true).and_then(|h| h.id()) {
+            Ok(id) => id,
+            Err(e) => {
+                self.ends(path, e);
+                return;
+            }
+        };
+        let looped = step != Step::Literal && self.chain.iter().any(|n| n.id == id);
+        let listed = if looped {
+            step == Step::DoubleStar && rest.is_empty()
+        } else {
+            rest.iter().all(|s| *s == "**" || s.is_empty())
+        };
+        #[cfg(test)]
+        hit(if looped { "pruned loop" } else { "pruned link" });
+        if listed {
+            #[cfg(test)]
+            hit("pruned link listed");
+            self.out.push((path.to_string(), Some(Ty::Link)));
         }
     }
 
@@ -1043,15 +1416,24 @@ impl Walker<'_> {
             let Some(dir) = self.current(base) else {
                 return;
             };
-            let class = self.child(&dir, child);
-            drop(dir);
-            match class {
+            match self.child(&dir, child) {
                 Child::Dir(h, id, kind) => {
+                    drop(dir);
                     self.down(&child.path, &child.name, h, id, kind, |w, p| {
                         w.walk_double_star(p, rest)
                     });
                 }
-                Child::Skip => {}
+                Child::Pruned(Ty::Link) => {
+                    self.pruned_link(
+                        &dir,
+                        &child.name,
+                        Some(Ty::Link),
+                        &child.path,
+                        rest,
+                        Step::DoubleStar,
+                    );
+                }
+                Child::Pruned(_) | Child::Skip => {}
                 Child::NotDir => {
                     if rest.is_empty() {
                         self.out.push((child.path.clone(), child.kind));
@@ -1062,10 +1444,10 @@ impl Walker<'_> {
     }
 }
 
-/// Whether `path` names anything, following links, looked up one name at a
-/// time from the root as a walk does: `Ok(false)` when the lookup just ends
-/// its branch ([`ends_branch`]).
-fn exists_by_handles(path: &str) -> std::io::Result<bool> {
+/// What `path` names, following links, looked up one name at a time from
+/// the root as a walk does: `Ok(None)` when the lookup just ends its branch
+/// ([`ends_branch`]).
+fn lookup_by_handles(path: &str) -> std::io::Result<Option<Ty>> {
     let parts: Vec<&str> = path.split('/').collect();
     let (root, rest) = match parts.split_first() {
         Some((&"", rest)) => ("/", rest),
@@ -1075,16 +1457,16 @@ fn exists_by_handles(path: &str) -> std::io::Result<bool> {
     let found = (|| {
         let mut dir = handle::Handle::root(root)?;
         let Some((last, parents)) = names.split_last() else {
-            return Ok(true);
+            return Ok(Ty::Dir);
         };
         for name in parents {
             dir = dir.child(name, true)?;
         }
-        dir.stat(last, true).map(|_| true)
+        dir.stat(last, true)
     })();
     match found {
-        Ok(found) => Ok(found),
-        Err(e) if ends_branch(&e) => Ok(false),
+        Ok(found) => Ok(Some(found)),
+        Err(e) if ends_branch(&e) => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -1095,6 +1477,8 @@ fn exists_by_handles(path: &str) -> std::io::Result<bool> {
 /// does not type is `lstat`ed relative to `dir`; one gone meanwhile is left
 /// out, any other failure is an error.
 fn list_dir(path: &str, dir: &handle::Handle) -> std::io::Result<Vec<Listed>> {
+    #[cfg(test)]
+    LISTINGS.with(|n| n.set(n.get().saturating_add(1)));
     #[cfg(test)]
     if FAIL_LISTING.with(|f| f.borrow().as_deref().is_some_and(|d| path.ends_with(d))) {
         return Err(std::io::Error::from_raw_os_error(5));
@@ -1139,6 +1523,43 @@ thread_local! {
 thread_local! {
     /// Makes listings report no entry types, as some filesystems do.
     static NO_DTYPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Directories listed on this thread, to test that pruning saves them.
+    static LISTINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Turns pruning off on this thread: every exclusion is expanded, the
+    /// reference pruning must agree with.
+    static NO_PRUNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How often this thread's walks took each edge case, by name.
+    static HITS: std::cell::RefCell<std::collections::BTreeMap<&'static str, u64>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// Counts an edge case on this thread ([`HITS`]).
+#[cfg(test)]
+fn hit(case: &'static str) {
+    HITS.with(|h| {
+        let mut h = h.borrow_mut();
+        let n = h.entry(case).or_insert(0);
+        *n = n.saturating_add(1);
+    });
+}
+
+/// Whether exclusions may prune walks ([`Pruner`]).
+#[cfg(not(test))]
+fn pruning() -> bool {
+    true
+}
+
+#[cfg(test)]
+fn pruning() -> bool {
+    !NO_PRUNING.with(std::cell::Cell::get)
 }
 
 /// Sets this thread's [`FAIL_LISTING`].
@@ -1899,13 +2320,8 @@ mod tests {
             .filter(|g| g.negate)
             .map(|g| join(&dir, &g.glob))
             .collect();
-        let includes = [join(&dir, "**/*.rs")];
-        let include_refs: Vec<&str> = includes.iter().map(String::as_str).collect();
         for p in &joined {
-            assert!(
-                Pruner::new(p, &include_refs, Options::SHELL).is_some(),
-                "{p} should prune"
-            );
+            assert!(Pruner::new(p).is_some(), "{p} should prune");
         }
 
         let files = globs(&dir, &patterns).unwrap();
@@ -1918,60 +2334,59 @@ mod tests {
         assert_eq!(globs(&dir, &reversed).unwrap(), files);
     }
 
-    /// Exclusions match dot entries, which includes reach only through a
-    /// literal segment; whole-tree ones still prune.
+    /// An exclusion matches dot names a wildcard include reaches; a dot
+    /// include outside it leaves the walk pruned. A path an include names
+    /// stays.
     #[test]
     fn exclusions_match_dot_entries() {
         let dir = tmp();
         write_file(&dir, "target/a.o", "a");
         write_file(&dir, "target/.keep/b.o", "b");
+        write_file(&dir, "target/.c.o", "c");
         write_file(&dir, "src/.env", "e");
         write_file(&dir, "src/x.o", "x");
-        let list = [g("**/*.o"), g("target/.keep/*.o"), g_neg("target/**/*")];
-        assert_eq!(globs(&dir, &list).unwrap(), [join(&dir, "src/x.o")]);
-        assert_eq!(cache_globs(&dir, &list).unwrap(), [join(&dir, "src/x.o")]);
-        let includes = [join(&dir, "**/*.o"), join(&dir, "target/.keep/*.o")];
-        let include_refs: Vec<&str> = includes.iter().map(String::as_str).collect();
-        let excluded = join(&dir, "target/**/*");
-        assert!(Pruner::new(&excluded, &include_refs, Options::SHELL).is_some());
+        let list = [
+            g("**/*.o"),
+            g("target/.keep/*.o"),
+            g("target/.c.o"),
+            g("src/.env"),
+            g_neg("target/**/*"),
+        ];
+        let (shell, tree, _, _) = agreed(&dir, &list);
+        assert_eq!(shell, [join(&dir, "src/.env"), join(&dir, "src/x.o")]);
+        assert_eq!(tree, shell);
         // `**` matches dot directories, `*` dot files.
         let list = [g("src/*"), g("src/.*"), g_neg("**/.*")];
-        assert_eq!(globs(&dir, &list).unwrap(), [join(&dir, "src/x.o")]);
+        assert_eq!(agreed(&dir, &list).0, [join(&dir, "src/x.o")]);
         let list = [g("target/.*/*.o"), g("src/x.o"), g_neg("**/b.o")];
-        assert_eq!(globs(&dir, &list).unwrap(), [join(&dir, "src/x.o")]);
+        assert_eq!(agreed(&dir, &list).0, [join(&dir, "src/x.o")]);
     }
 
     #[test]
     fn pruner_classification() {
-        fn new(pattern: &str, includes: &[&str]) -> Option<Pruner> {
-            Pruner::new(pattern, includes, Options::SHELL)
-        }
-        let inc = ["/w/**/*.rs"];
-        assert!(new("/w/target/**/*", &inc).is_some());
-        assert!(new("/w/target/**/**/*", &inc).is_some());
-        assert!(new("/w/*/target/**/*", &inc).is_some());
-        assert!(new("/w/**/target/**/*", &inc).is_some());
+        let new = Pruner::new;
+        assert!(new("/w/target/**/*").is_some());
+        assert!(new("/w/target/**/**/*").is_some());
+        assert!(new("/w/*/target/**/*").is_some());
+        assert!(new("/w/**/target/**/*").is_some());
+        assert!(new("/w/.cache/**/*").is_some());
         // These patterns do not cover a whole directory.
-        assert!(new("/w/target/**/*.o", &inc).is_none());
-        assert!(new("/w/target/*", &inc).is_none());
+        assert!(new("/w/target/**/*.o").is_none());
+        assert!(new("/w/target/*").is_none());
         // Both forms cover the same files.
-        assert!(new("/w/target/**", &inc).is_some());
-        assert!(new("/w/target/**/**", &inc).is_some());
+        assert!(new("/w/target/**").is_some());
+        assert!(new("/w/target/**/**").is_some());
         // This covers each child directory at depth 2 or greater under `target`.
-        assert!(new("/w/target/**/*/**/*", &inc).is_some());
+        assert!(new("/w/target/**/*/**/*").is_some());
         // These would prune the walk root.
-        assert!(new("/**/*", &inc).is_none());
-        assert!(new("**/*", &["**/*.rs"]).is_none());
-        // The exclusion matches dot entries too, so an include naming one
-        // anywhere is safe.
-        assert!(new("/w/target/**/*", &["/w/target/.cache/*"]).is_some());
-        assert!(new("/w/target/**/*", &["/w/**/.cache/*"]).is_some());
-        assert!(new("/w/**/target/**/*", &["/w/**/.git/**/*"]).is_some());
+        assert!(new("/**/*").is_none());
+        assert!(new("**/*").is_none());
+        assert!(new("//**").is_none());
     }
 
     #[test]
     fn pruner_covers() {
-        let p = Pruner::new("/w/**/target*/**/*", &[], Options::SHELL).unwrap();
+        let p = Pruner::new("/w/**/target*/**/*").unwrap();
         assert!(p.covers("/w/target"));
         assert!(p.covers("/w/a/b/target-x"));
         // `**` spans dot directories, as the exclusion matches them.
@@ -1979,9 +2394,11 @@ mod tests {
         assert!(!p.covers("/w/a/target/sub"));
         assert!(!p.covers("/w/a/starget"));
         assert!(!p.covers("/w"));
-        let rel = Pruner::new("target/**/*", &[], Options::SHELL).unwrap();
+        let rel = Pruner::new("target/**/*").unwrap();
         assert!(rel.covers("./target"));
         assert!(!rel.covers("./src/target"));
+        let sep = Pruner::new("/w//a/**").unwrap();
+        assert!(sep.covers("/w/a"));
     }
 
     #[test]
@@ -2051,9 +2468,59 @@ mod tests {
         );
     }
 
+    /// A link at a directory an exclusion names is dropped by the walk only
+    /// when it leads to one; the matcher, which cannot tell, accepts it
+    /// either way, and still rejects what lies below.
     #[cfg(unix)]
     #[test]
-    fn cache_exclusions_preserve_literal_paths_through_symlinks() {
+    fn cache_matcher_accepts_links_directory_exclusions_name() {
+        let dir = tmp();
+        write_file(&dir, "target/file.txt", "data");
+        write_file(&dir, "a.txt", "a");
+        std::os::unix::fs::symlink("target", join(&dir, "dlink")).unwrap();
+        std::os::unix::fs::symlink("a.txt", join(&dir, "flink")).unwrap();
+        // Absolute: a relative pattern loses its trailing `/` when joined.
+        for exclude in ["*/**", "*/"] {
+            let list = [g("*"), g_neg(&join(&dir, exclude))];
+            assert_eq!(
+                cache_globs(&dir, &list).unwrap(),
+                vec![join(&dir, "a.txt"), join(&dir, "flink")],
+                "{exclude}"
+            );
+            let matcher = CacheMatcher::new(&dir, &list);
+            for rel in ["dlink", "flink", "a.txt"] {
+                assert!(matcher.matches(&dir, rel), "{rel} with {exclude}");
+            }
+            assert!(!matcher.matches(&dir, "dlink/file.txt"), "{exclude}");
+        }
+    }
+
+    /// A trailing `/` or `**` matches a directory by a lookup of the path as
+    /// listed; a file the listing typed is not looked up at all.
+    #[test]
+    fn directory_exclusions_look_up_listed_paths() {
+        let dir = tmp();
+        write_file(&dir, "sub/x.txt", "x");
+        let scan = &mut Scan::default();
+        let mut m = Matcher::default();
+        for pattern in ["sub/", "sub/**", "s*/"] {
+            let e = Exclusion::new(&join(&dir, pattern), true, false);
+            assert!(m.excludes(&e, &join(&dir, "sub"), false, scan), "{pattern}");
+            let below = m.excludes(&e, &join(&dir, "sub/x.txt"), false, scan);
+            assert_eq!(below, pattern.ends_with("**"), "{pattern}");
+        }
+        let file = join(&dir, "sub/x.txt");
+        let e = Exclusion::new(&join(&dir, "sub/x.txt/"), true, false);
+        scan.hints.insert(file.clone(), Hint::File);
+        HITS.with(|h| h.borrow_mut().clear());
+        assert!(!m.excludes(&e, &file, false, scan));
+        assert!(!HITS.with(|h| h.borrow().contains_key("directory check")));
+        assert!(scan.result(()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_exclusions_match_literal_paths_through_symlinks() {
         let dir = tmp();
         write_file(&dir, "target/file.txt", "data");
         std::fs::create_dir_all(join(&dir, "out")).unwrap();
@@ -2075,29 +2542,19 @@ mod tests {
             );
         }
 
-        for pattern in ["out/link/file.txt", "out/link/*", "out/**/link/*"] {
+        // The exclusion's own walk would not cross the link; it excludes
+        // what it matches however the include reached it, as a restore
+        // checks it.
+        for pattern in ["out/link/*", "out/**/link/*"] {
             let include = g(pattern);
-            let excluded = cache_globs(&dir, &[g("out/**/*")]).unwrap();
-            assert_eq!(excluded, vec![join(&dir, "out/link")]);
-            let expected: Vec<String> = cache_globs(&dir, std::slice::from_ref(&include))
-                .unwrap()
-                .into_iter()
-                .filter(|path| !excluded.contains(path))
-                .collect();
-            assert_eq!(expected, vec![join(&dir, "out/link/file.txt")]);
             assert_eq!(
-                cache_globs(&dir, &[include, g_neg("out/**/*")]).unwrap(),
-                expected,
-                "include {pattern}"
+                cache_globs(&dir, std::slice::from_ref(&include)).unwrap(),
+                vec![join(&dir, "out/link/file.txt")]
             );
+            let list = [include, g_neg("out/**/*")];
+            assert!(cache_globs(&dir, &list).unwrap().is_empty(), "{pattern}");
+            assert!(!CacheMatcher::new(&dir, &list).matches(&dir, "out/link/file.txt"));
         }
-
-        let mut include = g("out/**/*");
-        include.fingerprint = "out/link/file.txt".into();
-        assert_eq!(
-            cache_globs(&dir, &[include, g_neg("out/**/*")]).unwrap(),
-            vec![join(&dir, "out/link/file.txt")]
-        );
     }
 
     #[test]
@@ -2556,6 +3013,410 @@ mod tests {
         }
     }
 
+    /// A seeded xorshift stream for the randomized tests.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn pick<'a>(&mut self, from: &[&'a str]) -> &'a str {
+            from[(self.next() % from.len() as u64) as usize]
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// A small random tree of what pruning has to get right: dot entries,
+    /// links back up (loops), across into other trees, to files and to
+    /// nothing, and directories that can be searched but not read.
+    fn random_tree(rng: &mut Rng) -> (String, Vec<String>) {
+        let dir = join(&tmp(), "root");
+        let mut dirs = vec![String::new()];
+        for _ in 0..6 + rng.below(6) {
+            let parent = dirs[rng.below(dirs.len() as u64) as usize].clone();
+            if parent.matches('/').count() >= 3 {
+                continue;
+            }
+            let name = rng.pick(&["a", "b", "nm", "t", ".h"]);
+            let d = if parent.is_empty() {
+                name.to_string()
+            } else {
+                format!("{parent}/{name}")
+            };
+            std::fs::create_dir_all(join(&dir, &d)).unwrap();
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+        let at = |d: &str, name: &str| {
+            if d.is_empty() {
+                join(&dir, name)
+            } else {
+                join(&dir, &format!("{d}/{name}"))
+            }
+        };
+        for d in &dirs {
+            for f in ["f.txt", "g.rs", ".d"] {
+                if rng.below(3) != 0 {
+                    std::fs::write(at(d, f), f).unwrap();
+                }
+            }
+        }
+        let mut locked = Vec::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            for _ in 0..3 + rng.below(5) {
+                let d = dirs[rng.below(dirs.len() as u64) as usize].clone();
+                let other = dirs[rng.below(dirs.len() as u64) as usize].clone();
+                let (name, target) = match rng.below(7) {
+                    0 => ("lp", ".".to_string()),
+                    1 => ("up", "..".to_string()),
+                    2 => ("x", at(&other, "")),
+                    3 => ("fl", "f.txt".to_string()),
+                    4 => ("dg", "nowhere".to_string()),
+                    // Named as directories exclusions cover.
+                    _ => (rng.pick(&["nm", "t"]), at(&other, "")),
+                };
+                let link = at(&d, name);
+                if std::fs::symlink_metadata(&link).is_err() {
+                    symlink(target, link).unwrap();
+                }
+            }
+            // SAFETY: geteuid has no preconditions.
+            if unsafe { libc::geteuid() } != 0 && rng.below(3) == 0 {
+                use std::os::unix::fs::PermissionsExt;
+                let d = dirs[rng.below(dirs.len() as u64) as usize].clone();
+                if !d.is_empty() {
+                    let path = at(&d, "");
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o311))
+                        .unwrap();
+                    locked.push(path);
+                }
+            }
+        }
+        (dir, locked)
+    }
+
+    /// A random pattern over the names [`random_tree`] uses: absolute (under
+    /// `dir`) one time in four.
+    fn random_pattern(rng: &mut Rng, dir: &str, max: u64) -> String {
+        let n = 1 + rng.below(max);
+        let rel = (0..n)
+            .map(|_| {
+                rng.pick(&[
+                    "a", "b", "nm", "t", ".h", "lp", "up", "x", "fl", "*", "*", "?", "[ab]", "**",
+                    "**", "f.txt", "*.rs", ".d",
+                ])
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        if rng.below(4) == 0 {
+            join(dir, &rel)
+        } else {
+            rel
+        }
+    }
+
+    /// A random entry list: includes, whole-tree exclusions (what prunes),
+    /// other exclusions, some ending in `/`, fingerprints and excluded
+    /// fingerprints, and folded groups with their own.
+    fn random_list(rng: &mut Rng, dir: &str) -> Vec<Glob> {
+        let mut list = Vec::new();
+        // A broad include and an exclusion covering what links are named,
+        // half the time: random prefixes alone rarely cover a link.
+        if rng.below(2) == 0 {
+            list.push(g(rng.pick(&["**", "*/**", "**/*", "*", "*/*", "**/**"])));
+            list.push(g_neg(rng.pick(&[
+                "**/nm/**",
+                "**/t/**/*",
+                "*/nm/**/*",
+                "x/**",
+                "**/x/**/*",
+                "**/lp/**",
+                "*/up/**",
+            ])));
+        }
+        for group in 0..1 + rng.below(3) as u32 {
+            for _ in 0..1 + rng.below(3) {
+                let mut inc = g(&random_pattern(rng, dir, 4));
+                if rng.below(6) == 0 {
+                    inc.fingerprint = random_pattern(rng, dir, 3);
+                }
+                list.push(grouped(inc, group));
+            }
+            for _ in 0..rng.below(3) {
+                let tail = rng.pick(&["**", "**/*", "**/*.rs", "*", "", "**/"]);
+                let prefix = random_pattern(rng, dir, 3);
+                let mut exc = g_neg(&format!("{prefix}/{tail}"));
+                if rng.below(10) == 0 {
+                    exc = g_neg(&random_pattern(rng, dir, 2));
+                    exc.fingerprint = random_pattern(rng, dir, 3);
+                }
+                list.push(grouped(exc, group));
+            }
+        }
+        list
+    }
+
+    /// What an exclusion matches, spelled out without [`Matcher`]'s
+    /// shortcuts: by name, a trailing `/` or a `**` matching nothing only a
+    /// directory.
+    fn reference_excludes(pattern: &str, path: &str, dotglob: bool) -> bool {
+        let segs = normalized(pattern);
+        let p = path_segments(path);
+        let is_dir = || std::fs::metadata(path).is_ok_and(|m| m.is_dir());
+        if pattern.ends_with('/') {
+            return match_segments(&segs, &p, dotglob) && is_dir();
+        }
+        let mut base = segs.clone();
+        while base.len() > 1 && base.last() == Some(&"**") {
+            base.pop();
+        }
+        if base.len() == segs.len() {
+            return match_segments(&segs, &p, dotglob);
+        }
+        (match_segments(&base, &p, dotglob) && is_dir())
+            || (1..p.len()).any(|n| {
+                match_segments(&base, &p[..n], dotglob)
+                    && p[n..].iter().all(|s| dotglob || !s.starts_with('.'))
+            })
+    }
+
+    /// Pruning is an optimisation: on random trees and entry lists, every
+    /// walk lists exactly what it lists with every exclusion expanded, and
+    /// the exclusion matcher's shortcuts agree with [`reference_excludes`].
+    /// The edge cases each come up, not just agreement.
+    #[test]
+    fn pruning_lists_what_expanding_lists() {
+        // SAFETY: geteuid has no preconditions.
+        #[cfg(unix)]
+        let root = unsafe { libc::geteuid() } == 0;
+        #[cfg(not(unix))]
+        let root = true;
+        HITS.with(|h| h.borrow_mut().clear());
+        let mut rng = Rng(0x5eed_cafe);
+        let (mut pruned, mut retained, mut excluding, mut folded, mut checked) = (0, 0, 0, 0, 0);
+        for _ in 0..45 {
+            let (dir, locked) = random_tree(&mut rng);
+            let mut paths: BTreeSet<String> = BTreeSet::new();
+            paths.extend(globs(&dir, &[g("**")]).unwrap());
+            paths.extend(cache_globs(&dir, &[g("**")]).unwrap());
+            for _ in 0..15 {
+                let list = random_list(&mut rng, &dir);
+                let walk = |prune: bool| {
+                    NO_PRUNING.with(|p| p.set(!prune));
+                    LISTINGS.with(|n| n.set(0));
+                    let shell = hinted_globs(&dir, &list).map_err(|e| e.to_string());
+                    let tree = cache_globs(&dir, &list).map_err(|e| e.to_string());
+                    NO_PRUNING.with(|p| p.set(false));
+                    (shell, tree, LISTINGS.with(std::cell::Cell::get))
+                };
+                let (shell, tree, with) = walk(true);
+                let (shell_ref, tree_ref, without) = walk(false);
+                // Hints come from whichever walk listed a path first: only
+                // their truth is compared.
+                let paths_of = |r: &Result<Vec<(String, Hint)>, String>| {
+                    r.clone()
+                        .map(|v| v.into_iter().map(|(f, _)| f).collect::<Vec<_>>())
+                };
+                assert_eq!(
+                    paths_of(&shell),
+                    paths_of(&shell_ref),
+                    "globs {list:?} in {dir}"
+                );
+                assert_eq!(tree, tree_ref, "cache_globs {list:?} in {dir}");
+                pruned += u32::from(with < without);
+                for (f, hint) in shell.iter().flatten() {
+                    let ft = std::fs::symlink_metadata(f).map(|m| m.file_type());
+                    match hint {
+                        Hint::File => assert!(ft.unwrap().is_file(), "{f}"),
+                        Hint::Link => assert!(ft.unwrap().is_symlink(), "{f}"),
+                        Hint::Unknown => {}
+                    }
+                }
+                let shell = paths_of(&shell).unwrap();
+                retained += u32::from(!shell.is_empty());
+                let positive: Vec<Glob> = list.iter().filter(|g| !g.negate).cloned().collect();
+                excluding += u32::from(globs(&dir, &positive).unwrap().len() > shell.len());
+                folded += u32::from(list.iter().any(|g| g.group > 0) && !shell.is_empty());
+                // A restore accepts every entry an archive holds.
+                let matcher = CacheMatcher::new(&dir, &list);
+                for f in tree.unwrap() {
+                    let rel = f.strip_prefix(&format!("{dir}/")).unwrap();
+                    assert!(matcher.matches(&dir, rel), "{rel} with {list:?}");
+                }
+                // The matcher, shortcuts and all, against the reference.
+                let scan = &mut Scan::default();
+                let mut m = Matcher::default();
+                for e in list.iter().filter(|g| g.negate) {
+                    let pattern = join_pattern(&dir, &e.glob);
+                    let dotglob = rng.below(2) == 0;
+                    {
+                        let x = Exclusion::new(&pattern, dotglob, false);
+                        for p in &paths {
+                            let spelled = if checked % 7 == 0 {
+                                p.replacen('/', "//", 2)
+                            } else {
+                                p.clone()
+                            };
+                            {
+                                let p = &spelled;
+                                assert_eq!(
+                                    m.excludes(&x, p, false, scan),
+                                    reference_excludes(&pattern, p, dotglob),
+                                    "{pattern} on {p}, dotglob {dotglob}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(unix)]
+            for path in locked {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let hits = HITS.with(|h| h.borrow().clone());
+        let count = |case: &str| hits.get(case).copied().unwrap_or(0);
+        for case in [
+            "pruned",
+            "pruned link",
+            "pruned link listed",
+            "pruned loop",
+            "fingerprint",
+            "included before, excluded",
+            "directory check",
+        ] {
+            assert!(count(case) > 5, "{case}: {hits:?}");
+        }
+        // Root reads everything: no directory is search-only then.
+        if root {
+            eprintln!("running as root: search-only directories not covered");
+        } else {
+            assert!(count("unlisted directory") > 5, "{hits:?}");
+        }
+        for (case, n) in [
+            ("pruned", pruned),
+            ("retained", retained),
+            ("excluding", excluding),
+            ("folded", folded),
+        ] {
+            assert!(n > 50, "{case}: {n}");
+        }
+        assert!(checked > 10_000, "{checked}");
+    }
+
+    /// `globs` and `cache_globs` of `list`, checked equal with pruning off,
+    /// with the directories `globs` listed with pruning on and off.
+    fn agreed(dir: &str, list: &[Glob]) -> (Vec<String>, Vec<String>, u64, u64) {
+        let walk = |prune: bool| {
+            NO_PRUNING.with(|p| p.set(!prune));
+            LISTINGS.with(|n| n.set(0));
+            let shell = globs(dir, list).unwrap();
+            let listed = LISTINGS.with(std::cell::Cell::get);
+            let tree = cache_globs(dir, list).unwrap();
+            NO_PRUNING.with(|p| p.set(false));
+            (shell, tree, listed)
+        };
+        let (shell, tree, with) = walk(true);
+        let (shell_ref, tree_ref, without) = walk(false);
+        assert_eq!(shell, shell_ref, "globs {list:?}");
+        assert_eq!(tree, tree_ref, "cache_globs {list:?}");
+        (shell, tree, with, without)
+    }
+
+    /// A covered directory reached through a symlink is an entry of its
+    /// own: a `<prefix>/**` exclusion lists it, `<prefix>/**/*` does not,
+    /// and pruning keeps both so.
+    #[cfg(unix)]
+    #[test]
+    fn pruning_keeps_symlinked_covered_directories() {
+        let dir = tmp();
+        write_file(&dir, "src/a.c", "a");
+        write_file(&dir, "real/b.c", "b");
+        std::os::unix::fs::symlink(join(&dir, "real"), join(&dir, "src/gen")).unwrap();
+        let src = |rel: &str| join(&dir, &format!("src/{rel}"));
+        for (inc, exc, want) in [
+            ("src/*", "src/gen/**", vec![src("a.c")]),
+            ("src/*", "src/gen/**/*", vec![src("a.c"), src("gen")]),
+            ("src/**", "src/gen/**", vec![src("a.c")]),
+            ("src/**", "src/gen/**/*", vec![src("a.c"), src("gen")]),
+            ("src/**", "src/*/**/*", vec![src("a.c"), src("gen")]),
+            ("src/gen/**", "src/gen/**/*", vec![src("gen")]),
+            ("src/*/**", "src/gen/**", vec![]),
+            ("src/gen", "src/gen/**", vec![]),
+        ] {
+            let list = [g(inc), g_neg(exc)];
+            assert!(Pruner::new(&join(&dir, exc)).is_some(), "{inc} - {exc}");
+            assert_eq!(agreed(&dir, &list).0, want, "{inc} - {exc}");
+        }
+    }
+
+    /// A literal segment crosses a link back up, which the exclusion's
+    /// own walk would not: it still excludes the path, so pruning holds.
+    #[cfg(unix)]
+    #[test]
+    fn exclusions_match_literal_paths_through_loops() {
+        let dir = tmp();
+        write_file(&dir, "build/x.o", "x");
+        write_file(&dir, "src/y.o", "y");
+        std::os::unix::fs::symlink(".", join(&dir, "build/again")).unwrap();
+        let list = [g("build/again/*.o"), g("src/*.o"), g_neg("build/**")];
+        assert!(Pruner::new(&join(&dir, "build/**")).is_some());
+        assert_eq!(agreed(&dir, &list).0, [join(&dir, "src/y.o")]);
+    }
+
+    /// An exclusion spelled with `//` covers what the walk reads it as.
+    #[test]
+    fn exclusions_with_repeated_separators_still_exclude() {
+        let dir = tmp();
+        write_file(&dir, "a/b/x.c", "x");
+        write_file(&dir, "a/y.c", "y");
+        let (shell, tree, _, _) = agreed(&dir, &[g("**/*.c"), g_neg("a//b/**")]);
+        assert_eq!(shell, [join(&dir, "a/y.c")]);
+        assert_eq!(tree, [join(&dir, "a/y.c")]);
+    }
+
+    /// An exclusion the walk can prune saves listing what it covers.
+    #[test]
+    fn pruning_skips_covered_directories() {
+        let dir = tmp();
+        write_file(&dir, "src/a.rs", "a");
+        write_file(&dir, "src/web/.yarnrc.yml", "y");
+        write_file(&dir, ".tools/t", "t");
+        for i in 0..20 {
+            write_file(&dir, &format!("src/node_modules/p{i}/q/i.js"), "i");
+        }
+        // Dot includes, here outside the excluded tree, no longer keep it
+        // walked.
+        let list = [
+            g("src/**/*.rs"),
+            g("src/web/.yarnrc.yml"),
+            g(".tools/**"),
+            g_neg("src/**/node_modules/**"),
+        ];
+        let (shell, _, with, without) = agreed(&dir, &list);
+        assert_eq!(
+            shell,
+            [
+                join(&dir, ".tools/t"),
+                join(&dir, "src/a.rs"),
+                join(&dir, "src/web/.yarnrc.yml")
+            ]
+        );
+        assert!(with < without / 4, "{with} listings vs {without}");
+    }
+
     /// Excluding dot entries changes no checksum unless an include names
     /// one inside the excluded tree: this one is pinned from before.
     #[test]
@@ -2580,12 +3441,54 @@ mod tests {
             g_neg("**/node_modules/**"),
             g_neg("src/.cache/**"),
         ];
-        let files = globs(&dir, &list).unwrap();
+        let files = agreed(&dir, &list).0;
         assert_eq!(
             files,
             [join(&dir, "src/a.rs"), join(&dir, "src/web/.yarnrc.yml")]
         );
         let sum = crate::fingerprint::checksum_files(&dir, &files, &[]).unwrap();
         assert_eq!(sum, "778b62a0d5a976fc4122d637ea23286f");
+    }
+
+    /// A trailing `/`, or a trailing `**` matching nothing, matches only a
+    /// directory, as the exclusion's walk would: a file of that name stays.
+    /// A relative pattern's `/` is cleaned away when joined, as before.
+    #[cfg(unix)]
+    #[test]
+    fn exclusions_keep_trailing_directory_constraint() {
+        let dir = tmp();
+        write_file(&dir, "input.txt", "i");
+        write_file(&dir, "gen", "g");
+        write_file(&dir, "real/r.txt", "r");
+        std::os::unix::fs::symlink(join(&dir, "real"), join(&dir, "link")).unwrap();
+        let abs = |rel: &str| join(&dir, rel);
+        for (list, want) in [
+            (
+                vec![g("input.txt"), g_neg(&abs("input.txt/"))],
+                vec![abs("input.txt")],
+            ),
+            (
+                vec![g("input.txt"), g_neg(&abs("input.txt//"))],
+                vec![abs("input.txt")],
+            ),
+            (vec![g("input.txt"), g_neg("input.txt/")], vec![]),
+            (vec![g("gen"), g_neg(&abs("gen/**"))], vec![abs("gen")]),
+            (vec![g("gen"), g_neg("gen/**")], vec![abs("gen")]),
+            (vec![g("gen"), g_neg(&abs("*/"))], vec![abs("gen")]),
+            // A link to a directory is one.
+            (vec![g("link"), g_neg(&abs("link/"))], vec![]),
+            (vec![g("link"), g_neg("link/**")], vec![]),
+            (
+                vec![g("*"), g_neg("link/**")],
+                vec![abs("gen"), abs("input.txt")],
+            ),
+            (vec![g("link"), g_neg("link/**/*")], vec![abs("link")]),
+            (
+                vec![g("*"), g_neg(&abs("*/"))],
+                vec![abs("gen"), abs("input.txt")],
+            ),
+        ] {
+            assert_eq!(agreed(&dir, &list).0, want, "{list:?}");
+        }
     }
 }

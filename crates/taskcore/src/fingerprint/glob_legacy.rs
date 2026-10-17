@@ -1,6 +1,7 @@
 //! The walker as it was before directory listings carried entry types, with
-//! today's exclusion semantics (exclusions walked with `dotglob`): a test-only
-//! reference the current one must agree with on every tree.
+//! today's exclusion semantics (exclusions walked with `dotglob`) and no
+//! pruning: a test-only reference the current one must agree with on every
+//! tree.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
@@ -8,7 +9,7 @@ use std::path::Path;
 
 use super::{
     Options, Pruner, collect, file_name, folded_groups, has_meta, join_pattern, join_seg, mark,
-    match_segments, matches_segment, own, rooted_segments,
+    matches_segment, own,
 };
 use crate::ast::Glob;
 
@@ -73,61 +74,22 @@ fn tree_globs<'a>(
     collect(&included, &excluded)
 }
 
+/// Every exclusion expanded by a walk of its own, with `dotglob` on, and
+/// nothing pruned: a reference independent of the current matcher.
 fn expand_patterns(
     patterns: &[(String, bool)],
     included: &mut BTreeSet<String>,
     excluded: &mut BTreeSet<String>,
     opts: Options,
 ) {
-    let includes: Vec<&str> = patterns
-        .iter()
-        .filter(|(_, negate)| !negate)
-        .map(|(p, _)| p.as_str())
-        .collect();
-    let fingerprints: Vec<String> = included
-        .iter()
-        .filter(|_| !opts.follow_symlinks)
-        .cloned()
-        .collect();
-    let pruning_includes: Vec<&str> = includes
-        .iter()
-        .copied()
-        .chain(fingerprints.iter().map(String::as_str))
-        .collect();
-
     let exclusion = Options {
         dotglob: true,
         ..opts
     };
-    let mut pruners = Vec::new();
-    for (pattern, _) in patterns.iter().filter(|(_, negate)| *negate) {
-        match Pruner::new(pattern, &pruning_includes, opts) {
-            Some(pruner) => {
-                // Pruning only affects walks. Subtract covered fingerprint paths
-                // inserted directly into `included` to preserve expanded-exclude
-                // behavior.
-                let segments = rooted_segments(pattern);
-                let covered: Vec<String> = included
-                    .iter()
-                    .filter(|p| match_segments(&segments, &rooted_segments(p), true))
-                    .cloned()
-                    .collect();
-                for path in covered {
-                    mark(included, excluded, path, true);
-                }
-                pruners.push(pruner);
-            }
-            None => {
-                for m in expand(pattern, &[], exclusion) {
-                    mark(included, excluded, m, true);
-                }
-            }
-        }
-    }
-
-    for pattern in includes {
-        for m in expand(pattern, &pruners, opts) {
-            mark(included, excluded, m, false);
+    for (pattern, negate) in patterns {
+        let walk = if *negate { exclusion } else { opts };
+        for m in expand(pattern, &[], walk) {
+            mark(included, excluded, m, *negate);
         }
     }
 }

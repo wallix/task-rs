@@ -816,10 +816,12 @@ tasks:
       - public/bundle.css
 ```
 
-The wildcards and `**` of an `exclude:` also match dot files and directories,
-which an include's do not (except when `generates` are archived for the cache,
-where both match them): `exclude: build/**` removes everything under `build`,
-and keeps the walk out of it.
+An `exclude:` removes every path its pattern matches, however a wildcard
+include reached it, including through a symlink. Its wildcards and `**` also
+match dot files and directories, which an include's do not (except when
+`generates` are archived for the cache, where both match them):
+`exclude: build/**` removes everything under `build`, and keeps the walk out of
+it.
 
 If a task's own commands write files that its `sources` glob also matches, the
 sources checksum changes during the run. Task then prints a warning naming the
