@@ -60,7 +60,13 @@ fn exclusions_match_paths_however_reached() {
 fn trailing_slash_and_empty_trees_match_directories_only() {
     let dir = stage("exclusions");
     assert_eq!(sources(&dir, "slash-absolute"), ["input.txt"]);
-    assert_eq!(sources(&dir, "slash-relative"), ["src/a.txt"]);
+    assert_eq!(sources(&dir, "slash-relative"), ["input.txt", "src/a.txt"]);
+    assert_eq!(
+        sources(&dir, "slash-tree-relative"),
+        ["src/a.txt", "src/lib.rs"]
+    );
+    assert_eq!(sources(&dir, "slash-include"), ["src/a.txt"]);
+    assert_eq!(sources(&dir, "slash-folded"), ["input.txt", "src/a.txt"]);
     assert_eq!(sources(&dir, "tree-of-a-file"), ["gen"]);
 }
 

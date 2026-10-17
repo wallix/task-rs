@@ -198,7 +198,7 @@ fn shell_globs<'a>(
 
     for g in globs {
         if !g.fingerprint.is_empty() {
-            let fp = join_pattern(dir, &g.fingerprint);
+            let fp = join_path(dir, &g.fingerprint);
             if scan.exists(&fp) {
                 #[cfg(test)]
                 hit("fingerprint");
@@ -255,8 +255,9 @@ pub fn cache_globs(dir: &str, globs: &[Glob]) -> std::io::Result<Vec<String>> {
 ///
 /// It also matches a link at a directory an exclusion names (a trailing `/`,
 /// or a trailing `**` matching nothing): the walk drops it only when it leads
-/// to a directory, which a name cannot tell. A restore checks every link's
-/// target separately.
+/// to a directory, which a name cannot tell. Likewise an include ending in
+/// `/` matches every path its name fits, though the walk lists only links to
+/// directories there. A restore checks every link's target separately.
 pub struct CacheMatcher {
     own: MatchGroup,
     folded: Vec<MatchGroup>,
@@ -273,8 +274,9 @@ struct MatchGroup {
 }
 
 /// `path`'s segments with the walk's root marker, dropping the `.` and empty
-/// segments a pattern may carry (an absolute one is not cleaned when joined):
-/// the walk lists such paths, and saving normalises them away.
+/// segments a pattern may carry (an absolute one is not cleaned when joined,
+/// nor is any pattern's trailing `/`): the walk lists such paths, and saving
+/// normalises them away.
 fn normalized_segments(path: &str) -> Vec<String> {
     rooted_segments(path)
         .into_iter()
@@ -318,7 +320,7 @@ impl MatchGroup {
                 if g.is_named() && !g.fingerprint.is_empty() {
                     group
                         .named
-                        .push(normalized_segments(&join_pattern(dir, &g.fingerprint)));
+                        .push(normalized_segments(&join_path(dir, &g.fingerprint)));
                 }
             }
         }
@@ -394,7 +396,7 @@ fn tree_globs<'a>(
             patterns.push(Pattern::of(g, pattern));
         }
         if !g.fingerprint.is_empty() && !g.negate {
-            let fp = join_pattern(dir, &g.fingerprint);
+            let fp = join_path(dir, &g.fingerprint);
             if scan.exists(&fp) {
                 #[cfg(test)]
                 hit("fingerprint");
@@ -835,9 +837,19 @@ fn is_dir(path: &str, scan: &mut Scan) -> bool {
 
 /// Joins `pattern` onto `dir` the way every expansion in this module does.
 fn join_pattern(dir: &str, pattern: &str) -> String {
-    filepathext::smart_join(dir, pattern)
+    filepathext::join_glob(dir, pattern)
+}
+
+/// Joins a `fingerprint` path onto `dir`: a path, not a pattern, so a
+/// trailing `/` is dropped rather than kept.
+fn join_path(dir: &str, path: &str) -> String {
+    let joined = filepathext::smart_join(dir, path)
         .to_string_lossy()
-        .into_owned()
+        .into_owned();
+    match joined.trim_end_matches('/') {
+        "" => joined,
+        trimmed => trimmed.to_string(),
+    }
 }
 
 /// Expands a single glob pattern rooted at `dir`, returning matching regular
@@ -1402,6 +1414,10 @@ impl Walker<'_> {
                 self.out.push((child.path.clone(), child.kind));
                 continue;
             }
+            if trailing_slash(rest) {
+                self.slashed(base, child);
+                continue;
+            }
             let Some(dir) = self.current(base) else {
                 return;
             };
@@ -1471,8 +1487,8 @@ impl Walker<'_> {
     /// current directory `dir` to a directory a pruner covers, with `rest`
     /// left to match after a `step` of the pattern: the link itself, as an
     /// entry, when `rest` can match nothing below it (all `**`), or when a
-    /// final `**` stops at a wildcard's link back to a directory on the way
-    /// down. Whatever else it would list below is excluded.
+    /// final `**` or `/` stops at a wildcard's link back to a directory on
+    /// the way down. Whatever else it would list below is excluded.
     ///
     /// `kind` is `name`'s own type when its listing gave it; only a link is
     /// opened, for its identity.
@@ -1504,7 +1520,7 @@ impl Walker<'_> {
         };
         let looped = step != Step::Literal && self.chain.iter().any(|n| n.id == id);
         let listed = if looped {
-            step == Step::DoubleStar && rest.is_empty()
+            (step == Step::DoubleStar && rest.is_empty()) || trailing_slash(rest)
         } else {
             rest.iter().all(|s| *s == "**" || s.is_empty())
         };
@@ -1514,6 +1530,25 @@ impl Walker<'_> {
             #[cfg(test)]
             hit("pruned link listed");
             self.out.push((path.to_string(), Some(Ty::Link)));
+        }
+    }
+
+    /// Lists `child` of `base` for a pattern with only a trailing `/` left:
+    /// a link to a directory is the entry, in either mode and whether or not
+    /// it loops back; a directory itself lists nothing, so it is not entered.
+    fn slashed(&mut self, base: &str, child: &Listed) {
+        if child.kind != Some(Ty::Link) {
+            return;
+        }
+        let Some(dir) = self.current(base) else {
+            return;
+        };
+        match dir.stat(&child.name, true) {
+            Ok(Ty::Dir) => self.out.push((child.path.clone(), Some(Ty::Link))),
+            Ok(_) => {}
+            Err(e) => {
+                self.ends(&child.path, e);
+            }
         }
     }
 
@@ -1558,6 +1593,8 @@ impl Walker<'_> {
                 Child::NotDir => {
                     if rest.is_empty() {
                         self.out.push((child.path.clone(), child.kind));
+                    } else if trailing_slash(rest) {
+                        self.slashed(base, child);
                     }
                 }
             }
@@ -1880,6 +1917,11 @@ mod handle {
 /// `.*`; `**` traversal also never crosses into dot directories.
 fn shown(entry: &Listed, dotglob: bool) -> bool {
     dotglob || !entry.name.starts_with('.')
+}
+
+/// Whether only a pattern's trailing `/` is left to match (`a/*/` past `*`).
+fn trailing_slash(rest: &[&str]) -> bool {
+    !rest.is_empty() && rest.iter().all(|s| s.is_empty())
 }
 
 /// Joins a base directory with a single path segment.
@@ -2627,9 +2669,8 @@ mod tests {
         write_file(&dir, "a.txt", "a");
         std::os::unix::fs::symlink("target", join(&dir, "dlink")).unwrap();
         std::os::unix::fs::symlink("a.txt", join(&dir, "flink")).unwrap();
-        // Absolute: a relative pattern loses its trailing `/` when joined.
         for exclude in ["*/**", "*/"] {
-            let list = [g("*"), g_neg(&join(&dir, exclude))];
+            let list = [g("*"), g_neg(exclude)];
             assert_eq!(
                 cache_globs(&dir, &list).unwrap(),
                 vec![join(&dir, "a.txt"), join(&dir, "flink")],
@@ -2839,6 +2880,10 @@ mod tests {
             "empty/**",
             "c/sp ace.txt",
             "nope/**/*",
+            "*/",
+            "**/",
+            "c/dlink/",
+            "a/x.txt/",
         ];
         let mut lists: Vec<Vec<Glob>> = patterns.iter().map(|p| vec![g(p)]).collect();
         let abs = format!("{dir}/a/**/*");
@@ -2846,6 +2891,8 @@ mod tests {
         lists.push(vec![g("**/*"), g_neg("**/*.tmp")]);
         lists.push(vec![g("**/*"), g_neg("a/**/*")]);
         lists.push(vec![g("**/*"), g_neg("a/**")]);
+        lists.push(vec![g("**/*"), g_neg("c/**/")]);
+        lists.push(vec![g("c/*"), g_neg("c/dlink/")]);
         lists.push(vec![g("a/**/*"), g_neg("a/.h/**/*"), g("a/.h/hid.txt")]);
         lists.push(vec![g_fp("a/**/*", "keep.tmp"), g("c/*")]);
         lists.push(vec![g_fp("d/**/*", "a/x.txt"), g_neg("a/**/*")]);
@@ -3319,7 +3366,9 @@ mod tests {
         // A broad include and an exclusion covering what links are named,
         // half the time: random prefixes alone rarely cover a link.
         if rng.below(2) == 0 {
-            list.push(g(rng.pick(&["**", "*/**", "**/*", "*", "*/*", "**/**"])));
+            list.push(g(
+                rng.pick(&["**", "*/**", "**/*", "*", "*/*", "**/**", "*/", "**/"])
+            ));
             list.push(g_neg(rng.pick(&[
                 "**/nm/**",
                 "**/t/**/*",
@@ -3644,8 +3693,8 @@ mod tests {
     }
 
     /// A trailing `/`, or a trailing `**` matching nothing, matches only a
-    /// directory, as the exclusion's walk would: a file of that name stays.
-    /// A relative pattern's `/` is cleaned away when joined, as before.
+    /// directory, as the exclusion's walk would: a file of that name stays,
+    /// whether the pattern is relative or absolute.
     #[cfg(unix)]
     #[test]
     fn exclusions_keep_trailing_directory_constraint() {
@@ -3664,7 +3713,24 @@ mod tests {
                 vec![g("input.txt"), g_neg(&abs("input.txt//"))],
                 vec![abs("input.txt")],
             ),
-            (vec![g("input.txt"), g_neg("input.txt/")], vec![]),
+            (
+                vec![g("input.txt"), g_neg("input.txt/")],
+                vec![abs("input.txt")],
+            ),
+            (vec![g("gen"), g_neg("*/")], vec![abs("gen")]),
+            (vec![g("link"), g_neg("link/")], vec![]),
+            // `**/` matches directories at any depth, not the files below.
+            (
+                vec![g("real/*"), g_neg("real/**/")],
+                vec![abs("real/r.txt")],
+            ),
+            // An include ending in `/` lists a link to a directory, never a
+            // file or a directory itself, in both walks.
+            (vec![g("input.txt/")], vec![]),
+            (vec![g("link/")], vec![abs("link")]),
+            (vec![g("*/")], vec![abs("link")]),
+            (vec![g("**/")], vec![abs("link")]),
+            (vec![g("*/"), g_neg("link/")], vec![]),
             (vec![g("gen"), g_neg(&abs("gen/**"))], vec![abs("gen")]),
             (vec![g("gen"), g_neg("gen/**")], vec![abs("gen")]),
             (vec![g("gen"), g_neg(&abs("*/"))], vec![abs("gen")]),
@@ -3681,8 +3747,21 @@ mod tests {
                 vec![abs("gen"), abs("input.txt")],
             ),
         ] {
-            assert_eq!(agreed(&dir, &list).0, want, "{list:?}");
+            let (shell, tree, _, _) = agreed(&dir, &list);
+            assert_eq!(shell, want, "{list:?}");
+            assert_eq!(tree, want, "tree {list:?}");
+            let matcher = CacheMatcher::new(&dir, &list);
+            for f in &tree {
+                let rel = f.strip_prefix(&format!("{dir}/")).unwrap();
+                assert!(matcher.matches(&dir, rel), "{rel} with {list:?}");
+            }
         }
+        // A fingerprint is a path: a trailing `/` on it is dropped.
+        let list = [g_fp("gen", "gen/")];
+        assert_eq!(globs(&dir, &list).unwrap(), [abs("gen")]);
+        assert_eq!(cache_globs(&dir, &list).unwrap(), [abs("gen")]);
+        let files = globs(&dir, &list).unwrap();
+        assert!(crate::fingerprint::checksum_files(&dir, &files, &[]).is_ok());
     }
 
     /// The task's own whole-tree exclusions also keep folded groups' walks

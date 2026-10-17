@@ -345,6 +345,9 @@ v3 are intentional.
   an exclusion without wildcards names it too. Go Task expands an exclusion as
   a shell glob of its own, which skips dot entries, and removes whatever that
   lists, named paths included.
+- A glob ending in `/` matches directories only (a symlink to one is the
+  entry), relative or absolute. Go Task drops the `/` from a relative entry
+  when joining it to the task directory.
 
 For release-specific compatibility notes, including migration fixes and known
 gaps, read the [changelog](CHANGELOG.md).

@@ -582,6 +582,10 @@ an include lists. A path an include names without wildcards, or a
 `exclude: web/.yarnrc.yml` it does not. This holds for `generates` too, whose
 includes, when archived for the cache, match dot entries as well.
 
+An entry ending in `/` matches directories only, whether it is relative or
+absolute: as an include it lists a symlink to a directory, as an exclusion it
+removes one; `exclude: build/` never removes a file named `build`.
+
 #### `generates`
 
 - **Type**: `[]string` or `[]Glob`

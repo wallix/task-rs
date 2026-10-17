@@ -55,6 +55,17 @@ pub fn smart_join(a: &str, b: &str) -> PathBuf {
     join(Path::new(a), b)
 }
 
+/// [`smart_join`] for a glob pattern: a trailing `/`, which makes it match
+/// directories only, survives the cleaning a relative join does.
+/// Only `/` counts: a trailing `\` is part of the name, as in the walk.
+pub fn join_glob(dir: &str, pattern: &str) -> String {
+    let mut joined = smart_join(dir, pattern).to_string_lossy().into_owned();
+    if pattern.ends_with('/') && !joined.ends_with('/') {
+        joined.push('/');
+    }
+    joined
+}
+
 /// Reports whether `path` is absolute, treating the special directory
 /// markers as absolute.
 pub fn is_abs(path: &str) -> bool {
@@ -222,6 +233,15 @@ mod tests {
     #[test]
     fn smart_join_absolute_second() {
         assert_eq!(smart_join("/a/b", "/c/d"), PathBuf::from("/c/d"));
+    }
+
+    #[test]
+    fn join_glob_keeps_a_trailing_slash() {
+        assert_eq!(join_glob("/a", "b/"), "/a/b/");
+        assert_eq!(join_glob("/a", "b//"), "/a/b/");
+        assert_eq!(join_glob("/a", "/c/d/"), "/c/d/");
+        assert_eq!(join_glob("/a", "b/*"), "/a/b/*");
+        assert_eq!(join_glob("/a", "./"), "/a/");
     }
 
     #[test]

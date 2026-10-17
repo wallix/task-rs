@@ -518,7 +518,7 @@ impl<'a> Reach<'a> {
                 .into_owned()
         };
         let mut abs = Glob {
-            glob: join(&g.glob),
+            glob: filepathext::join_glob(dir, &g.glob),
             negate: g.negate,
             ..Default::default()
         };
@@ -537,7 +537,7 @@ impl<'a> Reach<'a> {
                 labels(chain).join(" → ")
             ),
             declared: g.glob.clone(),
-            path: if grants { abs.glob } else { String::new() },
+            path: if grants { join(&g.glob) } else { String::new() },
             kind: GrantKind::Generates,
         })
     }

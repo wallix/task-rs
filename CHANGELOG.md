@@ -27,6 +27,12 @@
   takes from other tasks (`task:`, `from:`) from scanning `dir`.** A task
   taking `**/*.rs` sources from another no longer scans the `node_modules`
   trees it excludes; the file lists are unchanged.
+- **A relative glob ending in `/` matches directories only**, in `sources`,
+  `generates` and `sandbox.reads`, as an absolute one already did: it lists a
+  symlink to a directory, never a file. Before, `sources: [build/]` listed a
+  file named `build`, `exclude: build/` removed one, and `exclude: dir/**/`
+  removed every file under `dir`. Tasks with such entries see their checksum
+  change once.
 
 ## v4.9.0 - 2026-10-16
 

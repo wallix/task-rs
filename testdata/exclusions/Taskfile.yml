@@ -31,8 +31,7 @@ tasks:
       - exclude: build/**
     cmds: ['true']
 
-  # A trailing `/` matches only a directory. A relative pattern loses it
-  # when joined to the task directory.
+  # A trailing `/` matches only a directory, in a relative pattern too.
   slash-absolute:
     sources:
       - input.txt
@@ -44,6 +43,26 @@ tasks:
       - input.txt
       - src/a.txt
       - exclude: input.txt/
+    cmds: ['true']
+
+  # `src/**/` matches the directories under `src`, not the files in them.
+  slash-tree-relative:
+    sources:
+      - src/*
+      - exclude: src/**/
+    cmds: ['true']
+
+  # An include ending in `/` lists no file.
+  slash-include:
+    sources:
+      - input.txt/
+      - src/a.txt
+    cmds: ['true']
+
+  # Taken with `task:`, the entries keep their `/`.
+  slash-folded:
+    sources:
+      - task: slash-relative
     cmds: ['true']
 
   # `gen/**` matching nothing below matches `gen` only as a directory.

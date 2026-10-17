@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use super::{
-    Options, Pattern, Pruner, collect, file_name, folded_groups, has_meta, join_pattern, join_seg,
-    mark, matches_segment, own,
+    Options, Pattern, Pruner, collect, file_name, folded_groups, has_meta, join_path, join_pattern,
+    join_seg, mark, matches_segment, own, trailing_slash,
 };
 use crate::ast::Glob;
 
@@ -32,7 +32,7 @@ fn shell_globs<'a>(
 
     for g in globs {
         if !g.fingerprint.is_empty() {
-            let fp = join_pattern(dir, &g.fingerprint);
+            let fp = join_path(dir, &g.fingerprint);
             if Path::new(&fp).exists() {
                 if g.negate || !g.is_named() {
                     mark(&mut included, &mut excluded, fp, g.negate);
@@ -85,7 +85,7 @@ fn tree_globs<'a>(
             patterns.push(Pattern::of(g, pattern));
         }
         if !g.fingerprint.is_empty() && !g.negate {
-            let fp = join_pattern(dir, &g.fingerprint);
+            let fp = join_path(dir, &g.fingerprint);
             if Path::new(&fp).exists() {
                 if g.is_named() {
                     named.push(fp);
@@ -209,6 +209,12 @@ impl Walker<'_> {
             return;
         };
 
+        // `a//b` is `a/b`; a trailing `/` lists `base` itself.
+        if segment.is_empty() {
+            self.walk(base, rest);
+            return;
+        }
+
         if *segment == "**" {
             // `**` matches zero or more directory levels. Match here (zero
             // levels) then descend into every subdirectory.
@@ -234,6 +240,8 @@ impl Walker<'_> {
             if matches_segment(segment, &name, self.opts.dotglob) {
                 if rest.is_empty() {
                     self.out.push(child);
+                } else if trailing_slash(rest) {
+                    self.slashed(child);
                 } else if self.descends(&child) && self.enter(&child) {
                     self.walk(&child, rest);
                 }
@@ -259,7 +267,17 @@ impl Walker<'_> {
                 }
             } else if rest.is_empty() {
                 self.out.push(child);
+            } else if trailing_slash(rest) {
+                self.slashed(child);
             }
+        }
+    }
+
+    /// A link to a directory, before a trailing `/`, is the entry.
+    fn slashed(&mut self, child: String) {
+        let link = std::fs::symlink_metadata(&child).is_ok_and(|m| m.file_type().is_symlink());
+        if link && Path::new(&child).is_dir() {
+            self.out.push(child);
         }
     }
 }
