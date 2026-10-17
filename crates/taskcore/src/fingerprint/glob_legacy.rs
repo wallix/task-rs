@@ -1,5 +1,6 @@
-//! The walker as it was before directory listings carried entry types: a
-//! test-only reference the current one must agree with on every tree.
+//! The walker as it was before directory listings carried entry types, with
+//! today's exclusion semantics (exclusions walked with `dotglob`): a test-only
+//! reference the current one must agree with on every tree.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
@@ -94,6 +95,10 @@ fn expand_patterns(
         .chain(fingerprints.iter().map(String::as_str))
         .collect();
 
+    let exclusion = Options {
+        dotglob: true,
+        ..opts
+    };
     let mut pruners = Vec::new();
     for (pattern, _) in patterns.iter().filter(|(_, negate)| *negate) {
         match Pruner::new(pattern, &pruning_includes, opts) {
@@ -104,7 +109,7 @@ fn expand_patterns(
                 let segments = rooted_segments(pattern);
                 let covered: Vec<String> = included
                     .iter()
-                    .filter(|p| match_segments(&segments, &rooted_segments(p), opts.dotglob))
+                    .filter(|p| match_segments(&segments, &rooted_segments(p), true))
                     .cloned()
                     .collect();
                 for path in covered {
@@ -113,7 +118,7 @@ fn expand_patterns(
                 pruners.push(pruner);
             }
             None => {
-                for m in expand(pattern, &[], opts) {
+                for m in expand(pattern, &[], exclusion) {
                     mark(included, excluded, m, true);
                 }
             }

@@ -338,6 +338,9 @@ v3 are intentional.
 - A task included both directly and through a nested include is one task for
   `run: once`, whichever include path names it. Go Task counts each path
   separately.
+- The wildcards and `**` of an `exclude:` in `sources` or `generates` match
+  dot-prefixed names: `exclude: dir/**` removes everything under `dir`. Go
+  Task expands an exclusion as a shell glob, which skips dot entries.
 
 For release-specific compatibility notes, including migration fixes and known
 gaps, read the [changelog](CHANGELOG.md).

@@ -1,0 +1,31 @@
+version: '3'
+
+# Each task's sources are read with `--status --json`.
+tasks:
+  # Exclusions match dot entries; includes skip them unless named.
+  dot-entries:
+    sources:
+      - '**/*.o'
+      - target/.*/*.o
+      - src/.env
+      - exclude: target/**
+    cmds: ['true']
+
+  # `exclude: src/.*` removes `src/.env`, which the shell rule hides even
+  # from `.*`.
+  dot-wildcard:
+    sources:
+      - src/.e*
+      - src/a.txt
+      - exclude: src/.*
+    cmds: ['true']
+
+  # No include names a dot entry an exclusion matches: the checksum is the
+  # one 4.9.0 computed.
+  no-contradiction:
+    sources:
+      - 'fixture/**/*'
+      - fixture/src/web/.yarnrc.yml
+      - exclude: 'fixture/**/node_modules/**'
+      - exclude: 'fixture/src/.cache/**'
+    cmds: ['true']

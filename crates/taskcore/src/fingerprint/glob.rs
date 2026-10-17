@@ -14,6 +14,10 @@
 //!   `**` also matches every file below, like bash and mvdan.
 //! - literal segments match verbatim.
 //!
+//! Exclusions (negated entries) match with `dotglob` on: their wildcards and
+//! `**` also match dot-prefixed names, so `exclude: dir/**` removes every
+//! entry under `dir`, hidden ones included. Includes keep the shell rule.
+//!
 //! Cache collection ([`cache_globs`]) walks the same patterns in *tree* mode
 //! instead: wildcards and `**` also match dot entries, and `**` does not
 //! descend through a symlink to a directory — the link itself is the entry.
@@ -370,9 +374,10 @@ impl Options {
 
 /// Expands joined `(pattern, negate)` entries into the working sets.
 ///
-/// The result is the order-independent `included - excluded`. A negated
-/// whole-tree pattern (`<prefix>/**/*`) becomes a [`Pruner`] that keeps positive
-/// walks out of covered directories. Other excludes expand normally.
+/// The result is the order-independent `included - excluded`. Exclusions
+/// expand with `dotglob`. A negated whole-tree pattern (`<prefix>/**/*`)
+/// becomes a [`Pruner`] that keeps positive walks out of covered directories.
+/// Other excludes expand normally.
 fn expand_patterns(
     patterns: &[(String, bool)],
     included: &mut BTreeSet<String>,
@@ -396,6 +401,10 @@ fn expand_patterns(
         .chain(fingerprints.iter().map(String::as_str))
         .collect();
 
+    let exclusion = Options {
+        dotglob: true,
+        ..opts
+    };
     let mut pruners = Vec::new();
     for (pattern, _) in patterns.iter().filter(|(_, negate)| *negate) {
         match Pruner::new(pattern, &pruning_includes, opts) {
@@ -406,7 +415,7 @@ fn expand_patterns(
                 let segments = rooted_segments(pattern);
                 let covered: Vec<String> = included
                     .iter()
-                    .filter(|p| match_segments(&segments, &rooted_segments(p), opts.dotglob))
+                    .filter(|p| match_segments(&segments, &rooted_segments(p), true))
                     .cloned()
                     .collect();
                 for path in covered {
@@ -415,7 +424,7 @@ fn expand_patterns(
                 pruners.push(pruner);
             }
             None => {
-                for m in expand(pattern, &[], opts, scan) {
+                for m in expand(pattern, &[], exclusion, scan) {
                     mark(included, excluded, m, true);
                 }
             }
@@ -480,16 +489,12 @@ fn expand(pattern: &str, pruners: &[Pruner], opts: Options, scan: &mut Scan) -> 
 /// Skips directories covered by a negated `<prefix>/**/*` or `<prefix>/**`
 /// pattern while walking includes.
 ///
-/// Pruning preserves `included - excluded`: the exclude would remove every
-/// skipped path. Without `dotglob`, `**/*` cannot reach dot-prefixed
-/// descendants, so [`Pruner::new`] rejects pruning when an include can name one
-/// below a covered directory.
+/// Pruning preserves `included - excluded`: the exclusion, expanded with
+/// `dotglob`, would remove every skipped path, dot names included.
 struct Pruner {
     /// Pattern segments before the trailing `**`, including the walk's root
     /// marker (`""` for absolute patterns and `"."` for relative ones).
     prefix: Vec<String>,
-    /// Whether `**` in the prefix spans dot directories.
-    dotglob: bool,
 }
 
 impl Pruner {
@@ -551,26 +556,8 @@ impl Pruner {
             }
         }
 
-        // A literal dot segment in an include is safe only at a fixed depth
-        // within the prefix of every covered directory. With `dotglob` the
-        // exclude reaches every descendant, so any include is safe.
-        for include in includes.iter().filter(|_| !opts.dotglob) {
-            let mut after_double_star = false;
-            for (depth, seg) in rooted_segments(include).into_iter().enumerate() {
-                if seg == "**" {
-                    after_double_star = true;
-                } else if depth > 0
-                    && seg.starts_with('.')
-                    && (after_double_star || depth >= min_depth)
-                {
-                    return None;
-                }
-            }
-        }
-
         Some(Self {
             prefix: prefix.iter().map(|s| (*s).to_string()).collect(),
-            dotglob: opts.dotglob,
         })
     }
 
@@ -578,7 +565,7 @@ impl Pruner {
     /// prefix.
     fn covers(&self, dir: &str) -> bool {
         let path: Vec<&str> = dir.split('/').collect();
-        match_segments(&self.prefix, &path, self.dotglob)
+        match_segments(&self.prefix, &path, true)
     }
 }
 
@@ -1931,33 +1918,27 @@ mod tests {
         assert_eq!(globs(&dir, &reversed).unwrap(), files);
     }
 
+    /// Exclusions match dot entries, which includes reach only through a
+    /// literal segment; whole-tree ones still prune.
     #[test]
-    fn exclude_prune_keeps_literal_dot_paths() {
+    fn exclusions_match_dot_entries() {
         let dir = tmp();
         write_file(&dir, "target/a.o", "a");
         write_file(&dir, "target/.keep/b.o", "b");
-        let files = globs(
-            &dir,
-            &[
-                g("target/**/*"),
-                g("target/.keep/*.o"),
-                g_neg("target/**/*"),
-            ],
-        )
-        .unwrap();
-        // `**/*` cannot reach the literal dot path, so pruning is unsafe.
-        assert_eq!(files, vec![join(&dir, "target/.keep/b.o")]);
-        let includes = [join(&dir, "target/.keep/*.o")];
+        write_file(&dir, "src/.env", "e");
+        write_file(&dir, "src/x.o", "x");
+        let list = [g("**/*.o"), g("target/.keep/*.o"), g_neg("target/**/*")];
+        assert_eq!(globs(&dir, &list).unwrap(), [join(&dir, "src/x.o")]);
+        assert_eq!(cache_globs(&dir, &list).unwrap(), [join(&dir, "src/x.o")]);
+        let includes = [join(&dir, "**/*.o"), join(&dir, "target/.keep/*.o")];
         let include_refs: Vec<&str> = includes.iter().map(String::as_str).collect();
-        assert!(Pruner::new(&join(&dir, "target/**/*"), &include_refs, Options::SHELL).is_none());
-        // Tree mode reaches dot paths, but `.keep` could be a directory
-        // symlink: literal traversal still prevents pruning.
-        assert!(Pruner::new(&join(&dir, "target/**/*"), &include_refs, Options::TREE).is_none());
-        assert!(
-            cache_globs(&dir, &[g("target/.keep/*.o"), g_neg("target/**/*")])
-                .unwrap()
-                .is_empty()
-        );
+        let excluded = join(&dir, "target/**/*");
+        assert!(Pruner::new(&excluded, &include_refs, Options::SHELL).is_some());
+        // `**` matches dot directories, `*` dot files.
+        let list = [g("src/*"), g("src/.*"), g_neg("**/.*")];
+        assert_eq!(globs(&dir, &list).unwrap(), [join(&dir, "src/x.o")]);
+        let list = [g("target/.*/*.o"), g("src/x.o"), g_neg("**/b.o")];
+        assert_eq!(globs(&dir, &list).unwrap(), [join(&dir, "src/x.o")]);
     }
 
     #[test]
@@ -1981,20 +1962,11 @@ mod tests {
         // These would prune the walk root.
         assert!(new("/**/*", &inc).is_none());
         assert!(new("**/*", &["**/*.rs"]).is_none());
-        // A fixed dot segment above covered directories is safe. One below a
-        // covered directory or after `**` is not.
-        assert!(
-            new(
-                "/home/u/.local/w/target/**/*",
-                &["/home/u/.local/w/**/*.rs"]
-            )
-            .is_some()
-        );
-        assert!(new("/w/target/**/*", &["/w/target/.cache/*"]).is_none());
-        assert!(new("/w/target/**/*", &["/w/**/.cache/*"]).is_none());
-        // `**` cannot span `.git`, matching the walk.
-        assert!(new("/w/**/target/**/*", &["/w/.git/**/*"]).is_some());
-        assert!(new("/w/**/target/**/*", &["/w/**/.git/**/*"]).is_none());
+        // The exclusion matches dot entries too, so an include naming one
+        // anywhere is safe.
+        assert!(new("/w/target/**/*", &["/w/target/.cache/*"]).is_some());
+        assert!(new("/w/target/**/*", &["/w/**/.cache/*"]).is_some());
+        assert!(new("/w/**/target/**/*", &["/w/**/.git/**/*"]).is_some());
     }
 
     #[test]
@@ -2002,16 +1974,14 @@ mod tests {
         let p = Pruner::new("/w/**/target*/**/*", &[], Options::SHELL).unwrap();
         assert!(p.covers("/w/target"));
         assert!(p.covers("/w/a/b/target-x"));
-        assert!(!p.covers("/w/a/.hidden/target"));
+        // `**` spans dot directories, as the exclusion matches them.
+        assert!(p.covers("/w/a/.hidden/target"));
         assert!(!p.covers("/w/a/target/sub"));
         assert!(!p.covers("/w/a/starget"));
         assert!(!p.covers("/w"));
         let rel = Pruner::new("target/**/*", &[], Options::SHELL).unwrap();
         assert!(rel.covers("./target"));
         assert!(!rel.covers("./src/target"));
-        // `**` spans dot directories in tree mode.
-        let tree = Pruner::new("/w/**/target/**/*", &[], Options::TREE).unwrap();
-        assert!(tree.covers("/w/a/.hidden/target"));
     }
 
     #[test]
@@ -2584,5 +2554,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Excluding dot entries changes no checksum unless an include names
+    /// one inside the excluded tree: this one is pinned from before.
+    #[test]
+    fn dot_exclusions_keep_checksums_without_dot_includes_inside() {
+        let dir = tmp();
+        for f in [
+            "src/a.rs",
+            "src/.env",
+            "src/.cache/k.rs",
+            "src/web/.yarnrc.yml",
+            "node_modules/.yarn-state.yml",
+            "node_modules/p/i.js",
+            "node_modules/.bin/x",
+            "src/node_modules/q/j.js",
+            ".git/HEAD",
+        ] {
+            write_file(&dir, f, f);
+        }
+        let list = [
+            g("**/*"),
+            g("src/web/.yarnrc.yml"),
+            g_neg("**/node_modules/**"),
+            g_neg("src/.cache/**"),
+        ];
+        let files = globs(&dir, &list).unwrap();
+        assert_eq!(
+            files,
+            [join(&dir, "src/a.rs"), join(&dir, "src/web/.yarnrc.yml")]
+        );
+        let sum = crate::fingerprint::checksum_files(&dir, &files, &[]).unwrap();
+        assert_eq!(sum, "778b62a0d5a976fc4122d637ea23286f");
     }
 }

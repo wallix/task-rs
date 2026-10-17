@@ -572,6 +572,12 @@ tasks:
 An entry can also copy another task's sources with `from:` or `task:`; see
 [`cache`](#cache).
 
+Unlike an include's, the wildcards and `**` of an `exclude:` entry also match
+names beginning with a dot: `exclude: web/**` removes `web/.cache/x` when
+`web/.cache/*` lists it, and `exclude: '**/.*'` removes every dot file an
+include lists. This holds for `generates` too, whose includes, when archived
+for the cache, match dot entries as well.
+
 #### `generates`
 
 - **Type**: `[]string` or `[]Glob`

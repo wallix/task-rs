@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **An `exclude:` matches dot entries.** Its wildcards and `**` also match
+  names beginning with a dot, so `exclude: dir/**` removes everything an
+  include lists under `dir`, hidden files included. Includes still list a dot
+  entry only when its name is written out without wildcards. Only tasks whose
+  wildcard includes list a dot entry inside an excluded tree see their checksum
+  change, once. Tasks with a dot-file include elsewhere, such as
+  `web/.yarnrc.yml` next to `exclude: '**/node_modules/**'`, no longer scan the
+  excluded trees, which could make them twice as slow.
+
 ## v4.9.0 - 2026-10-16
 
 - **A walk of `sources` or `generates` no longer leaves files out on an error.**
