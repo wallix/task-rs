@@ -576,8 +576,11 @@ An `exclude:` entry removes every listed path its pattern matches, however a
 wildcard include reached it. Unlike an include's, its wildcards and `**` also
 match names beginning with a dot: `exclude: web/**` removes `web/.cache/x`
 when `web/.cache/*` lists it, and `exclude: '**/.*'` removes every dot file
-an include lists. This holds for `generates` too, whose includes, when archived
-for the cache, match dot entries as well.
+an include lists. A path an include names without wildcards, or a
+`fingerprint:`, is kept unless an exclusion without wildcards names it too:
+`web/.yarnrc.yml` next to `exclude: web/**` stays, next to
+`exclude: web/.yarnrc.yml` it does not. This holds for `generates` too, whose
+includes, when archived for the cache, match dot entries as well.
 
 #### `generates`
 
@@ -984,7 +987,7 @@ unsandboxed.
 A folded task's `exclude:` entries remove only that task's own matches, never
 those of the tasks it runs or folds in, another folded task's or the referring
 task's. The referring task's own `exclude:` entries apply to everything it
-folds in.
+folds in, paths the folded task names without wildcards included.
 
 Entries folded in by `from:` or `task:` count for the up-to-date check and the
 cache, but two things in `cmds` see only the task's own entries:

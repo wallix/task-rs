@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **A path an include names without wildcards stays against a wider
+  `exclude:`.** `build/version.txt` next to `exclude: build/**`, or `src/.env`
+  next to `exclude: '**/.*'`, is kept in `sources` and `generates`, as is a
+  generates `fingerprint:` file; only an exclusion naming the same path removes
+  it. A path named only by a task taken with `from:` or `task:` still follows
+  the taking task's exclusions. Tasks whose `exclude:` used to remove such a
+  path see their checksum change once.
 - **An `exclude:` matches dot entries.** Its wildcards and `**` also match
   names beginning with a dot, so `exclude: dir/**` removes everything an
   include lists under `dir`, hidden files included. Includes still list a dot

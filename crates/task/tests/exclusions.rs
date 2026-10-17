@@ -64,6 +64,29 @@ fn trailing_slash_and_empty_trees_match_directories_only() {
     assert_eq!(sources(&dir, "tree-of-a-file"), ["gen"]);
 }
 
+/// A path named without wildcards stays against every exclusion but one
+/// naming it; the exemption holds in the naming task only.
+#[test]
+fn named_paths_stay() {
+    let dir = stage("exclusions");
+    assert_eq!(sources(&dir, "named"), ["src/.env", "target/.keep/b.o"]);
+    assert_eq!(
+        sources(&dir, "folded-named"),
+        ["src/.env", "target/.keep/b.o"]
+    );
+}
+
+/// Named through a link, a path stays all the same.
+#[cfg(unix)]
+#[test]
+fn named_paths_stay_through_links() {
+    let dir = staged();
+    assert_eq!(
+        sources(&dir, "named"),
+        ["build/again/x.o", "src/.env", "target/.keep/b.o"]
+    );
+}
+
 /// Exclusions match dot entries, which includes still skip unless named.
 #[test]
 fn exclusions_match_dot_entries() {

@@ -1,15 +1,15 @@
 //! The walker as it was before directory listings carried entry types, with
-//! today's exclusion semantics (exclusions walked with `dotglob`) and no
-//! pruning: a test-only reference the current one must agree with on every
-//! tree.
+//! today's exclusion semantics (exclusions walked with `dotglob`, named paths
+//! exempt) and no pruning: a test-only reference the current one must agree
+//! with on every tree.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
 use super::{
-    Options, Pruner, collect, file_name, folded_groups, has_meta, join_pattern, join_seg, mark,
-    matches_segment, own,
+    Options, Pattern, Pruner, collect, file_name, folded_groups, has_meta, join_pattern, join_seg,
+    mark, matches_segment, own,
 };
 use crate::ast::Glob;
 
@@ -28,19 +28,35 @@ fn shell_globs<'a>(
 ) -> Vec<String> {
     let mut excluded: BTreeSet<String> = BTreeSet::new();
     let mut patterns = Vec::new();
+    let mut named = Vec::new();
 
     for g in globs {
         if !g.fingerprint.is_empty() {
             let fp = join_pattern(dir, &g.fingerprint);
             if Path::new(&fp).exists() {
-                mark(&mut included, &mut excluded, fp, g.negate);
+                if g.negate || !g.is_named() {
+                    mark(&mut included, &mut excluded, fp, g.negate);
+                } else {
+                    named.push(fp);
+                }
             }
             continue;
         }
-        patterns.push((join_pattern(dir, &g.glob), g.negate));
+        let pattern = join_pattern(dir, &g.glob);
+        if g.is_named() {
+            named.extend(expand(&pattern, &[], Options::SHELL));
+            continue;
+        }
+        patterns.push(Pattern::of(g, pattern));
     }
 
-    expand_patterns(&patterns, &mut included, &mut excluded, Options::SHELL);
+    expand_patterns(
+        &patterns,
+        named,
+        &mut included,
+        &mut excluded,
+        Options::SHELL,
+    );
     collect(&included, &excluded)
 }
 
@@ -59,25 +75,45 @@ fn tree_globs<'a>(
 ) -> Vec<String> {
     let mut excluded: BTreeSet<String> = BTreeSet::new();
     let mut patterns = Vec::new();
+    let mut named = Vec::new();
 
     for g in globs {
-        patterns.push((join_pattern(dir, &g.glob), g.negate));
+        let pattern = join_pattern(dir, &g.glob);
+        if g.is_named() && !g.has_wildcards() {
+            named.extend(expand(&pattern, &[], Options::TREE));
+        } else {
+            patterns.push(Pattern::of(g, pattern));
+        }
         if !g.fingerprint.is_empty() && !g.negate {
             let fp = join_pattern(dir, &g.fingerprint);
             if Path::new(&fp).exists() {
-                mark(&mut included, &mut excluded, fp, false);
+                if g.is_named() {
+                    named.push(fp);
+                } else {
+                    mark(&mut included, &mut excluded, fp, false);
+                }
             }
         }
     }
 
-    expand_patterns(&patterns, &mut included, &mut excluded, Options::TREE);
+    expand_patterns(
+        &patterns,
+        named,
+        &mut included,
+        &mut excluded,
+        Options::TREE,
+    );
     collect(&included, &excluded)
 }
 
 /// Every exclusion expanded by a walk of its own, with `dotglob` on, and
-/// nothing pruned: a reference independent of the current matcher.
+/// nothing pruned: a reference independent of the current matcher. A path
+/// named explicitly (an include without wildcards, a fingerprint) is then
+/// kept unless an exclusion without wildcards, or a negated fingerprint,
+/// names it too.
 fn expand_patterns(
-    patterns: &[(String, bool)],
+    patterns: &[Pattern],
+    named: Vec<String>,
     included: &mut BTreeSet<String>,
     excluded: &mut BTreeSet<String>,
     opts: Options,
@@ -86,10 +122,23 @@ fn expand_patterns(
         dotglob: true,
         ..opts
     };
-    for (pattern, negate) in patterns {
-        let walk = if *negate { exclusion } else { opts };
-        for m in expand(pattern, &[], walk) {
-            mark(included, excluded, m, *negate);
+    let mut fixed = excluded.clone();
+    for p in patterns {
+        let walk = if p.negate { exclusion } else { opts };
+        let matches = expand(&p.path, &[], walk);
+        if p.negate && p.literal {
+            fixed.extend(matches.iter().cloned());
+        }
+        for m in matches {
+            mark(included, excluded, m, p.negate);
+        }
+    }
+    for m in named {
+        if fixed.contains(&m) {
+            mark(included, excluded, m, true);
+        } else {
+            excluded.remove(&m);
+            included.insert(m);
         }
     }
 }

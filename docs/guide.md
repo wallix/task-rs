@@ -821,7 +821,11 @@ include reached it, including through a symlink. Its wildcards and `**` also
 match dot files and directories, which an include's do not (except when
 `generates` are archived for the cache, where both match them):
 `exclude: build/**` removes everything under `build`, and keeps the walk out of
-it.
+it. A path named without wildcards, such as `build/version.txt` next to
+`exclude: build/**`, is kept: only an exclusion naming the same path, such as
+`exclude: build/version.txt`, removes it. A path named only by a task whose
+sources are taken with `from:` or `task:` is not exempt from the taking task's
+own exclusions.
 
 If a task's own commands write files that its `sources` glob also matches, the
 sources checksum changes during the run. Task then prints a warning naming the

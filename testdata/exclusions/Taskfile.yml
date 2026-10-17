@@ -12,6 +12,25 @@ tasks:
       - exclude: build/**
     cmds: ['true']
 
+  # A path named without wildcards stays, but for an exclusion naming it.
+  named:
+    sources:
+      - build/again/x.o
+      - target/.keep/b.o
+      - src/.env
+      - src/a.txt
+      - exclude: build/**
+      - exclude: '**/.*'
+      - exclude: src/a.txt
+    cmds: ['true']
+
+  # Named only by a task it takes sources from: its own exclusions apply.
+  folded-named:
+    sources:
+      - task: named
+      - exclude: build/**
+    cmds: ['true']
+
   # A trailing `/` matches only a directory. A relative pattern loses it
   # when joined to the task directory.
   slash-absolute:

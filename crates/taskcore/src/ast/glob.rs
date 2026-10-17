@@ -33,6 +33,15 @@ pub struct Glob {
     /// Never parsed. A folded task's exclusions apply to its own group only;
     /// the task's own (group 0) apply to the whole list.
     pub group: u32,
+    /// Never parsed, never hashed: in a list whose groups collapsed into
+    /// group 0, whether only folded tasks have the entry. A path it names is
+    /// then not exempt from the task's exclusions ([`Glob::is_named`]).
+    ///
+    /// Two tasks whose lists differ only in this flag share an identity and
+    /// so `.task` state; their checksums still differ when the selected files
+    /// do, which costs reruns, never a stale up-to-date. Hashing it would move
+    /// the identity of every task folding a named entry next to an exclusion.
+    pub folded: bool,
 }
 
 impl Glob {
@@ -40,6 +49,23 @@ impl Glob {
     /// than matching files itself.
     pub fn is_reference(&self) -> bool {
         !self.from.is_empty() || !self.task.is_empty()
+    }
+
+    /// Whether the entry names its path explicitly: an include without
+    /// wildcards, or one with a `fingerprint`, of the task itself. Only an
+    /// exclusion naming the same path removes it.
+    pub fn is_named(&self) -> bool {
+        !self.negate
+            && !self.folded
+            && !self.is_reference()
+            && (!self.fingerprint.is_empty() || !self.has_wildcards())
+    }
+
+    /// Whether the entry as written, before it is joined onto the task
+    /// directory, has wildcards. An exclusion without is matched by equality
+    /// with the joined path.
+    pub fn has_wildcards(&self) -> bool {
+        self.glob.contains(['*', '?', '['])
     }
 }
 

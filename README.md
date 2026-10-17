@@ -341,8 +341,10 @@ v3 are intentional.
 - An `exclude:` in `sources` or `generates` removes every path its pattern
   matches, however a wildcard include reached it, and its wildcards and `**`
   match dot-prefixed names: `exclude: dir/**` removes everything under `dir`.
-  Go Task expands an exclusion as a shell glob of its own, which skips dot
-  entries, and removes whatever that lists.
+  A path an include names without wildcards, or a `fingerprint:`, stays unless
+  an exclusion without wildcards names it too. Go Task expands an exclusion as
+  a shell glob of its own, which skips dot entries, and removes whatever that
+  lists, named paths included.
 
 For release-specific compatibility notes, including migration fixes and known
 gaps, read the [changelog](CHANGELOG.md).

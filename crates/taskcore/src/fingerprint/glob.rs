@@ -181,6 +181,7 @@ fn shell_globs<'a>(
 ) -> Vec<String> {
     let mut excluded: BTreeSet<String> = BTreeSet::new();
     let mut patterns = Vec::new();
+    let mut named = Vec::new();
 
     for g in globs {
         if !g.fingerprint.is_empty() {
@@ -188,15 +189,25 @@ fn shell_globs<'a>(
             if scan.exists(&fp) {
                 #[cfg(test)]
                 hit("fingerprint");
-                mark(&mut included, &mut excluded, fp, g.negate);
+                if g.negate || !g.is_named() {
+                    mark(&mut included, &mut excluded, fp, g.negate);
+                } else {
+                    named.push(fp);
+                }
             }
             continue;
         }
-        patterns.push((join_pattern(dir, &g.glob), g.negate));
+        let pattern = join_pattern(dir, &g.glob);
+        if g.is_named() {
+            named.extend(expand(&pattern, &[], Options::SHELL, scan));
+            continue;
+        }
+        patterns.push(Pattern::of(g, pattern));
     }
 
     expand_patterns(
         &patterns,
+        named,
         &mut included,
         &mut excluded,
         Options::SHELL,
@@ -240,7 +251,10 @@ pub struct CacheMatcher {
 struct MatchGroup {
     includes: Vec<Vec<String>>,
     excludes: Vec<Vec<String>>,
-    fingerprints: Vec<Vec<String>>,
+    /// Paths named explicitly: includes without wildcards and fingerprints.
+    named: Vec<Vec<String>>,
+    /// The exclusions without wildcards, the only ones removing a named path.
+    literal: Vec<Vec<String>>,
 }
 
 /// `path`'s segments with the walk's root marker, dropping the `.` and empty
@@ -260,7 +274,8 @@ impl MatchGroup {
         let mut group = Self {
             includes: Vec::new(),
             excludes: Vec::new(),
-            fingerprints: Vec::new(),
+            named: Vec::new(),
+            literal: Vec::new(),
         };
         for g in globs {
             let pattern = join_pattern(dir, &g.glob);
@@ -273,15 +288,21 @@ impl MatchGroup {
                 if pattern.ends_with('/') {
                     continue;
                 }
+                if !g.has_wildcards() {
+                    group.literal.push(segments.clone());
+                }
                 if segments.len() > 1 && segments.last().is_some_and(|s| s == "**") {
                     segments.push("*".to_string());
                 }
                 group.excludes.push(segments);
             } else {
+                if g.is_named() && !g.has_wildcards() {
+                    group.named.push(segments.clone());
+                }
                 group.includes.push(segments);
-                if !g.fingerprint.is_empty() {
+                if g.is_named() && !g.fingerprint.is_empty() {
                     group
-                        .fingerprints
+                        .named
                         .push(normalized_segments(&join_pattern(dir, &g.fingerprint)));
                 }
             }
@@ -295,13 +316,24 @@ impl MatchGroup {
             .any(|e| match_segments(e, segments, Options::TREE.dotglob))
     }
 
+    fn names(&self, segments: &[&str]) -> bool {
+        self.named.iter().any(|f| f.iter().eq(segments))
+    }
+
+    /// Whether the group's exclusions remove `segments`: only one without
+    /// wildcards, matched by equality, when the group names it too.
+    fn removes(&self, segments: &[&str]) -> bool {
+        self.literal.iter().any(|l| l.iter().eq(segments))
+            || (!self.names(segments) && self.excluded(segments))
+    }
+
     fn lists(&self, segments: &[&str]) -> bool {
-        (self.fingerprints.iter().any(|f| f.iter().eq(segments))
+        (self.names(segments)
             || self
                 .includes
                 .iter()
                 .any(|i| match_segments(i, segments, Options::TREE.dotglob)))
-            && !self.excluded(segments)
+            && !self.removes(segments)
     }
 }
 
@@ -323,7 +355,7 @@ impl CacheMatcher {
         let path = normalized_segments(&join_pattern(root, rel));
         let segments: Vec<&str> = path.iter().map(String::as_str).collect();
         (self.own.lists(&segments) || self.folded.iter().any(|g| g.lists(&segments)))
-            && !self.own.excluded(&segments)
+            && !self.own.removes(&segments)
     }
 }
 
@@ -336,20 +368,37 @@ fn tree_globs<'a>(
 ) -> Vec<String> {
     let mut excluded: BTreeSet<String> = BTreeSet::new();
     let mut patterns = Vec::new();
+    let mut named = Vec::new();
 
     for g in globs {
-        patterns.push((join_pattern(dir, &g.glob), g.negate));
+        let pattern = join_pattern(dir, &g.glob);
+        if g.is_named() && !g.has_wildcards() {
+            named.extend(expand(&pattern, &[], Options::TREE, scan));
+        } else {
+            patterns.push(Pattern::of(g, pattern));
+        }
         if !g.fingerprint.is_empty() && !g.negate {
             let fp = join_pattern(dir, &g.fingerprint);
             if scan.exists(&fp) {
                 #[cfg(test)]
                 hit("fingerprint");
-                mark(&mut included, &mut excluded, fp, false);
+                if g.is_named() {
+                    named.push(fp);
+                } else {
+                    mark(&mut included, &mut excluded, fp, false);
+                }
             }
         }
     }
 
-    expand_patterns(&patterns, &mut included, &mut excluded, Options::TREE, scan);
+    expand_patterns(
+        &patterns,
+        named,
+        &mut included,
+        &mut excluded,
+        Options::TREE,
+        scan,
+    );
     collect(&included, &excluded)
 }
 
@@ -392,7 +441,25 @@ impl Options {
     };
 }
 
-/// Expands joined `(pattern, negate)` entries into the working sets.
+/// An entry joined onto the task directory, for [`expand_patterns`].
+struct Pattern {
+    path: String,
+    negate: bool,
+    /// Written without wildcards ([`Glob::has_wildcards`]).
+    literal: bool,
+}
+
+impl Pattern {
+    fn of(g: &Glob, path: String) -> Self {
+        Self {
+            path,
+            negate: g.negate,
+            literal: !g.has_wildcards(),
+        }
+    }
+}
+
+/// Expands joined entries into the working sets.
 ///
 /// The result is the order-independent `included - excluded`. Exclusions are
 /// matched against paths rather than walked ([`Exclusion`]): one removes every
@@ -400,8 +467,13 @@ impl Options {
 /// names included. A whole-tree exclusion (`<prefix>/**/*` or `<prefix>/**`)
 /// also becomes a [`Pruner`] that keeps positive walks out of the directories
 /// it covers.
+///
+/// The paths in `named`, which entries name explicitly ([`Glob::is_named`])
+/// and were looked up past every pruner, are kept unless an exclusion
+/// without wildcards names them or `excluded` held them on entry.
 fn expand_patterns(
-    patterns: &[(String, bool)],
+    patterns: &[Pattern],
+    named: Vec<String>,
     included: &mut BTreeSet<String>,
     excluded: &mut BTreeSet<String>,
     opts: Options,
@@ -409,18 +481,20 @@ fn expand_patterns(
 ) {
     let includes: Vec<&str> = patterns
         .iter()
-        .filter(|(_, negate)| !negate)
-        .map(|(p, _)| p.as_str())
+        .filter(|p| !p.negate)
+        .map(|p| p.path.as_str())
         .collect();
     let mut pruners = Vec::new();
     let mut exclusions = Vec::new();
-    for (pattern, _) in patterns.iter().filter(|(_, negate)| *negate) {
-        let pruner = Pruner::new(pattern).filter(|_| pruning());
-        exclusions.push(Exclusion::new(pattern, true, pruner.is_some()));
+    for p in patterns.iter().filter(|p| p.negate) {
+        let pruner = Pruner::new(&p.path).filter(|_| pruning());
+        exclusions.push(Exclusion::new(&p.path, p.literal, true, pruner.is_some()));
         pruners.extend(pruner);
     }
 
     let mut exclusions = Exclusions::new(exclusions);
+    // Excluded by name before any pattern applies (negated fingerprints).
+    let fixed = excluded.clone();
     // Paths already included (fingerprints, folded groups' matches) may lie
     // anywhere, pruned directories included.
     if !exclusions.is_empty() {
@@ -446,6 +520,17 @@ fn expand_patterns(
             mark(included, excluded, m, negate);
         }
     }
+    // Last, over whatever a wildcard's exclusion decided for the same path.
+    for m in named {
+        if fixed.contains(&m) || exclusions.names(&m, scan) {
+            mark(included, excluded, m, true);
+        } else {
+            #[cfg(test)]
+            hit("named");
+            excluded.remove(&m);
+            included.insert(m);
+        }
+    }
 }
 
 /// An exclusion, compiled for matching listed paths.
@@ -461,7 +546,8 @@ struct Exclusion {
     /// For a trailing `**`: the segments matching anything below the base.
     below: Option<Vec<String>>,
     tail: Tail,
-    /// The pattern without wildcards, as a path: matched by equality.
+    /// For an entry written without wildcards, its joined pattern as a path,
+    /// matched by equality (with a trailing `/`, a directory only).
     literal: Option<String>,
     /// The leading literal segments and `/`: every matched path starts with
     /// it or equals `base`.
@@ -493,7 +579,9 @@ enum Tail {
 }
 
 impl Exclusion {
-    fn new(pattern: &str, dotglob: bool, pruned: bool) -> Self {
+    /// `pattern` is the entry joined onto the task directory; `literal` says
+    /// the entry as written has no wildcards ([`Glob::has_wildcards`]).
+    fn new(pattern: &str, literal: bool, dotglob: bool, pruned: bool) -> Self {
         let mut segments: Vec<String> = normalized(pattern)
             .into_iter()
             .map(str::to_string)
@@ -517,7 +605,7 @@ impl Exclusion {
                 .collect()
         });
         let lead = segments.iter().take_while(|s| !has_meta(s)).count();
-        let literal = (lead == segments.len() && tail == Tail::Name).then(|| segments.join("/"));
+        let literal = (literal && tail != Tail::Tree).then(|| segments.join("/"));
         let base = segments.get(..lead).unwrap_or_default().join("/");
         let prefix = format!("{base}/");
         let needles = segments
@@ -569,8 +657,9 @@ struct Exclusions {
 
 impl Exclusions {
     fn new(all: Vec<Exclusion>) -> Self {
-        let (literal, others): (Vec<Exclusion>, Vec<Exclusion>) =
-            all.into_iter().partition(|e| e.literal.is_some());
+        let (literal, others): (Vec<Exclusion>, Vec<Exclusion>) = all
+            .into_iter()
+            .partition(|e| e.literal.is_some() && e.tail == Tail::Name);
         Self {
             literal: literal.into_iter().filter_map(|e| e.literal).collect(),
             others,
@@ -580,6 +669,16 @@ impl Exclusions {
 
     fn is_empty(&self) -> bool {
         self.literal.is_empty() && self.others.is_empty()
+    }
+
+    /// Whether one without wildcards names `path` (with a trailing `/`, as
+    /// a directory).
+    fn names(&mut self, path: &str, scan: &mut Scan) -> bool {
+        let clean = clean_path(path);
+        self.literal.contains(clean.as_ref())
+            || self.others.iter().any(|e| {
+                e.literal.is_some() && self.matcher.excludes_clean(e, &clean, path, false, scan)
+            })
     }
 
     /// Whether one excludes `path` (see [`Matcher::excludes`]).
@@ -637,7 +736,7 @@ impl Matcher {
             return false;
         }
         if let Some(literal) = &e.literal {
-            return literal == path;
+            return literal == path && (e.tail == Tail::Name || is_dir(raw, scan));
         }
         if !path.starts_with(&e.prefix) && path != e.base {
             return false;
@@ -1972,9 +2071,13 @@ mod tests {
         ];
         assert_eq!(globs(&dir, &list).unwrap(), want);
         assert_eq!(cache_globs(&dir, &list).unwrap(), want);
-        // The same entries as one list: the exclusion is global.
+        // The same entries as one list: the exclusion is global, but for the
+        // path named.
         let flat: Vec<Glob> = list.iter().map(|g| grouped(g.clone(), 0)).collect();
-        assert_eq!(globs(&dir, &flat).unwrap(), vec![join(&dir, "a/x.txt")]);
+        assert_eq!(
+            globs(&dir, &flat).unwrap(),
+            vec![join(&dir, "a/x.txt"), join(&dir, "own.tmp")]
+        );
     }
 
     /// A fingerprint stands for its group's glob; another group's exclusion
@@ -2168,40 +2271,48 @@ mod tests {
         );
     }
 
+    /// A fingerprint names its file: only an exclusion naming it too
+    /// removes it, not one of its directory.
     #[test]
-    fn exclude_prunes_injected_fingerprint_file() {
+    fn exclusions_keep_injected_fingerprint_file() {
         let dir = tmp();
         write_file(&dir, "build/gen/fp.txt", "f");
         write_file(&dir, "src/a.rs", "a");
-        // Pruning must still exclude fingerprint files inserted without walking.
-        let patterns = [
-            g("**/*.rs"),
-            g_fp("build/**/*", "build/gen/fp.txt"),
-            g_neg("build/gen/**/*"),
-        ];
-        let files = globs(&dir, &patterns).unwrap();
-        assert_eq!(files, vec![join(&dir, "src/a.rs")]);
-
-        // A trailing `**` exclude must also remove the injected fingerprint.
-        let bare = [
+        let want = vec![join(&dir, "build/gen/fp.txt"), join(&dir, "src/a.rs")];
+        for exclude in ["build/gen/**/*", "build/gen/**", "**/*.txt"] {
+            let patterns = [
+                g("**/*.rs"),
+                g_fp("build/**/*", "build/gen/fp.txt"),
+                g_neg(exclude),
+            ];
+            assert_eq!(globs(&dir, &patterns).unwrap(), want, "{exclude}");
+        }
+        let named = [
             g("**/*.rs"),
             g_fp("build/**", "build/gen/fp.txt"),
-            g_neg("build/gen/**"),
+            g_neg("build/gen/fp.txt"),
         ];
-        assert_eq!(globs(&dir, &bare).unwrap(), vec![join(&dir, "src/a.rs")]);
+        assert_eq!(globs(&dir, &named).unwrap(), vec![join(&dir, "src/a.rs")]);
     }
 
     #[test]
-    fn cache_globs_exclude_drops_injected_fingerprint_file() {
+    fn cache_globs_exclude_keeps_injected_fingerprint_file() {
         let dir = tmp();
         write_file(&dir, "build/gen/fp.txt", "f");
+        write_file(&dir, "build/gen/other.txt", "o");
         write_file(&dir, "build/out.js", "o");
         let patterns = [
             g_fp("build/**/*", "build/gen/fp.txt"),
             g_neg("build/gen/**/*"),
         ];
         let files = cache_globs(&dir, &patterns).unwrap();
-        assert_eq!(files, vec![join(&dir, "build/out.js")]);
+        assert_eq!(
+            files,
+            vec![join(&dir, "build/gen/fp.txt"), join(&dir, "build/out.js")]
+        );
+        let matcher = CacheMatcher::new(&dir, &patterns);
+        assert!(matcher.matches(&dir, "build/gen/fp.txt"));
+        assert!(!matcher.matches(&dir, "build/gen/other.txt"));
     }
 
     #[test]
@@ -2353,12 +2464,27 @@ mod tests {
             g_neg("target/**/*"),
         ];
         let (shell, tree, _, _) = agreed(&dir, &list);
-        assert_eq!(shell, [join(&dir, "src/.env"), join(&dir, "src/x.o")]);
+        assert_eq!(
+            shell,
+            [
+                join(&dir, "src/.env"),
+                join(&dir, "src/x.o"),
+                join(&dir, "target/.c.o")
+            ]
+        );
         assert_eq!(tree, shell);
         // `**` matches dot directories, `*` dot files.
         let list = [g("src/*"), g("src/.*"), g_neg("**/.*")];
         assert_eq!(agreed(&dir, &list).0, [join(&dir, "src/x.o")]);
         let list = [g("target/.*/*.o"), g("src/x.o"), g_neg("**/b.o")];
+        assert_eq!(agreed(&dir, &list).0, [join(&dir, "src/x.o")]);
+        // Named: kept, but by an exclusion naming it.
+        let list = [g("src/.env"), g("src/x.o"), g_neg("**/.*")];
+        assert_eq!(
+            agreed(&dir, &list).0,
+            [join(&dir, "src/.env"), join(&dir, "src/x.o")]
+        );
+        let list = [g("src/.env"), g("src/x.o"), g_neg("src/.env")];
         assert_eq!(agreed(&dir, &list).0, [join(&dir, "src/x.o")]);
     }
 
@@ -2495,6 +2621,32 @@ mod tests {
         }
     }
 
+    /// An exclusion written without wildcards matches by equality, even when
+    /// the task directory's own name holds glob characters (which the walk of
+    /// an include still reads as a pattern).
+    #[test]
+    fn literal_exclusions_match_by_equality() {
+        let root = tmp();
+        let dir = join(&root, "proj[old]");
+        write_file(&dir, "build/v.txt", "v");
+        let path = join(&dir, "build/v.txt");
+        let exclusion = Exclusion::new(&path, true, true, false);
+        assert_eq!(exclusion.literal.as_deref(), Some(path.as_str()));
+        let mut exclusions = Exclusions::new(vec![exclusion]);
+        assert!(exclusions.names(&path, &mut Scan::default()));
+        let dir_exclusion = Exclusion::new(&join(&dir, "build/"), true, true, false);
+        assert!(Matcher::default().excludes(
+            &dir_exclusion,
+            &join(&dir, "build"),
+            false,
+            &mut Scan::default()
+        ));
+        let matcher = CacheMatcher::new(&dir, &[g("build/v.txt"), g_neg("build/*")]);
+        assert!(matcher.matches(&dir, "build/v.txt"));
+        let matcher = CacheMatcher::new(&dir, &[g("build/v.txt"), g_neg("build/v.txt")]);
+        assert!(!matcher.matches(&dir, "build/v.txt"));
+    }
+
     /// A trailing `/` or `**` matches a directory by a lookup of the path as
     /// listed; a file the listing typed is not looked up at all.
     #[test]
@@ -2504,13 +2656,13 @@ mod tests {
         let scan = &mut Scan::default();
         let mut m = Matcher::default();
         for pattern in ["sub/", "sub/**", "s*/"] {
-            let e = Exclusion::new(&join(&dir, pattern), true, false);
+            let e = Exclusion::new(&join(&dir, pattern), !pattern.contains('*'), true, false);
             assert!(m.excludes(&e, &join(&dir, "sub"), false, scan), "{pattern}");
             let below = m.excludes(&e, &join(&dir, "sub/x.txt"), false, scan);
             assert_eq!(below, pattern.ends_with("**"), "{pattern}");
         }
         let file = join(&dir, "sub/x.txt");
-        let e = Exclusion::new(&join(&dir, "sub/x.txt/"), true, false);
+        let e = Exclusion::new(&join(&dir, "sub/x.txt/"), true, true, false);
         scan.hints.insert(file.clone(), Hint::File);
         HITS.with(|h| h.borrow_mut().clear());
         assert!(!m.excludes(&e, &file, false, scan));
@@ -2554,6 +2706,18 @@ mod tests {
             let list = [include, g_neg("out/**/*")];
             assert!(cache_globs(&dir, &list).unwrap().is_empty(), "{pattern}");
             assert!(!CacheMatcher::new(&dir, &list).matches(&dir, "out/link/file.txt"));
+        }
+
+        // A path named is kept, as a restore accepts it.
+        let mut include = g("out/**/*");
+        include.fingerprint = "out/link/file.txt".into();
+        for include in [g("out/link/file.txt"), include] {
+            let list = [include, g_neg("out/**/*")];
+            assert_eq!(
+                cache_globs(&dir, &list).unwrap(),
+                vec![join(&dir, "out/link/file.txt")]
+            );
+            assert!(CacheMatcher::new(&dir, &list).matches(&dir, "out/link/file.txt"));
         }
     }
 
@@ -3260,7 +3424,7 @@ mod tests {
                     let pattern = join_pattern(&dir, &e.glob);
                     let dotglob = rng.below(2) == 0;
                     {
-                        let x = Exclusion::new(&pattern, dotglob, false);
+                        let x = Exclusion::new(&pattern, !e.has_wildcards(), dotglob, false);
                         for p in &paths {
                             let spelled = if checked % 7 == 0 {
                                 p.replacen('/', "//", 2)
@@ -3296,6 +3460,7 @@ mod tests {
             "fingerprint",
             "included before, excluded",
             "directory check",
+            "named",
         ] {
             assert!(count(case) > 5, "{case}: {hits:?}");
         }
@@ -3354,7 +3519,7 @@ mod tests {
             ("src/**", "src/*/**/*", vec![src("a.c"), src("gen")]),
             ("src/gen/**", "src/gen/**/*", vec![src("gen")]),
             ("src/*/**", "src/gen/**", vec![]),
-            ("src/gen", "src/gen/**", vec![]),
+            ("src/gen", "src/gen/**", vec![src("gen")]),
         ] {
             let list = [g(inc), g_neg(exc)];
             assert!(Pruner::new(&join(&dir, exc)).is_some(), "{inc} - {exc}");
@@ -3364,6 +3529,7 @@ mod tests {
 
     /// A literal segment crosses a link back up, which the exclusion's
     /// own walk would not: it still excludes the path, so pruning holds.
+    /// The path named in full is kept.
     #[cfg(unix)]
     #[test]
     fn exclusions_match_literal_paths_through_loops() {
@@ -3374,6 +3540,11 @@ mod tests {
         let list = [g("build/again/*.o"), g("src/*.o"), g_neg("build/**")];
         assert!(Pruner::new(&join(&dir, "build/**")).is_some());
         assert_eq!(agreed(&dir, &list).0, [join(&dir, "src/y.o")]);
+        let list = [g("build/again/x.o"), g("src/*.o"), g_neg("build/**")];
+        assert_eq!(
+            agreed(&dir, &list).0,
+            [join(&dir, "build/again/x.o"), join(&dir, "src/y.o")]
+        );
     }
 
     /// An exclusion spelled with `//` covers what the walk reads it as.
@@ -3477,7 +3648,7 @@ mod tests {
             (vec![g("gen"), g_neg(&abs("*/"))], vec![abs("gen")]),
             // A link to a directory is one.
             (vec![g("link"), g_neg(&abs("link/"))], vec![]),
-            (vec![g("link"), g_neg("link/**")], vec![]),
+            (vec![g("link"), g_neg("link/**")], vec![abs("link")]),
             (
                 vec![g("*"), g_neg("link/**")],
                 vec![abs("gen"), abs("input.txt")],

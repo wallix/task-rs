@@ -365,6 +365,7 @@ impl Cache {
                 task: self.replace(&g.task),
                 vars: g.vars.as_ref().and_then(|v| self.replace_vars(v)),
                 group: g.group,
+                folded: g.folded,
             })
             .collect()
     }

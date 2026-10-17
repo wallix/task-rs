@@ -1081,11 +1081,13 @@ fn check_task_references(
 
 /// Settles the groups of a resolved list. They matter only when a folded
 /// task's entries exclude something: otherwise every entry joins group 0, which
-/// evaluates, deduplicates and hashes exactly as one flat list.
+/// evaluates, deduplicates and hashes exactly as one flat list, its folded
+/// entries marked [`Glob::folded`].
 pub(crate) fn finish_groups(mut globs: Vec<Glob>) -> Vec<Glob> {
     let grouped = globs.iter().any(|g| g.group != 0 && g.negate);
     if !grouped {
         for g in &mut globs {
+            g.folded = g.group != 0;
             g.group = 0;
         }
     }
@@ -1093,25 +1095,35 @@ pub(crate) fn finish_groups(mut globs: Vec<Glob>) -> Vec<Glob> {
 }
 
 /// Keeps the first of equal entries (same pattern, negation and fingerprint,
-/// and the same group when `grouped`), in order.
+/// and the same group when `grouped`), in order; folded only if each is.
 fn dedup(globs: Vec<Glob>, grouped: bool) -> Vec<Glob> {
-    let mut seen = std::collections::HashSet::new();
-    globs
-        .into_iter()
-        .filter(|g| {
-            let mut key = g.glob.clone();
-            if g.negate {
-                key = format!("!{key}");
+    use std::collections::{HashMap, hash_map::Entry};
+    let mut seen: HashMap<(u32, String), usize> = HashMap::new();
+    let mut out: Vec<Glob> = Vec::new();
+    for g in globs {
+        let mut key = g.glob.clone();
+        if g.negate {
+            key = format!("!{key}");
+        }
+        if !g.fingerprint.is_empty() {
+            key.push('\u{0}');
+            key.push_str("fp:");
+            key.push_str(&g.fingerprint);
+        }
+        let group = if grouped { g.group } else { 0 };
+        match seen.entry((group, key)) {
+            Entry::Occupied(at) => {
+                if let Some(kept) = out.get_mut(*at.get()) {
+                    kept.folded &= g.folded;
+                }
             }
-            if !g.fingerprint.is_empty() {
-                key.push('\u{0}');
-                key.push_str("fp:");
-                key.push_str(&g.fingerprint);
+            Entry::Vacant(at) => {
+                at.insert(out.len());
+                out.push(g);
             }
-            let group = if grouped { g.group } else { 0 };
-            seen.insert((group, key))
-        })
-        .collect()
+        }
+    }
+    out
 }
 
 /// Whether caching is active for a compiled task: a cache block is present and
@@ -1932,8 +1944,8 @@ mod tests {
     }
 
     /// Without a folded exclusion, groups collapse into one deduplicated list,
-    /// as before they existed; with one, equal entries of different groups
-    /// both stay.
+    /// as before they existed, an entry folded only if no copy is the task's
+    /// own; with one, equal entries of different groups both stay.
     #[test]
     fn finish_groups_collapses_unless_a_folded_task_excludes() {
         let flat = finish_groups(vec![
@@ -1943,14 +1955,20 @@ mod tests {
             glob("/r/b", false, 2),
             glob("/r/b", false, 1),
         ]);
+        let folded = |mut g: Glob| {
+            g.folded = true;
+            g
+        };
         assert_eq!(
             flat,
             vec![
                 glob("/r/a", false, 0),
                 glob("/r/x", true, 0),
-                glob("/r/b", false, 0)
+                folded(glob("/r/b", false, 0))
             ]
         );
+        let own_later = finish_groups(vec![glob("/r/a", false, 1), glob("/r/a", false, 0)]);
+        assert_eq!(own_later, vec![glob("/r/a", false, 0)]);
         let grouped = finish_groups(vec![
             glob("/r/a", false, 0),
             glob("/r/a", false, 1),
