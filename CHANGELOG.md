@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.10.0 - 2026-10-17
+
 - **A path an include names without wildcards stays against a wider
   `exclude:`.** `build/version.txt` next to `exclude: build/**`, or `src/.env`
   next to `exclude: '**/.*'`, is kept in `sources` and `generates`, as is a
