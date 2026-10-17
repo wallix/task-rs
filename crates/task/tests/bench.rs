@@ -7,10 +7,12 @@
 //! ```
 //!
 //! Optional: `TASK_BENCH_FILES` (default 200000), `TASK_BENCH_BIN` (default
-//! this build's binary). Each binary is timed on all CPUs and pinned to one
-//! (`taskset -c 0`), which caps fingerprinting at one thread, for a task with
-//! `generates` (`build`, which takes the build-once lock) and one without
-//! (`scan`). The tree goes under `$TMPDIR`.
+//! this build's binary), `TASK_BENCH_TASKS` (default `build,scan,retain,drop`).
+//! Each binary is timed on all CPUs and pinned to one (`taskset -c 0`), which
+//! caps fingerprinting at one thread, for each task: `build` has `generates`
+//! and takes the build-once lock, `scan` has none, and `retain` and `drop`
+//! weigh exclusions that keep nearly every file or drop most. The tree goes
+//! under `$TMPDIR`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -27,6 +29,24 @@ const LARGE: usize = 4;
 const LARGE_BYTES: usize = 64 << 20;
 
 const TASKFILE: &str = "version: '3'\ntasks:\n  build:\n    sources: ['src/**/*']\n    generates: [out.txt]\n    cmds: ['echo built > out.txt']\n  scan:\n    sources: ['src/**/*']\n    cmds: ['true']\n";
+
+/// Tasks whose exclusions keep nearly every file (20 absent paths, a suffix
+/// and a tree that match nothing) or drop most (a pruned tree and a
+/// wildcard).
+fn exclusion_tasks() -> String {
+    let mut retain = String::from("  retain:\n    sources:\n      - 'src/**/*'\n");
+    for i in 0..20 {
+        retain.push_str(&format!("      - exclude: src/absent{i}.txt\n"));
+    }
+    retain.push_str("      - exclude: '**/*.pyc'\n      - exclude: 'src/**/node_modules/**'\n");
+    retain.push_str("    cmds: ['true']\n");
+    let drop = concat!(
+        "  drop:\n    sources:\n      - 'src/**/*'\n",
+        "      - exclude: 'src/d[1-9]*/**'\n      - exclude: 'src/**/f*7.txt'\n",
+        "    cmds: ['true']\n",
+    );
+    format!("{retain}{drop}")
+}
 
 fn tree(files: usize) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("task-bench-{files}"));
@@ -51,7 +71,11 @@ fn tree(files: usize) -> PathBuf {
         }
         std::fs::write(&marker, "").unwrap();
     }
-    std::fs::write(dir.join("Taskfile.yml"), TASKFILE).unwrap();
+    std::fs::write(
+        dir.join("Taskfile.yml"),
+        format!("{TASKFILE}{}", exclusion_tasks()),
+    )
+    .unwrap();
     dir
 }
 
@@ -101,13 +125,15 @@ fn fingerprint_benchmark() {
         })
         .collect();
     bins.push(("current".to_string(), current));
+    let tasks =
+        std::env::var("TASK_BENCH_TASKS").unwrap_or_else(|_| "build,scan,retain,drop".to_string());
     println!("{files} small files + {LARGE} x {} MiB", LARGE_BYTES >> 20);
     println!(
         "{:<10} {:<6} {:<5} {:>12} {:>12} {:>12}",
         "binary", "task", "cpus", "first run", "up to date", "--status"
     );
     for (name, bin) in &bins {
-        for task in ["build", "scan"] {
+        for task in tasks.split(',') {
             for one_cpu in [true, false] {
                 // Warm the page cache, then start from no saved state.
                 let _ = std::fs::remove_dir_all(dir.join(".task"));
