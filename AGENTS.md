@@ -30,9 +30,10 @@ and shipped as a single self-contained `task` binary (static-musl on Linux;
 at build-system reliability (deterministic fingerprinting, distributed caching
 and locking, setup tasks); v4.0.0 is a full Rust rewrite of that fork.
 
-It stays **drop-in compatible** with Taskfile v3: same schema, CLI flags, exit
-codes and observable behaviour, verified by a black-box suite that ports the
-entire Go test corpus. Fingerprint checksum *values* use a format of their own
+It started as a **drop-in replacement** for Taskfile v3 (same schema, CLI flags,
+exit codes and observable behaviour, verified by a black-box suite that ports
+the entire Go test corpus) and keeps that as a baseline, but consistency and
+performance now come before parity (see below). Fingerprint checksum *values* use a format of their own
 (v1, see `fingerprint/checksum.rs`), not the Go implementation's, and `.task`
 entries are keyed by each task's identity rather than its namespaced name.
 Included copies with matching compiled build inputs share state (diverging from
@@ -78,22 +79,24 @@ Taskfile-versions pages, and `reference/` for CLI, schema, templating,
 environment and reproducible builds; a user-visible behaviour change updates it
 in the same commit.
 
-## Drop-in Compatibility Is a Hard Constraint
+## Compatibility With Go Task v3
 
-Behaviour parity with Go Task v3 is load-bearing, in the same way pinning is for
-a build system. Before changing anything user-observable, know which side of the
-line it is on:
+Parity with Go Task v3 is a baseline, not a hard constraint: internal
+consistency and performance come first. A change may diverge from Go Task when
+it makes behaviour more consistent or faster; it then documents the divergence
+in `README.md` (compatibility and differences) and `CHANGELOG.md` in the same
+commit. Divergences already made include removed remote taskfiles and timestamp
+fingerprinting, `setup` tasks, fingerprint-based `generates`, duplicate-key
+errors, env precedence, Jinja templating and exclusion matching.
 
-- **Frozen:** the Taskfile v3 schema, CLI flags and their semantics, exit codes,
-  stdout / stderr shape that tests assert on, and the **fingerprint checksum
-  format** — a change there silently invalidates every existing `.task` cache
-  and cache key, so it bumps the format version and is treated as a breaking
-  change, not a refactor.
-- **Deliberately divergent:** the differences already documented in `README.md`
-  and `CHANGELOG.md` (removed remote taskfiles and timestamp fingerprinting,
-  added `setup` tasks and fingerprint-based `generates`, duplicate-key errors,
-  env precedence, Jinja templating). Extending this list is a product decision —
-  ask, don't assume.
+- **Fingerprint checksum format:** a change there silently invalidates every
+  existing `.task` cache and cache key, so it bumps the format version and is
+  called out as a breaking change, not a refactor. A change to the files a
+  task's lists select changes checksums too: say so in the commit body and the
+  CHANGELOG.
+- **User-observable behaviour** (the Taskfile schema, CLI flags, exit codes,
+  stdout / stderr shape that tests assert on): may change when it serves
+  consistency or performance, never silently.
 
 New behaviour gets a `testdata/` case and a black-box test in
 `crates/task/tests/` alongside it. `schema.json` describes the accepted Taskfile
@@ -142,7 +145,8 @@ cargo test -p task --test cache
 ```
 
 Run the full `cargo test --workspace --locked` before calling a change done —
-the suite is the safety net for the compatibility constraint above.
+the suite is the safety net for every documented behaviour, ported or
+divergent.
 
 ### Build / container scripts
 

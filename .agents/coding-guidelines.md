@@ -12,11 +12,11 @@
   and risky to reimplement, or the dep is already transitive. "Slightly more
   ergonomic" is not a reason. Prefer writing the glue. Language-specific rules
   in per-area files.
-- Drop-in compatibility with Go Task v3 is a hard constraint: the Taskfile
-  schema, CLI flags, exit codes, observable output, and the fingerprint checksum
-  algorithm are frozen. Divergences are deliberate and documented in `README.md`
-  / `CHANGELOG.md` — adding one is a product decision, not a refactor. See
-  [AGENTS.md](../AGENTS.md#drop-in-compatibility-is-a-hard-constraint).
+- Compatibility with Go Task v3 is a baseline, not a hard constraint:
+  consistency and performance come first. Every divergence is documented in
+  `README.md` / `CHANGELOG.md` in the commit that makes it, and a change to the
+  fingerprint checksum format bumps its version. See
+  [AGENTS.md](../AGENTS.md#compatibility-with-go-task-v3).
 - Release builds must stay reproducible and free-standing: one static-musl
   binary, no system C libraries, byte-identical on a rebuild from the same
   commit. Do not introduce build-time non-determinism (timestamps, host paths,
