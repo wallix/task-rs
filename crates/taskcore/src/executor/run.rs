@@ -1474,7 +1474,7 @@ impl Executor {
             let ignored =
                 cmd.ignore_error || t.ignore_error || cmd.defer || CallPath::ignored(ancestors);
             let result = self
-                .exec_shell(t, call, &cmd.cmd, posix, bash, ancestors, ignored)
+                .exec_shell(t, &cmd.cmd, posix, bash, ancestors, ignored)
                 .await;
             if let Err(ExecutorError::Exec(execext::Error::NonZeroExit(_))) = &result
                 && cmd.ignore_error
@@ -1505,7 +1505,6 @@ impl Executor {
     async fn exec_shell(
         &self,
         t: &Task,
-        call: &Call,
         command: &str,
         posix: Vec<String>,
         bash: Vec<String>,
@@ -1537,15 +1536,9 @@ impl Executor {
             return run_result.map_err(ExecutorError::Exec);
         }
 
-        let compiler = self.compiler();
-        let vars = {
-            let (mut scratch, sink) = self.scratch_logger();
-            let r = compiler
-                .fast_get_variables(Some(t), Some(call), &mut scratch)
-                .await;
-            self.flush_scratch(&sink);
-            r?
-        };
+        // Group markers render against the task's compiled vars, `CHECKSUM`
+        // included.
+        let vars = t.vars.clone().unwrap_or_default();
 
         let out_buf = SharedBytes::default();
         let err_buf = SharedBytes::default();

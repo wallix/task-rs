@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Templated `output:` group markers show a variable's value as is**, as
+  commands do, instead of rendering template text it holds again.
+
 ## v4.10.0 - 2026-10-17
 
 - **A path an include names without wildcards stays against a wider

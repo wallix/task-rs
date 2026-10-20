@@ -1079,6 +1079,19 @@ fn checksum_reaches_summary_and_group_markers() {
     );
 }
 
+/// Group markers preserve template text in variable values, as commands do.
+#[test]
+fn group_markers_render_var_values_once() {
+    let dir = scratch(concat!(
+        "version: '3'\noutput:\n  group:\n    begin: 'B={{.V}}'\ntasks:\n  build:\n",
+        "    vars:\n      V: '{{\"{{\"}}.TASK}}'\n    cmds: ['echo \"C={{.V}}\"']\n",
+    ));
+    let out = run(&dir, &["build"]);
+    assert!(out.ok(), "{}", out.combined());
+    assert!(out.stdout.contains("C={{.TASK}}\n"), "{}", out.combined());
+    assert!(out.stdout.contains("B={{.TASK}}\n"), "{}", out.combined());
+}
+
 /// A source that is neither a regular file nor a symlink fails the task,
 /// naming it, instead of blocking on it.
 #[cfg(unix)]
