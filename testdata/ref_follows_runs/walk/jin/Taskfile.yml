@@ -7,7 +7,7 @@ tasks:
       - task: ':show'
         vars: {V: '{% raw %}{{ "a" }}{#b#}{% endraw %}'}
 
-  # CHECKSUM, as a run renders it, in this dialect.
+  # CHECKSUM in what a task calls, refused in this dialect too.
   checksums:
     sources: [{task: ck}]
     cmds:

@@ -232,7 +232,7 @@ tasks:
 
 | Variable | Type | Description |
 | --- | --- | --- |
-| `CHECKSUM` | `string` | Checksum of the task's `sources` (available in `status`, and in the `cache` `url`/`lock` templates) |
+| `CHECKSUM` | `string` | Checksum of the task's `sources`: available in commands, `preconditions` and the `cache` block only (see below) |
 
 ```yaml
 tasks:
@@ -243,6 +243,19 @@ tasks:
     cmds:
       - cargo build --release
 ```
+
+Only command bodies and their `if:`, deferred commands, `preconditions`, the
+cache block and templated `output:` group markers may read `CHECKSUM`.
+Everything that decides what the task runs or reads fails when it reads it,
+directly, through a `ref:` or Jinja's `debug()`, naming the task and field:
+`task: build: setup: template "…" reads CHECKSUM: CHECKSUM is only available
+in commands, preconditions and the cache block, after setup`. That covers
+Taskfile-level `vars` and `env`, failing every task, task and include `vars`,
+`env`, `dotenv`, `dir`, `sources` and `generates` entries and their `vars`,
+`sandbox` entries, `setup`, `deps`, the task names, `vars` and `for:` of
+commands, deferred ones included, the task-level `if:`, `run:`, `label`,
+`desc` and `prefix`; `--summary` renders it empty there. A `ref: "."`
+capture leaves `CHECKSUM` out, and a var named `CHECKSUM` is ignored.
 
 ### Loop
 

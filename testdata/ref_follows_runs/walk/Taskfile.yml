@@ -93,7 +93,7 @@ tasks:
   'w-*':
     sources: ['src/w-{{index .MATCH 0}}.txt']
 
-  # 3. CHECKSUM, as a run renders it.
+  # 3. CHECKSUM in what a task calls: refused.
   checksums:
     sources: [{task: ck}]
     cmds:
@@ -152,8 +152,7 @@ tasks:
       - defer: {task: z, vars: {C: '{{.CHECKSUM}}'}}
       - 'true'
 
-  # Its references are in generates: its final CHECKSUM is not the eager
-  # one either.
+  # A deferred call reading CHECKSUM, its references in generates.
   gen-checksum:
     sources: [{task: on-gen-checksum}]
     cmds:

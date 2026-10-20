@@ -59,6 +59,11 @@ impl Vars {
         self.om.insert(key, value).is_some()
     }
 
+    /// Removes `key`, keeping the order of the others.
+    pub fn remove(&mut self, key: &str) -> Option<Var> {
+        self.om.shift_remove(key)
+    }
+
     /// Iterates over the pairs in insertion order.
     pub fn all(&self) -> impl Iterator<Item = (&String, &Var)> {
         self.om.iter()

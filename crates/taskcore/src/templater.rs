@@ -81,6 +81,79 @@ thread_local! {
     // and avoids rebuilding ~45 function/filter registrations per Cache.
     static GO_ENV: Rc<Environment<'static>> = Rc::new(build_go_environment());
     static JINJA_ENV: Rc<Environment<'static>> = Rc::new(build_jinja_environment());
+    // Set by [`PendingChecksum`] whenever a render touches it.
+    static CHECKSUM_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The value `CHECKSUM` holds until the run computes it, after setup. A render
+/// that reads it — directly, through `debug()`, a Go comparison function, a
+/// filter, or a `ref:` — fails with [`TemplaterError::ChecksumUnavailable`],
+/// unless the [`Cache`] renders a late field (see [`Cache::set_late`]), where
+/// it renders as itself. Jinja's comparison operators and tests (`is …`) never
+/// reach the object and are not caught.
+pub const PENDING_CHECKSUM: &str = "\u{1a}CHECKSUM\u{1a}";
+
+/// Whether `value` is, or holds, [`PENDING_CHECKSUM`].
+fn holds_pending_checksum(value: &YamlValue) -> bool {
+    match value {
+        YamlValue::String(s) => s.contains(PENDING_CHECKSUM),
+        YamlValue::Sequence(seq) => seq.iter().any(holds_pending_checksum),
+        YamlValue::Mapping(map) => map
+            .iter()
+            .any(|(k, v)| holds_pending_checksum(k) || holds_pending_checksum(v)),
+        _ => false,
+    }
+}
+
+/// [`PENDING_CHECKSUM`] as the template engine sees it: every use is noted.
+struct PendingChecksum;
+
+impl PendingChecksum {
+    fn touch() {
+        CHECKSUM_READ.with(|r| r.set(true));
+    }
+}
+
+impl fmt::Debug for PendingChecksum {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Self::touch();
+        f.write_str(PENDING_CHECKSUM)
+    }
+}
+
+impl minijinja::value::Object for PendingChecksum {
+    fn get_value(self: &std::sync::Arc<Self>, _: &JinjaValue) -> Option<JinjaValue> {
+        Self::touch();
+        None
+    }
+
+    fn enumerate(self: &std::sync::Arc<Self>) -> minijinja::value::Enumerator {
+        Self::touch();
+        minijinja::value::Enumerator::NonEnumerable
+    }
+
+    fn enumerator_len(self: &std::sync::Arc<Self>) -> Option<usize> {
+        Self::touch();
+        None
+    }
+
+    fn is_true(self: &std::sync::Arc<Self>) -> bool {
+        Self::touch();
+        true
+    }
+
+    fn custom_cmp(
+        self: &std::sync::Arc<Self>,
+        _: &minijinja::value::DynObject,
+    ) -> Option<std::cmp::Ordering> {
+        Self::touch();
+        None
+    }
+
+    fn render(self: &std::sync::Arc<Self>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Self::touch();
+        f.write_str(PENDING_CHECKSUM)
+    }
 }
 
 /// The helpers that stay a *call* after a pipe, taking the subject as their
@@ -215,6 +288,31 @@ pub enum TemplaterError {
         /// The underlying engine message.
         message: String,
     },
+    /// The template reads `CHECKSUM` where it is not available yet: anything
+    /// that decides what a task runs or reads renders before setup and before
+    /// the sources are hashed.
+    ChecksumUnavailable {
+        /// The task whose field reads it, once the compile names it.
+        task: String,
+        /// The field being rendered (see [`Cache::field`]), if known.
+        field: String,
+        /// The template string as the user wrote it.
+        template: String,
+    },
+}
+
+impl TemplaterError {
+    /// Names `task` as the owner of a [`Self::ChecksumUnavailable`] that does
+    /// not name one yet.
+    #[must_use]
+    pub fn in_task(mut self, name: &str) -> Self {
+        if let Self::ChecksumUnavailable { task, .. } = &mut self
+            && task.is_empty()
+        {
+            *task = name.to_string();
+        }
+        self
+    }
 }
 
 impl fmt::Display for TemplaterError {
@@ -237,6 +335,23 @@ impl fmt::Display for TemplaterError {
             Self::Render { template, message } => {
                 write!(f, "template failed to render {template:?}: {message}")
             }
+            Self::ChecksumUnavailable {
+                task,
+                field,
+                template,
+            } => {
+                if !task.is_empty() {
+                    write!(f, "task: {task}: ")?;
+                }
+                if !field.is_empty() {
+                    write!(f, "{field}: ")?;
+                }
+                write!(
+                    f,
+                    "template {template:?} reads CHECKSUM: CHECKSUM is only available in \
+                     commands, preconditions and the cache block, after setup"
+                )
+            }
         }
     }
 }
@@ -256,6 +371,8 @@ pub struct Cache {
     dialect: Dialect,
     cache_map: Option<IndexMap<String, YamlValue>>,
     err: Option<TemplaterError>,
+    late: bool,
+    field: String,
 }
 
 impl Cache {
@@ -269,7 +386,43 @@ impl Cache {
             dialect: Dialect::Go,
             cache_map: None,
             err: None,
+            late: false,
+            field: String::new(),
         }
+    }
+
+    /// Whether the strings rendered next are late fields — command bodies and
+    /// conditions, preconditions, the cache block — which may read
+    /// [`PENDING_CHECKSUM`]. Off, reading it is an error.
+    pub fn set_late(&mut self, late: bool) {
+        self.late = late;
+    }
+
+    /// Names the field being rendered for [`TemplaterError::ChecksumUnavailable`].
+    pub fn field(&mut self, field: impl Into<String>) -> &mut Self {
+        self.field = field.into();
+        self
+    }
+
+    /// Replaces the template variables, preserving the dialect, late-field flag
+    /// and any recorded error.
+    pub fn set_vars(&mut self, vars: Vars) {
+        self.vars = vars;
+        self.cache_map = None;
+    }
+
+    /// Records a [`PENDING_CHECKSUM`] read by `tmpl`. Returns true for a late
+    /// field; otherwise records an error and returns false.
+    fn checksum_read(&mut self, tmpl: &str) -> bool {
+        if self.late {
+            return true;
+        }
+        self.err = Some(TemplaterError::ChecksumUnavailable {
+            task: String::new(),
+            field: self.field.clone(),
+            template: tmpl.to_string(),
+        });
+        false
     }
 
     /// Sets the template dialect for the plain-string render methods (`replace`,
@@ -330,7 +483,16 @@ impl Cache {
         for (k, v) in extra {
             data.insert(k.clone(), v.clone());
         }
-        match render(self.env_for(self.dialect), self.dialect, tmpl, &data) {
+        CHECKSUM_READ.with(|r| r.set(false));
+        let result = render(self.env_for(self.dialect), self.dialect, tmpl, &data);
+        let read = CHECKSUM_READ.with(|r| r.replace(false))
+            || result
+                .as_ref()
+                .is_ok_and(|out| out.contains(PENDING_CHECKSUM));
+        if read && !self.checksum_read(tmpl) {
+            return tmpl.to_string();
+        }
+        match result {
             Ok(out) => out,
             Err(e) => {
                 self.err = Some(e);
@@ -380,26 +542,29 @@ impl Cache {
         self.ensure_cache_map();
         let data = self.cache_map.clone().unwrap_or_default();
         if ref_ == "." {
+            // A pending CHECKSUM is no value yet: the capture leaves it out.
             return YamlValue::Mapping(
                 data.into_iter()
+                    .filter(|(_, v)| !holds_pending_checksum(v))
                     .map(|(k, v)| (YamlValue::String(k), v))
                     .collect(),
             );
         }
         // A plain dotted path (`.FOO.BAR`) is looked up directly so its value
         // keeps its original type (map, list, or scalar). Anything more complex
-        // (pipelines, function calls) falls back to string rendering.
+        // (pipelines, function calls) falls back to string rendering, whose
+        // string form is what callers store and compare.
         if let Some(value) = lookup_path(&data, ref_) {
+            if holds_pending_checksum(&value) && !self.checksum_read(ref_) {
+                return YamlValue::Null;
+            }
             return value;
         }
-        let wrapped = format!("{{{{{ref_}}}}}");
-        match resolve(self.env_for(self.dialect), self.dialect, &wrapped, &data) {
-            Ok(value) => value,
-            Err(e) => {
-                self.err = Some(e);
-                YamlValue::Null
-            }
+        let rendered = self.replace(&format!("{{{{{ref_}}}}}"));
+        if self.err.is_some() {
+            return YamlValue::Null;
         }
+        YamlValue::String(rendered)
     }
 
     /// Renders both static and dynamic forms of `var`, merging `extra` on top.
@@ -535,26 +700,17 @@ fn lookup_path(data: &IndexMap<String, YamlValue>, ref_: &str) -> Option<YamlVal
     Some(current)
 }
 
-/// Renders `wrapped` (a single `{{ ... }}` action) and returns the raw value it
-/// produced rather than its string form.
-fn resolve(
-    env: &Environment<'static>,
-    dialect: Dialect,
-    wrapped: &str,
-    data: &IndexMap<String, YamlValue>,
-) -> Result<YamlValue, TemplaterError> {
-    // Rendering to a string loses type information; for a bare reference the
-    // string form is what callers store and compare, so it is preserved here.
-    let out = render(env, dialect, wrapped, data)?;
-    Ok(YamlValue::String(out))
-}
-
 /// Builds the minijinja context from the variable map. `crate::yaml::Value`
 /// serializes into the shapes minijinja expects (maps, sequences, scalars).
 fn build_context(data: &IndexMap<String, YamlValue>) -> JinjaValue {
     let map: IndexMap<String, JinjaValue> = data
         .iter()
-        .map(|(k, v)| (k.clone(), JinjaValue::from_serialize(v)))
+        .map(|(k, v)| match v {
+            YamlValue::String(s) if s == PENDING_CHECKSUM => {
+                (k.clone(), JinjaValue::from_object(PendingChecksum))
+            }
+            _ => (k.clone(), JinjaValue::from_serialize(v)),
+        })
         .collect();
     context!(..JinjaValue::from_serialize(&map))
 }
@@ -1453,22 +1609,39 @@ fn func_index(value: JinjaValue, keys: Rest<JinjaValue>) -> Result<JinjaValue, m
 
 // Go comparison builtins. minijinja `Value` is totally ordered, so the operators
 // map directly; `eq`/`ne` also cover strings, numbers, and bools.
+/// Notes a comparison reading [`PENDING_CHECKSUM`], which compares unequal to
+/// anything without asking the object.
+fn compared(a: &JinjaValue, b: &JinjaValue) {
+    if [a, b]
+        .iter()
+        .any(|v| v.downcast_object_ref::<PendingChecksum>().is_some())
+    {
+        PendingChecksum::touch();
+    }
+}
+
 fn func_eq(a: JinjaValue, b: JinjaValue) -> bool {
+    compared(&a, &b);
     a == b
 }
 fn func_ne(a: JinjaValue, b: JinjaValue) -> bool {
+    compared(&a, &b);
     a != b
 }
 fn func_lt(a: JinjaValue, b: JinjaValue) -> bool {
+    compared(&a, &b);
     a < b
 }
 fn func_le(a: JinjaValue, b: JinjaValue) -> bool {
+    compared(&a, &b);
     a <= b
 }
 fn func_gt(a: JinjaValue, b: JinjaValue) -> bool {
+    compared(&a, &b);
     a > b
 }
 fn func_ge(a: JinjaValue, b: JinjaValue) -> bool {
+    compared(&a, &b);
     a >= b
 }
 
@@ -2088,6 +2261,32 @@ mod tests {
         let mut c = cache_with(&[("EMPTY", "")]);
         assert_eq!(c.replace(r#"{{ne .EMPTY ""}}"#), "false");
         assert_eq!(c.replace(r#"{{eq .EMPTY ""}}"#), "true");
+    }
+
+    /// A pending CHECKSUM read outside a late field is an error, through a Go
+    /// comparison too; a late field renders it as itself.
+    #[test]
+    fn pending_checksum_is_refused_outside_late_fields() {
+        for tmpl in [
+            "{{.CHECKSUM}}",
+            r#"{{if eq .CHECKSUM ""}}empty{{else}}set{{end}}"#,
+            r#"{{ne "x" .CHECKSUM}}"#,
+            "{{len .CHECKSUM}}",
+            "{{if .CHECKSUM}}set{{end}}",
+        ] {
+            let mut c = cache_with(&[("CHECKSUM", PENDING_CHECKSUM)]);
+            assert_eq!(c.replace(tmpl), tmpl);
+            assert!(
+                matches!(c.err(), Some(TemplaterError::ChecksumUnavailable { .. })),
+                "{tmpl}: {:?}",
+                c.err()
+            );
+        }
+        let mut c = cache_with(&[("CHECKSUM", PENDING_CHECKSUM), ("X", "x")]);
+        assert_eq!(c.replace(r#"{{eq .X "x"}}"#), "true");
+        c.set_late(true);
+        assert_eq!(c.replace("{{.CHECKSUM}}"), PENDING_CHECKSUM);
+        assert!(c.err().is_none());
     }
 
     #[test]

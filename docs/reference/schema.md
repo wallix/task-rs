@@ -930,9 +930,9 @@ tasks:
 ```
 
 `from: cmds` reads a deferred `task:` command as it runs after a success; one
-whose name or `vars` mention `{{.EXIT_CODE}}`, or `{{.CHECKSUM}}` in a task
-with `from:` or `task:` entries itself, is an error, as is one whose template
-fails to render (a run would ignore it): list its targets explicitly.
+whose name or `vars` mention `{{.EXIT_CODE}}` is an error, as is one whose
+template fails to render (a run would ignore it): list its targets
+explicitly. A call reading `{{.CHECKSUM}}` is an error anywhere.
 
 A `task:` entry names one task, which need not be a dependency or be called.
 It takes optional `vars`, as a dependency call does, and nothing else. The
@@ -980,10 +980,9 @@ task that would be run, with what it runs, and without compiling it; a task a
 `task:` entry names is included whatever its `platforms:`. A `task:` command
 whose name renders empty runs nothing, and counts for nothing. A deferred call
 counts as it runs after a success; one whose name or `vars` mention
-`{{.EXIT_CODE}}`, or `{{.CHECKSUM}}` in a task that has `task:` or `from:`
-entries in its own `sources` or `generates`, is an error, as is one whose
-template fails to render, which a run would ignore: list its targets with
-their own `task:` entries. A recursion whose end depends on what the walk does
+`{{.EXIT_CODE}}` is an error, as is one whose template fails to render, which
+a run would ignore: list its targets with their own `task:` entries. A
+recursion whose end depends on what the walk does
 not evaluate (an `if:`) stops at 256 calls of one task, or 1000 calls in all,
 with exit code 204. The `sh:` variables of the tasks reached run as for a run,
 unsandboxed.
@@ -998,7 +997,7 @@ cache, but two things in `cmds` see only the task's own entries:
 
 - `for: sources` and `for: generates` iterate the task's own entries; the
   folded-in ones are left out.
-- `{{.CHECKSUM}}` in `cmds`, `deps` and `setup` hashes the task's own
+- `{{.CHECKSUM}}` in command bodies and conditions hashes the task's own
   entries, so it does not change when a folded-in file does. Deferred
   commands, `preconditions` and the cache block see the `{{.CHECKSUM}}` the
   fingerprint records, which covers them (empty when they resolve to no

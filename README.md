@@ -348,6 +348,10 @@ v3 are intentional.
 - A glob ending in `/` matches directories only (a symlink to one is the
   entry), relative or absolute. Go Task drops the `/` from a relative entry
   when joining it to the task directory.
+- Only command bodies and their `if:`, deferred commands, `preconditions`,
+  the cache block and `output:` group markers may read `CHECKSUM`; vars
+  (Taskfile-level ones included), `env`, `sources`, `setup`, `deps`, the task
+  names and `vars` of commands and the like fail when they do.
 
 For release-specific compatibility notes, including migration fixes and known
 gaps, read the [changelog](CHANGELOG.md).

@@ -972,14 +972,18 @@ tasks that generate remote artifacts (Docker images, deploys, CD releases) the
 checksum requires either access to the artifact or for an out-of-band refresh
 of the `.checksum` fingerprint file.
 
-The special variable <span v-pre>`{{ CHECKSUM }}`</span> is available for
-interpolation within `cmds` and `status` commands. Only `source` globs are
-fingerprinted.
+The special variable <span v-pre>`{{ CHECKSUM }}`</span> holds the checksum
+of the task's sources. Command bodies and their `if:`, deferred commands,
+`preconditions`, the cache block and templated `output:` group markers may
+read it; anything deciding what the task runs or reads (vars, `env`,
+`sources`, `setup`, `deps`, the task names and `vars` of commands, …) fails
+if it does (see the [templating reference](reference/templating.md#status-and-cache)).
+Only `source` globs are fingerprinted.
 
 The sources are hashed when the task is compiled only if something reads
-`CHECKSUM`: its commands and their vars, task names, preconditions, the cache
-block, deferred commands, `requires`, a `ref:` var, Jinja's `debug()`,
-`--summary`, or templated `output:` group markers. Otherwise a task with
+`CHECKSUM`: its command bodies and conditions, preconditions, the cache
+block, deferred commands, `requires`, Jinja's `debug()`, `--summary`, or
+templated `output:` group markers. Otherwise a task with
 `generates` hashes them once after `setup`, for its build-once lock and cache
 key, and a task without (no lock, no cache entry) reuses its up-to-date
 reading. A cache entry is restored only when its key matches what the

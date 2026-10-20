@@ -45,6 +45,9 @@ pub fn get_from_vars(env: &ast::Vars, env_precedence: bool) -> Vec<String> {
         let Some(rendered) = allowed_value(&v) else {
             continue;
         };
+        if rendered == crate::templater::PENDING_CHECKSUM {
+            continue;
+        }
         if !env_precedence && std::env::var_os(&k).is_some() {
             continue;
         }

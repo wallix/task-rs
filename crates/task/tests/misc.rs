@@ -1049,6 +1049,91 @@ fn reference_fingerprints_are_stable() {
     }
 }
 
+/// What decides what a task runs or reads cannot read CHECKSUM: a task var,
+/// a setup entry or a source reading it fails the task, naming the task and
+/// field and saying where it is available, and runs nothing.
+#[test]
+fn checksum_outside_late_fields_is_refused() {
+    for (task, at) in [
+        (
+            "vars:\n      X: '{{.CHECKSUM}}'\n    cmds: ['echo {{.X}}']",
+            "task: build: vars: X: ",
+        ),
+        (
+            "setup: ['x-{{.CHECKSUM}}']\n    cmds: [echo ran]",
+            "task: build: setup: ",
+        ),
+        (
+            "sources: ['{{.CHECKSUM}}.txt']\n    cmds: [echo ran]",
+            "task: build: sources: ",
+        ),
+        (
+            "env:\n      E: {sh: 'touch ran-env; echo {{.CHECKSUM}}'}\n    cmds: [echo ran]",
+            "task: build: env: ",
+        ),
+    ] {
+        let dir = scratch(&format!(
+            "version: '3'\ntasks:\n  build:\n    {task}\n  'x-*':\n    cmds: [echo setup]\n"
+        ));
+        let out = run(&dir, &["build"]);
+        assert_eq!(out.code, 1, "{task}: {}", out.combined());
+        assert!(
+            out.stderr.contains(at)
+                && out.stderr.contains(
+                    "reads CHECKSUM: CHECKSUM is only available in commands, preconditions and \
+                     the cache block, after setup"
+                ),
+            "{task}: {}",
+            out.stderr
+        );
+        assert!(!out.stdout.contains("ran"), "{task}: {}", out.combined());
+        assert!(!out.stdout.contains("setup"), "{task}: {}", out.combined());
+        assert!(!dir.join("ran-env").exists(), "{task}");
+    }
+
+    // A wildcard task is named as it was called.
+    let dir = scratch(
+        "version: '3'\ntasks:\n  'w-*':\n    label: '{{.CHECKSUM}}'\n    cmds: [echo ran]\n",
+    );
+    let out = run(&dir, &["w-a"]);
+    assert_eq!(out.code, 1, "{}", out.combined());
+    assert!(out.stderr.contains("task: w-a: label: "), "{}", out.stderr);
+}
+
+/// `--summary` renders a refused CHECKSUM empty, as it did before the
+/// refusal, rather than failing or printing the template.
+#[test]
+fn summary_renders_a_refused_checksum_empty() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  build:\n    desc: 'd-{{.CHECKSUM}}-'\n    cmds: [echo ran]\n",
+    );
+    // The environment's CHECKSUM does not show through either.
+    let out = run_with_env(&dir, &["--summary", "build"], &[("CHECKSUM", "env")]);
+    assert!(out.ok(), "{}", out.combined());
+    assert!(out.stdout.contains("d--\n"), "{}", out.combined());
+}
+
+/// A var named CHECKSUM, at any level, is ignored: commands see the
+/// computed value, empty without sources, and other vars cannot read it.
+#[test]
+fn a_checksum_var_is_ignored() {
+    let dir = scratch(concat!(
+        "version: '3'\nvars:\n  CHECKSUM: top\ntasks:\n",
+        "  build:\n    vars: {CHECKSUM: mine}\n    cmds: ['echo \"[{{.CHECKSUM}}]\"']\n",
+        "  read:\n    vars: {CHECKSUM: mine, Y: '{{.CHECKSUM}}'}\n    cmds: [echo ran]\n",
+    ));
+    let out = run(&dir, &["build"]);
+    assert!(out.ok(), "{}", out.combined());
+    assert!(out.stdout.contains("[]\n"), "{}", out.combined());
+    let out = run(&dir, &["read"]);
+    assert_eq!(out.code, 1, "{}", out.combined());
+    assert!(
+        out.stderr.contains("task: read: vars: Y: "),
+        "{}",
+        out.stderr
+    );
+}
+
 /// Consumers outside the task's own fields still see CHECKSUM: `--summary`
 /// prints the compiled vars, and group markers render against them.
 #[test]
@@ -1402,25 +1487,27 @@ fn status_files_with(dir: &Path, args: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// `CHECKSUM` in a dep's vars, in a dep's name and in a deferred call's vars
-/// renders as the run renders it, in both dialects: the files the run
-/// creates under those names are the reached sources.
+/// `CHECKSUM` in a dep's vars, in a dep's name or in a deferred call's vars
+/// is refused, in both dialects: it is computed after setup, once what the
+/// task calls is known. Run, and reached through a reference, alike.
 #[test]
-fn checksum_in_reached_calls_renders_as_a_run_does() {
+fn checksum_in_calls_is_refused() {
     let dir = stage("ref_follows_runs/walk");
-    for (prefix, file) in [("", ""), ("jin:", "jin-")] {
-        let ran = run(&dir, &[&format!("{prefix}ck")]);
-        assert!(ran.ok(), "{}", ran.combined());
-        let sources = sources_of(&dir, &format!("{prefix}checksums"));
-        for kind in ["ck-defer", "ck-name", "ck-var"] {
-            let want = format!("out/{file}{kind}-");
+    for prefix in ["", "jin:"] {
+        for task in ["ck", "checksums"] {
+            let out = run(&dir, &[&format!("{prefix}{task}")]);
+            assert_eq!(out.code, 1, "{prefix}{task}: {}", out.combined());
             assert!(
-                sources.iter().any(|s| s.starts_with(&want)),
-                "{prefix}{kind}: {sources:?}"
+                out.stderr.contains(
+                    "reads CHECKSUM: CHECKSUM is only available in commands, preconditions and \
+                     the cache block, after setup"
+                ),
+                "{prefix}{task}: {}",
+                out.stderr
             );
         }
-        assert_eq!(sources.len(), 4, "{sources:?}");
     }
+    assert!(!dir.join("out").exists());
 }
 
 /// Identical var text from a Go and from a Jinja caller is rendered again
@@ -1435,7 +1522,7 @@ fn a_reached_call_is_keyed_by_the_dialect_of_its_vars() {
 }
 
 /// A deferred call is followed as it runs on success; one depending on the
-/// exit code, or on a `CHECKSUM` its task's references change, is refused.
+/// exit code, or on `CHECKSUM`, is refused.
 #[test]
 fn deferred_calls_are_followed() {
     let dir = stage("ref_follows_runs/walk");
@@ -1449,9 +1536,9 @@ fn deferred_calls_are_followed() {
         ),
         (
             "deferred-checksum",
-            "task: deferred-checksum: sources: {task: on-checksum}: \"on-checksum\"'s deferred \
-             call \"z\" depends on CHECKSUM, which covers \"on-checksum\"'s own references only \
-             once they are resolved: list its targets with explicit `task:` entries\n",
+            "task: deferred-checksum: sources: {task: on-checksum}: cmds: template \
+             \"{{.CHECKSUM}}\" reads CHECKSUM: CHECKSUM is only available in commands, preconditions and the cache \
+             block, after setup\n",
         ),
     ] {
         let out = run(&dir, &[task]);
@@ -1617,18 +1704,19 @@ fn platform_pruning_does_not_depend_on_order() {
     assert_eq!(sources_of(&dir, "pruned-sh"), ["src/here.txt"]);
 }
 
-/// A deferred call using CHECKSUM in a task with references in `generates`
-/// is refused too, in both dialects: its final CHECKSUM covers them.
+/// A deferred call naming its target from CHECKSUM is refused too, in both
+/// dialects, with its references in `generates`.
 #[test]
-fn deferred_checksum_with_generates_references_is_refused() {
+fn deferred_call_naming_from_checksum_is_refused() {
     let dir = stage("ref_follows_runs/walk");
     for prefix in ["", "jin:"] {
         let out = run(&dir, &[&format!("{prefix}gen-checksum")]);
         assert_eq!(out.code, 1, "{prefix}: {}", out.combined());
         assert!(
-            out.stderr.contains(&format!(
-                "\"{prefix}on-gen-checksum\"'s deferred call \"{prefix}ck-name-"
-            )),
+            out.stderr.contains("ck-name-")
+                && out
+                    .stderr
+                    .contains("reads CHECKSUM: CHECKSUM is only available"),
             "{prefix}: {}",
             out.stderr
         );

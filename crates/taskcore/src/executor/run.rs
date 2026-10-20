@@ -476,11 +476,19 @@ impl Executor {
             );
         }
 
+        // A reached task's errors are named by the reference's chain; a
+        // wildcard task by the name it was called as.
+        let owner = match resolver {
+            None => "",
+            Some(_) if wildcards.is_empty() => orig.task.as_str(),
+            Some(_) => call.task.as_str(),
+        };
         let compiler = self.compiler();
         let (mut scratch, sink) = self.scratch_logger();
         let vars = compiler
             .get_variables(Some(&orig), Some(&call), evaluate_sh_vars, &mut scratch)
-            .await?;
+            .await
+            .map_err(|e| e.in_task(owner))?;
 
         let taskfile_env = self
             .taskfile
@@ -523,7 +531,7 @@ impl Executor {
             None => variables::reached_task(&orig, vars, &ctx, &compiler, &mut scratch).await,
         };
         self.flush_scratch(&sink);
-        Ok(result?)
+        Ok(result.map_err(|e| e.in_task(owner))?)
     }
 
     /// Queues a task on the runtime's local task set and returns its handle.
@@ -1295,7 +1303,11 @@ impl Executor {
         ancestors: &Ancestors,
     ) -> Option<ExecutorError> {
         let cmd = t.cmds.get(i)?;
-        let mut cache = TemplaterCache::new(t.vars.clone().unwrap_or_default());
+        let vars = t.vars.clone().unwrap_or_default();
+        // What it calls never sees CHECKSUM, as the compile checked.
+        let mut call_vars = vars.clone();
+        crate::compiler::set_pending_checksum(&mut call_vars);
+        let mut cache = TemplaterCache::new(vars);
         cache.set_dialect(t.dialect);
         let mut extra: indexmap::IndexMap<String, crate::yaml::Value> = indexmap::IndexMap::new();
         if exit_code > 0 {
@@ -1306,12 +1318,14 @@ impl Executor {
         }
         let mut rendered = cmd.clone();
         rendered.cmd = cache.replace_with_extra(&cmd.cmd, &extra);
-        rendered.task = cache.replace_with_extra(&cmd.task, &extra);
         rendered.if_ = cache.replace_with_extra(&cmd.if_, &extra);
+        let mut calls = TemplaterCache::new(call_vars);
+        calls.set_dialect(t.dialect);
+        rendered.task = calls.replace_with_extra(&cmd.task, &extra);
         rendered.vars = cmd
             .vars
             .as_ref()
-            .and_then(|v| cache.replace_vars_with_extra(v, &extra));
+            .and_then(|v| calls.replace_vars_with_extra(v, &extra));
 
         let mut task = t.clone();
         if let Some(slot) = task.cmds.get_mut(i) {

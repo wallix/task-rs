@@ -38,6 +38,18 @@ pub enum CompilerError {
     },
 }
 
+impl CompilerError {
+    /// Names `task` in a refused `CHECKSUM` read (see
+    /// [`TemplaterError::in_task`](crate::templater::TemplaterError::in_task)).
+    #[must_use]
+    pub fn in_task(self, task: &str) -> Self {
+        match self {
+            Self::Template(err) => Self::Template(err.in_task(task)),
+            other => other,
+        }
+    }
+}
+
 impl std::fmt::Display for CompilerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -148,6 +160,16 @@ impl Compiler {
                 },
             );
         }
+        // A run's compile refuses CHECKSUM where it cannot have a value; a fast
+        // one (`--list`, `--summary`, prompts) renders it empty there, whatever
+        // the environment holds.
+        if task.is_some() {
+            if evaluate_sh_vars {
+                set_pending_checksum(&mut result);
+            } else {
+                result.remove("CHECKSUM");
+            }
+        }
 
         // The task's directory, used when resolving that task's own vars so
         // dynamic vars run in the right place. Only needed with a task.
@@ -155,7 +177,7 @@ impl Compiler {
             Some(t) => {
                 let mut cache = Cache::new(result.clone());
                 cache.set_dialect(t.dialect);
-                let dirs = cache.replace_vec(&t.dirs);
+                let dirs = cache.field("dir").replace_vec(&t.dirs);
                 if let Some(err) = cache.err() {
                     return Err(CompilerError::Template(err.clone()));
                 }
@@ -172,28 +194,55 @@ impl Compiler {
         };
 
         // Apply the taskfile env then vars, resolved against the root dir.
+        // A task's CHECKSUM stays pending, whatever var of that name a layer
+        // sets.
+        let reserved = |k: &str| task.is_some() && k == "CHECKSUM";
         let taskfile_env = self.taskfile_env.clone();
-        for (k, v) in taskfile_env.all() {
-            self.range_var(&mut result, k, v, &self.dir, evaluate_sh_vars, logger)
-                .await?;
+        for (k, v) in taskfile_env.all().filter(|(k, _)| !reserved(k)) {
+            self.range_var(
+                &mut result,
+                "env",
+                k,
+                v,
+                &self.dir,
+                evaluate_sh_vars,
+                logger,
+            )
+            .await?;
         }
         let taskfile_vars = self.taskfile_vars.clone();
-        for (k, v) in taskfile_vars.all() {
-            self.range_var(&mut result, k, v, &self.dir, evaluate_sh_vars, logger)
-                .await?;
+        for (k, v) in taskfile_vars.all().filter(|(k, _)| !reserved(k)) {
+            self.range_var(
+                &mut result,
+                "vars",
+                k,
+                v,
+                &self.dir,
+                evaluate_sh_vars,
+                logger,
+            )
+            .await?;
         }
 
         if let Some(t) = task {
             if let Some(include_vars) = &t.include_vars {
-                for (k, v) in include_vars.all() {
-                    self.range_var(&mut result, k, v, &self.dir, evaluate_sh_vars, logger)
-                        .await?;
+                for (k, v) in include_vars.all().filter(|(k, _)| !reserved(k)) {
+                    self.range_var(
+                        &mut result,
+                        "vars",
+                        k,
+                        v,
+                        &self.dir,
+                        evaluate_sh_vars,
+                        logger,
+                    )
+                    .await?;
                 }
             }
             if let Some(included_vars) = &t.included_taskfile_vars {
                 let dir = task_dir.as_deref().unwrap_or(&self.dir);
-                for (k, v) in included_vars.all() {
-                    self.range_var(&mut result, k, v, dir, evaluate_sh_vars, logger)
+                for (k, v) in included_vars.all().filter(|(k, _)| !reserved(k)) {
+                    self.range_var(&mut result, "vars", k, v, dir, evaluate_sh_vars, logger)
                         .await?;
                 }
             }
@@ -203,27 +252,37 @@ impl Compiler {
             return Ok(result);
         };
 
-        for (k, v) in call.vars.all() {
-            self.range_var(&mut result, k, v, &self.dir, evaluate_sh_vars, logger)
-                .await?;
+        for (k, v) in call.vars.all().filter(|(k, _)| !reserved(k)) {
+            self.range_var(
+                &mut result,
+                "vars",
+                k,
+                v,
+                &self.dir,
+                evaluate_sh_vars,
+                logger,
+            )
+            .await?;
         }
         if let Some(task_vars) = &t.vars {
             let dir = task_dir.as_deref().unwrap_or(&self.dir);
-            for (k, v) in task_vars.all() {
-                self.range_var(&mut result, k, v, dir, evaluate_sh_vars, logger)
+            for (k, v) in task_vars.all().filter(|(k, _)| !reserved(k)) {
+                self.range_var(&mut result, "vars", k, v, dir, evaluate_sh_vars, logger)
                     .await?;
             }
         }
-
         Ok(result)
     }
 
     /// Resolves a single variable and stores it in `result`. Templating happens
     /// against the current `result`, so a var may reference earlier layers.
+    /// `layer` (`vars` or `env`) names where it is declared in errors.
     /// Ports the closure returned by Go `getRangeFunc`.
+    #[allow(clippy::too_many_arguments)]
     async fn range_var(
         &self,
         result: &mut Vars,
+        layer: &str,
         key: &str,
         var: &Var,
         dir: &str,
@@ -233,6 +292,7 @@ impl Compiler {
         // The variable renders in its own file's dialect, stamped at read time.
         let mut cache = Cache::new(result.clone());
         cache.set_dialect(var.dialect);
+        cache.field(format!("{layer}: {key}"));
         let new_var = cache.replace_var(var);
 
         // When not evaluating dynamic vars, store the static value (or an empty
@@ -401,6 +461,20 @@ impl Compiler {
         vars.push(("ALIAS".to_string(), alias));
         vars
     }
+}
+
+/// Sets a task's `CHECKSUM` to [`PENDING_CHECKSUM`](crate::templater::PENDING_CHECKSUM),
+/// which only its late fields may read until the run computes the value.
+pub(crate) fn set_pending_checksum(vars: &mut Vars) {
+    vars.set(
+        "CHECKSUM".to_string(),
+        Var {
+            value: Some(Value::String(
+                crate::templater::PENDING_CHECKSUM.to_string(),
+            )),
+            ..Default::default()
+        },
+    );
 }
 
 /// Splits a `KEY=VALUE` list into `(name, value)` pairs for the shell.

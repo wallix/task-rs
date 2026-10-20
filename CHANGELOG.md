@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Breaking: `CHECKSUM` is only available in commands, preconditions, the
+  cache block and group markers.** Command bodies and their `if:`, deferred
+  commands, `preconditions`, the cache block and templated `output:` group
+  markers may read it. Anything deciding what a task runs or reads now fails,
+  naming the task and field, where it used to render empty (as Go Task does)
+  or as the checksum of the task's own entries:
+  - Taskfile-level `vars` and `env`, which fails every task;
+  - task and include `vars`, `env` and `dotenv`;
+  - `dir`, `sources` and `generates` entries and their `vars`, `sandbox`
+    entries;
+  - `setup`, `deps`, and the task names, `vars` and `for:` of commands,
+    deferred ones included;
+  - the task-level `if:`, `run:`, `label`, `desc` and `prefix`.
+
+  `{{ debug() }}` in any of these fails too. `--summary` still renders
+  `CHECKSUM` empty there, a `ref: "."` capture leaves it out, and a var named
+  `CHECKSUM` is ignored.
 - **Templated `output:` group markers show a variable's value as is**, as
   commands do, instead of rendering template text it holds again.
 
