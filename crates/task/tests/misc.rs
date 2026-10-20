@@ -1049,6 +1049,25 @@ fn reference_fingerprints_are_stable() {
     }
 }
 
+/// Loops over a task's files, in its commands and deps, expand against the
+/// tree its setup left: they see the files setup made.
+#[test]
+fn file_loops_expand_after_setup() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  gen:\n    cmds: ['mkdir -p src && touch src/a.txt src/b.txt']\n  show-*:\n    cmds: ['echo dep={{index .MATCH 0}}']\n  build:\n    setup: [gen]\n    sources: ['src/*.txt']\n    deps:\n      - for: sources\n        task: 'show-{{.ITEM}}'\n    cmds:\n      - for: sources\n        cmd: 'echo cmd={{.ITEM}}'\n",
+    );
+    let out = run(&dir, &["build"]);
+    assert!(out.ok(), "{}", out.combined());
+    for line in [
+        "cmd=src/a.txt",
+        "cmd=src/b.txt",
+        "dep=src/a.txt",
+        "dep=src/b.txt",
+    ] {
+        assert!(out.stdout.contains(line), "{line}: {}", out.combined());
+    }
+}
+
 /// What decides what a task runs or reads cannot read CHECKSUM: a task var,
 /// a setup entry or a source reading it fails the task, naming the task and
 /// field and saying where it is available, and runs nothing.
@@ -1070,6 +1089,16 @@ fn checksum_outside_late_fields_is_refused() {
         (
             "env:\n      E: {sh: 'touch ran-env; echo {{.CHECKSUM}}'}\n    cmds: [echo ran]",
             "task: build: env: ",
+        ),
+        // Loops over files expand after setup; what they call is checked
+        // before it.
+        (
+            "setup: [x-a]\n    sources: ['*.yml']\n    cmds:\n      - for: sources\n        task: 'x-{{.CHECKSUM}}'",
+            "task: build: cmds: ",
+        ),
+        (
+            "setup: [x-a]\n    sources: ['*.yml']\n    deps:\n      - for: sources\n        task: x-b\n        vars: {A: '{{slice .ITEM 1}}', V: '{{.CHECKSUM}}'}",
+            "task: build: deps: ",
         ),
     ] {
         let dir = scratch(&format!(
@@ -1111,6 +1140,69 @@ fn summary_renders_a_refused_checksum_empty() {
     let out = run_with_env(&dir, &["--summary", "build"], &[("CHECKSUM", "env")]);
     assert!(out.ok(), "{}", out.combined());
     assert!(out.stdout.contains("d--\n"), "{}", out.combined());
+}
+
+/// A reference that fails to resolve is reported after setup, with the
+/// compile's message and exit code: for a `run: once` task, whose result is
+/// shared, and before a `requires` naming CHECKSUM, too.
+#[test]
+fn a_bad_reference_fails_after_setup() {
+    let dir = scratch(concat!(
+        "version: '3'\ntasks:\n  mk:\n    cmds: ['touch made']\n",
+        "  once:\n    run: once\n    setup: [mk]\n    sources: [{task: missing}]\n    cmds: [echo ran]\n",
+        "  req:\n    requires: {vars: [CHECKSUM]}\n    setup: [mk]\n    sources: [{task: missing}]\n    cmds: [echo ran]\n",
+        "  reqenum:\n    requires: {vars: [{name: CHECKSUM, enum: [x]}]}\n    setup: [mk]\n",
+        "    sources: [{task: missing}]\n    cmds: [echo ran]\n",
+    ));
+    for task in ["once", "req", "reqenum"] {
+        let _ = std::fs::remove_file(dir.join("made"));
+        let out = run(&dir, &[task]);
+        assert_eq!(out.code, 200, "{task}: {}", out.combined());
+        assert!(
+            out.stderr.contains(&format!(
+                "task: {task}: sources: task \"missing\" does not exist"
+            )),
+            "{task}: {}",
+            out.stderr
+        );
+        assert!(
+            !out.stderr.contains("Failed to run"),
+            "{task}: {}",
+            out.stderr
+        );
+        assert!(dir.join("made").exists(), "{task}: setup must run first");
+    }
+}
+
+/// A `requires` naming CHECKSUM fails a task without sources, which has none.
+#[test]
+fn requires_checksum_without_sources_is_missing() {
+    let dir = scratch(
+        "version: '3'\ntasks:\n  build:\n    requires: {vars: [CHECKSUM]}\n    cmds: [echo ran]\n",
+    );
+    let out = run(&dir, &["build"]);
+    assert_eq!(out.code, 206, "{}", out.combined());
+    assert!(
+        out.stderr.contains("missing required variables: CHECKSUM"),
+        "{}",
+        out.stderr
+    );
+}
+
+/// `--summary` does not resolve `task:` entries: that would run the `sh:`
+/// vars of the tasks they reach.
+#[test]
+fn summary_runs_no_shell_for_references() {
+    let dir = scratch(concat!(
+        "version: '3'\ntasks:\n  lib:\n    vars: {X: {sh: 'touch lib-ran'}}\n    sources: [l.txt]\n",
+        "  wide:\n    sources: [x.txt, {task: lib}]\n    cmds: ['echo W={{.CHECKSUM}}']\n",
+    ));
+    write(&dir, "x.txt", "x");
+    write(&dir, "l.txt", "l");
+    let out = run(&dir, &["--summary", "wide"]);
+    assert!(out.ok(), "{}", out.combined());
+    assert!(out.stdout.contains("echo W="), "{}", out.combined());
+    assert!(!dir.join("lib-ran").exists());
 }
 
 /// A var named CHECKSUM, at any level, is ignored: commands see the

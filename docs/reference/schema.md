@@ -472,6 +472,13 @@ fetching external inputs. Setup task outputs are **not** merged into the
 parent's fingerprint, and `from: deps` does not read `setup`; name the setup
 task in the parent's `sources` (`- task: generate-version`) if you need that.
 
+After setup, the parent expands `for:` loops over `sources` or `generates`
+in its commands and `deps`, then resolves its `from:` and `task:` entries.
+Its `{{.CHECKSUM}}`, cache key and build-once lock name share one hash of the
+sources setup left. A `setup:` entry's own loop over files expands before
+setup, against the current tree. Setup entries cannot read `{{.CHECKSUM}}`
+(see [`CHECKSUM`](templating.md#status-and-cache)).
+
 ```yaml
 tasks:
   build:
@@ -992,16 +999,10 @@ those of the tasks it runs or folds in, another folded task's or the referring
 task's. The referring task's own `exclude:` entries apply to everything it
 folds in, paths the folded task names without wildcards included.
 
-Entries folded in by `from:` or `task:` count for the up-to-date check and the
-cache, but two things in `cmds` see only the task's own entries:
-
-- `for: sources` and `for: generates` iterate the task's own entries; the
-  folded-in ones are left out.
-- `{{.CHECKSUM}}` in command bodies and conditions hashes the task's own
-  entries, so it does not change when a folded-in file does. Deferred
-  commands, `preconditions` and the cache block see the `{{.CHECKSUM}}` the
-  fingerprint records, which covers them (empty when they resolve to no
-  sources).
+Entries folded in by `from:` or `task:` count for the up-to-date check, the
+cache and `{{.CHECKSUM}}`, which covers them (empty when they resolve to no
+sources). `for: sources` and `for: generates` iterate the task's own entries
+only; the folded-in ones are left out.
 
 #### `sandbox`
 

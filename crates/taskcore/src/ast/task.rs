@@ -72,18 +72,40 @@ pub struct Task {
     /// The original unresolved command templates, set during compilation for
     /// stable checksumming independent of variable resolution.
     pub raw_cmds: Vec<Cmd>,
-    /// The checksum of sources + raw commands + generates, computed during
-    /// compilation when something reads the `CHECKSUM` variable it fills;
-    /// empty otherwise, for the run to compute (`ChecksumChecker::source_value`).
+    /// The checksum of sources + raw commands + generates, the `CHECKSUM`
+    /// variable. Never computed by compilation: the run sets it after setup
+    /// (`variables::finalize`), else the up-to-date check reads it
+    /// (`ChecksumChecker::source_value`).
     pub source_hash: String,
     /// Cache entry and build-once lock checksum: `source_hash` plus a digest of
     /// raw task and include `vars` (`hash::cache_checksum`). Set alongside
-    /// `source_hash` during compilation, so empty when that is.
+    /// `source_hash`, so empty when that is.
     pub cache_checksum: String,
     /// The vars digest `cache_checksum` appends to `source_hash`
-    /// (`hash::cache_vars_digest`), set during compilation even when the
-    /// source hash is left for the run to compute. Not part of the identity.
+    /// (`hash::cache_vars_digest`), set during compilation. Not part of the
+    /// identity.
     pub cache_vars_digest: String,
+    /// Whether a late field — a command body or condition, a precondition, the
+    /// cache block — reads `CHECKSUM`, rendered as
+    /// [`PENDING_CHECKSUM`](crate::templater::PENDING_CHECKSUM) until the run
+    /// computes the value. Not part of the identity.
+    pub reads_checksum: bool,
+    /// The commands whose body or condition reads `CHECKSUM`, as written, for
+    /// [`variables::finalize`](crate::variables::finalize) to render again.
+    /// Not part of the identity.
+    pub pending_cmds: Vec<PendingCmd>,
+}
+
+/// A compiled command whose body or condition reads `CHECKSUM`: its templates
+/// and the loop variables they rendered with.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PendingCmd {
+    /// The command's index in the compiled `cmds`.
+    pub index: usize,
+    pub cmd: String,
+    pub if_: String,
+    /// The `for:` loop's variables, empty outside a loop.
+    pub extra: indexmap::IndexMap<String, crate::yaml::Value>,
 }
 
 impl Task {

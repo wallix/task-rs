@@ -192,7 +192,9 @@ publish the resulting fingerprint or cache entry.
 `setup` is for preparation that must happen before the parent task is checked.
 Setup tasks run sequentially and unconditionally, even when the parent is
 already up to date. They do not become part of the parent's fingerprint; use
-`run: once` for setup shared by several tasks.
+`run: once` for setup shared by several tasks. The parent's `for:` loops over
+files and its `from:` and `task:` entries resolve after setup. Its `CHECKSUM`,
+cache key and build-once lock use the sources setup left.
 
 ```yaml
 version: '3'
@@ -348,10 +350,12 @@ v3 are intentional.
 - A glob ending in `/` matches directories only (a symlink to one is the
   entry), relative or absolute. Go Task drops the `/` from a relative entry
   when joining it to the task directory.
-- Only command bodies and their `if:`, deferred commands, `preconditions`,
-  the cache block and `output:` group markers may read `CHECKSUM`; vars
-  (Taskfile-level ones included), `env`, `sources`, `setup`, `deps`, the task
-  names and `vars` of commands and the like fail when they do.
+- `CHECKSUM` is computed once per run, after `setup`, over the task's final
+  sources, `from:` and `task:` entries included. Only command bodies and
+  their `if:`, deferred commands, `preconditions`, the cache block and
+  `output:` group markers may read it; vars (Taskfile-level ones included),
+  `env`, `sources`, `setup`, `deps`, the task names and `vars` of commands
+  and the like fail when they do.
 
 For release-specific compatibility notes, including migration fixes and known
 gaps, read the [changelog](CHANGELOG.md).

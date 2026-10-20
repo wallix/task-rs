@@ -18,13 +18,14 @@ use std::pin::Pin;
 use indexmap::IndexMap;
 
 use crate::ast::{
-    Caches, Cmd, Dep, Dialect, For, Glob, Location, Matrix, Precondition, Task, Var, Vars,
+    Caches, Cmd, Dep, Dialect, For, Glob, Location, Matrix, PendingCmd, Precondition, Task, Var,
+    Vars,
 };
 use crate::compiler::{Compiler, CompilerError};
 use crate::env;
 use crate::execext;
 use crate::filepathext;
-use crate::fingerprint::{self, ChecksumChecker};
+use crate::fingerprint;
 use crate::logger::Logger;
 use crate::templater::{Cache, TemplaterError};
 use crate::yaml::Value;
@@ -379,94 +380,15 @@ pub struct CompileContext<'a> {
     pub dir: &'a str,
     /// The taskfile-level environment variables (merged into the task env).
     pub taskfile_env: &'a Vars,
-    /// The directory used for fingerprint state (`TempDir.Fingerprint`).
-    pub fingerprint_temp_dir: &'a str,
     /// Whether task env vars override the inherited process environment.
     pub env_precedence: bool,
     /// The taskfile-level named cache models (`caches:`), for `cache.inherit`.
     pub caches: &'a Caches,
-    /// Compute `CHECKSUM` whenever the task has sources, as consumers outside
-    /// the task's own fields read it: `--summary` prints the compiled vars, and
-    /// templated `output:` group markers re-render them (see
-    /// [`ChecksumNeeds`]).
-    pub eager_checksum: bool,
 }
 
-/// Which compile phases need the sources checksum. Hashing a large tree is a
-/// whole pass over it, so a compile computes `CHECKSUM` only when something
-/// observes it; otherwise the run computes the value at its first consumer
-/// (the build-once lock, else the up-to-date check) and `CHECKSUM` stays
-/// unset.
-///
-/// The test is conservative: a false positive only costs the hash every
-/// compile used to compute. Only command bodies and conditions, deferred
-/// commands, preconditions and the cache block may read it: everything else
-/// renders it [pending](crate::templater::PENDING_CHECKSUM), an error.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ChecksumNeeds {
-    /// Read by what renders with the task's own entries' checksum (C1):
-    /// command bodies and conditions, a deferred one's in a `for:` loop
-    /// included (the loop branch renders it first).
-    pub early: bool,
-    /// Read by what renders with the final checksum (C2, widened by `from:`/
-    /// `task:` entries): preconditions, the cache block, deferred commands, and
-    /// the reach's rendering of a reached task's deferred calls.
-    pub last: bool,
-}
-
-/// Whether a raw field's text could read `CHECKSUM`: it names it, or calls
-/// Jinja's `debug()`, which dumps the whole context. Fields are scanned
-/// through their `Debug` form, which holds every string they carry.
-fn mentions_checksum(text: &str) -> bool {
-    text.contains("CHECKSUM") || text.contains("debug")
-}
-
-/// What in `t` observes `CHECKSUM`, by phase.
-pub(crate) fn checksum_needs(t: &Task, ctx: &CompileContext<'_>) -> ChecksumNeeds {
-    if t.sources.is_empty() {
-        return ChecksumNeeds::default();
-    }
-    if ctx.eager_checksum
-        // `requires` checks the compiled vars for it, and an `enum` its value.
-        || t.requires.as_ref().is_some_and(|r| mentions_checksum(&format!("{r:?}")))
-    {
-        return ChecksumNeeds {
-            early: true,
-            last: true,
-        };
-    }
-    let cmd_reads = |c: &crate::ast::Cmd| mentions_checksum(&c.cmd) || mentions_checksum(&c.if_);
-    let early = t
-        .cmds
-        .iter()
-        .filter(|c| !c.defer || c.for_.is_some())
-        .any(cmd_reads);
-    let cache_reads = t.cache.as_ref().is_some_and(|c| {
-        let model = (!c.inherit.is_empty())
-            .then(|| ctx.caches.get(&c.inherit))
-            .flatten();
-        // A vk model embeds the cache key, and with it the checksum, in its URL.
-        !c.vk.is_empty()
-            || model.is_some_and(|m| !m.vk.is_empty() || mentions_checksum(&format!("{m:?}")))
-            || mentions_checksum(&format!("{c:?}"))
-    });
-    let last = cache_reads
-        || t.preconditions
-            .iter()
-            .any(|p| mentions_checksum(&p.sh) || mentions_checksum(&p.msg))
-        || t.cmds.iter().filter(|c| c.defer).any(cmd_reads);
-    ChecksumNeeds { early, last }
-}
-
-/// Computes the cache key, converting hash errors to compile errors.
-fn cache_checksum(orig_task: &Task, source_hash: &str) -> Result<String, CompileError> {
-    crate::hash::cache_checksum(orig_task, source_hash).map_err(|e| CompileError::CacheKey {
-        task: orig_task.name().to_string(),
-        message: e.to_string(),
-    })
-}
-
-/// Compiles `orig_task` against `vars`, returning the fully-templated task.
+/// Compiles `orig_task` against `vars`, returning the fully-templated task,
+/// with `CHECKSUM` still [`PENDING_CHECKSUM`](crate::templater::PENDING_CHECKSUM):
+/// [`finalize`] sets it once the run has hashed the sources.
 ///
 /// When `evaluate_sh_vars` is true, dynamic env vars are resolved (running
 /// shells via `compiler`); otherwise they are left for later. Ports Go
@@ -479,32 +401,20 @@ pub async fn compiled_task(
     ctx: &CompileContext<'_>,
     compiler: &Compiler,
     logger: &mut Logger,
-    resolver: Option<&dyn TaskResolver>,
 ) -> Result<Task, CompileError> {
-    let needs = checksum_needs(orig_task, ctx);
-    let widens = evaluate_sh_vars
-        && resolver.is_some()
-        && (has_from_entries(&orig_task.sources) || has_from_entries(&orig_task.generates));
-    let (mut new, mut vars, mut cache) = compile_run(
+    let (new, cache) = compile_run(
         orig_task,
         vars,
         evaluate_sh_vars,
         ctx,
         compiler,
         logger,
-        needs,
-        widens,
+        true,
     )
     .await?;
-
-    // Resolve `from:` and `task:` entries in sources/generates/sandbox.writes,
-    // recomputing the checksum if sources or generates were extended. Not
-    // without `sh:` vars: a name templated from one renders empty, and no
-    // fast-compile consumer (platforms, requires, deps, prompt, summary) reads
-    // the globs.
+    // A `task:` name that renders empty would otherwise read as a plain glob
+    // matching the task dir.
     if evaluate_sh_vars {
-        // A `task:` name that renders empty would otherwise read as a plain
-        // glob matching the task dir.
         check_task_references(&new, "sources", &orig_task.sources, &new.sources)?;
         check_task_references(&new, "generates", &orig_task.generates, &new.generates)?;
         if let (Some(orig), Some(rendered)) = (&orig_task.sandbox, &new.sandbox) {
@@ -516,73 +426,160 @@ pub async fn compiled_task(
             )?;
         }
     }
-    let writes = new
+    finish_compile(orig_task, new, evaluate_sh_vars, ctx, cache)
+}
+
+/// Completes `t`, compiled from `orig_task` by [`compiled_task`], against the
+/// tree as it is — for a run, the one setup left: expands the `for:` loops
+/// over `sources` or `generates` it left, then resolves `from:` and `task:`
+/// entries in sources/generates/sandbox.writes through `resolver`. Not without
+/// `sh:` vars: a name templated from one renders empty, and no fast-compile
+/// consumer reads the globs.
+pub async fn resolve(
+    orig_task: &Task,
+    mut t: Task,
+    evaluate_sh_vars: bool,
+    resolver: &dyn TaskResolver,
+) -> Result<Task, CompileError> {
+    expand_tree_loops(&mut t, true, evaluate_sh_vars)?;
+    let writes = t
         .sandbox
         .as_ref()
         .is_some_and(|s| !s.write_tasks.is_empty());
-    let references = has_from_entries(&new.sources) || has_from_entries(&new.generates);
-    // A template error so far is reported before the templater is replaced
-    // below, which would drop it. Only then: otherwise a cache block error
-    // still comes first, as before.
-    if evaluate_sh_vars
-        && (references || writes)
-        && let Some(err) = cache.err()
-    {
-        return Err(CompileError::Template(err.clone()));
+    let references = has_from_entries(&t.sources) || has_from_entries(&t.generates);
+    if !evaluate_sh_vars || !(references || writes) {
+        return Ok(t);
     }
-    if let Some(resolver) = resolver.filter(|_| evaluate_sh_vars && (references || writes)) {
-        let mut reach = crate::reach::Reach::new(resolver, &new);
-        if has_from_entries(&new.sources) {
-            new.sources = reach.globs(&new, orig_task, false).await?;
+    let mut reach = crate::reach::Reach::new(resolver, &t);
+    if has_from_entries(&t.sources) {
+        t.sources = reach.globs(&t, orig_task, false).await?;
+    }
+    if has_from_entries(&t.generates) {
+        t.generates = reach.globs(&t, orig_task, true).await?;
+    }
+    // Only a task about to run needs these grants, but resolved on every full
+    // compile, sandboxing on or off, so bad references fail alike.
+    if writes {
+        let grants = reach.writes(&t).await?;
+        if let Some(s) = &mut t.sandbox {
+            s.task_grants = grants;
         }
-        if has_from_entries(&new.generates) {
-            new.generates = reach.globs(&new, orig_task, true).await?;
-        }
-        // Only a task about to run needs these grants, but resolved on every
-        // full compile, sandboxing on or off, so bad references fail alike.
-        if writes {
-            let grants = reach.writes(&new).await?;
-            if let Some(s) = &mut new.sandbox {
-                s.task_grants = grants;
+    }
+    Ok(t)
+}
+
+/// Whether a `for:` loop iterates files: `sources` or `generates`, which only
+/// the tree a run hashes can tell.
+fn reads_tree(f: &For) -> bool {
+    f.matrix.as_ref().is_none_or(Matrix::is_empty)
+        && f.list.is_empty()
+        && (f.from == "sources" || f.from == "generates")
+}
+
+/// Expands the `for:` loops [`compile_run`] left in `t`'s commands and deps,
+/// those over files (see [`reads_tree`]), against the tree as it is. With
+/// `late`, the bodies and conditions of the commands they make render too.
+fn expand_tree_loops(t: &mut Task, late: bool, evaluate_sh_vars: bool) -> Result<(), CompileError> {
+    let cmd_loops = t.cmds.iter().any(|c| c.for_.is_some());
+    let dep_loops = t.deps.iter().any(|d| d.for_.is_some());
+    if !cmd_loops && !dep_loops {
+        return Ok(());
+    }
+    let vars = t.vars.clone().unwrap_or_default();
+    let mut cache = Cache::new(vars.clone());
+    cache.set_dialect(t.dialect);
+    cache.set_lenient(!evaluate_sh_vars);
+    if cmd_loops {
+        cache.field("cmds");
+        let old = std::mem::take(&mut t.cmds);
+        let mut moved = Vec::with_capacity(old.len());
+        let mut cmds = Vec::with_capacity(old.len());
+        let mut pending = Vec::new();
+        for cmd in &old {
+            moved.push(cmds.len());
+            match &cmd.for_ {
+                Some(for_) => expand_cmd_loop(
+                    cmd,
+                    for_,
+                    t,
+                    &vars,
+                    &mut cache,
+                    late,
+                    &mut cmds,
+                    &mut pending,
+                )?,
+                None => cmds.push(cmd.clone()),
             }
         }
-        // The resolved entries feed the checksum: sources as files and rules,
-        // generates as rules. Cleared first, as the checker would reuse it;
-        // empty when the references resolved to no sources. Without sources
-        // there was no eager one to replace.
-        let widened =
-            has_from_entries(&orig_task.sources) || has_from_entries(&orig_task.generates);
-        if widened && !orig_task.sources.is_empty() {
-            // A C1 computed for the commands is not the final value: leave
-            // that to the run unless something here reads it.
-            new.source_hash.clear();
-            new.cache_checksum.clear();
+        for p in &mut t.pending_cmds {
+            p.index = moved.get(p.index).copied().unwrap_or(p.index);
         }
-        if widened && needs.last {
-            let mut checker = ChecksumChecker::new(ctx.fingerprint_temp_dir, new.clone());
-            let source_hash = checker.source_value().await.to_string();
-            new.cache_checksum = cache_checksum(orig_task, &source_hash)?;
-            new.source_hash = source_hash.clone();
-            vars.set(
-                "CHECKSUM".to_string(),
-                Var {
-                    value: Some(Value::String(source_hash)),
-                    ..Default::default()
-                },
-            );
-            new.vars = Some(vars.clone());
-            cache.set_vars(vars.clone());
+        t.reads_checksum |= !pending.is_empty();
+        t.pending_cmds.extend(pending);
+        t.cmds = cmds;
+    }
+    if dep_loops {
+        cache.field("deps");
+        let old = std::mem::take(&mut t.deps);
+        let mut deps = Vec::with_capacity(old.len());
+        for dep in &old {
+            match &dep.for_ {
+                Some(for_) => expand_dep_loop(dep, for_, t, &vars, &mut cache, &mut deps)?,
+                None => deps.push(dep.clone()),
+            }
+        }
+        t.deps = deps;
+    }
+    match cache.err() {
+        Some(err) if evaluate_sh_vars => Err(CompileError::Template(err.clone())),
+        _ => Ok(()),
+    }
+}
+
+/// Sets `t`'s `CHECKSUM` and cache key from `source_hash`, read after setup.
+/// Re-renders command bodies and conditions that read the pending value,
+/// preconditions and the cache block, whose `vk:` URLs carry the key.
+/// An empty `source_hash` (no sources or no reader) leaves `CHECKSUM` unset.
+/// `t` is `orig_task` compiled by [`compiled_task`].
+pub fn finalize(
+    orig_task: &Task,
+    mut t: Task,
+    source_hash: &str,
+    evaluate_sh_vars: bool,
+    ctx: &CompileContext<'_>,
+) -> Result<Task, CompileError> {
+    t.source_hash = source_hash.to_string();
+    t.cache_checksum = crate::hash::join_cache_checksum(source_hash, &t.cache_vars_digest);
+    let mut vars = t.vars.take().unwrap_or_default();
+    if source_hash.is_empty() {
+        vars.remove("CHECKSUM");
+    } else {
+        vars.set(
+            "CHECKSUM".to_string(),
+            Var {
+                value: Some(Value::String(source_hash.to_string())),
+                ..Default::default()
+            },
+        );
+    }
+    t.vars = Some(vars.clone());
+    let mut cache = Cache::new(vars);
+    cache.set_dialect(orig_task.dialect);
+    for p in std::mem::take(&mut t.pending_cmds) {
+        if let Some(cmd) = t.cmds.get_mut(p.index) {
+            cmd.cmd = cache.replace_with_extra(&p.cmd, &p.extra);
+            cmd.if_ = cache.replace_with_extra(&p.if_, &p.extra);
         }
     }
-
-    finish_compile(orig_task, new, evaluate_sh_vars, ctx, cache)
+    finish_compile(orig_task, t, evaluate_sh_vars, ctx, cache)
 }
 
 /// Compiles a task a `from:` or `task:` entry reaches, as running it would up
 /// to its `setup` and `deps`, the steps that decide what it runs: variables
-/// (`sh:` ones included), dotenv, env, the `CHECKSUM` of its own entries,
-/// commands and `for:` loops. Its references, preconditions and cache block
-/// are left alone, so only template errors there do not fail it.
+/// (`sh:` ones included), dotenv, env, and the calls of its commands and
+/// `for:` loops, those over files expanded against the tree as it is. Its
+/// command bodies and conditions, references, preconditions and cache block
+/// are left alone, so template errors there do not fail it.
 pub async fn reached_task(
     orig_task: &Task,
     vars: Vars,
@@ -590,38 +587,34 @@ pub async fn reached_task(
     compiler: &Compiler,
     logger: &mut Logger,
 ) -> Result<Task, CompileError> {
-    let needs = checksum_needs(orig_task, ctx);
-    let (new, _, cache) =
-        compile_run(orig_task, vars, true, ctx, compiler, logger, needs, false).await?;
+    let (mut new, cache) = compile_run(orig_task, vars, true, ctx, compiler, logger, false).await?;
     if let Some(err) = cache.err() {
         return Err(CompileError::Template(err.clone()));
     }
+    expand_tree_loops(&mut new, false, true)?;
     Ok(new)
 }
 
 /// The part of [`compiled_task`] a run needs to know what it runs: everything
-/// up to `setup` and `deps`. Returns the task, its vars (`CHECKSUM` included)
-/// and the templater holding them.
-///
-/// `needs` says which phases read `CHECKSUM`; `widens` that references will
-/// widen the sources afterwards, making the value computed here (C1) final
-/// only for the commands.
-#[allow(clippy::too_many_arguments)]
+/// up to `setup` and `deps`. Returns the task and the templater holding its
+/// vars. With `late`, command bodies and conditions are rendered too, those
+/// reading the pending `CHECKSUM` noted in `pending_cmds`; without, they are
+/// left as written.
 async fn compile_run(
     orig_task: &Task,
-    mut vars: Vars,
+    vars: Vars,
     evaluate_sh_vars: bool,
     ctx: &CompileContext<'_>,
     compiler: &Compiler,
     logger: &mut Logger,
-    needs: ChecksumNeeds,
-    widens: bool,
-) -> Result<(Task, Vars, Cache), CompileError> {
+    late: bool,
+) -> Result<(Task, Cache), CompileError> {
     // Substitute captured wildcards from a `MATCH` var into the task name.
     let full_name = compute_full_name(orig_task, &vars);
 
     let mut cache = Cache::new(vars.clone());
     cache.set_dialect(orig_task.dialect);
+    cache.set_lenient(!evaluate_sh_vars);
     let mut new = Task {
         task: orig_task.task.clone(),
         label: cache.field("label").replace(&orig_task.label),
@@ -768,130 +761,254 @@ async fn compile_run(
             })?;
     }
 
-    // What a command, a dep or a setup entry calls renders with CHECKSUM
-    // pending: reading it there is an error.
-    let call_vars = vars.clone();
-    let mut calls = Cache::new(call_vars.clone());
-    calls.set_dialect(orig_task.dialect);
-    calls.field("cmds");
-
-    // Compute the source checksum from the unresolved commands, so CHECKSUM is
-    // available before cmd/cache resolution, when something reads it: the
-    // commands, or a final consumer that no widening will recompute it for.
-    // Otherwise it is unset, as before. The templater keeps the errors so far.
-    if !orig_task.sources.is_empty() && (needs.early || (needs.last && !widens)) {
-        let mut checker = ChecksumChecker::new(ctx.fingerprint_temp_dir, new.clone());
-        let source_hash = checker.source_value().await.to_string();
-        new.cache_checksum = cache_checksum(orig_task, &source_hash)?;
-        new.source_hash = source_hash.clone();
-        vars.set(
-            "CHECKSUM".to_string(),
-            Var {
-                value: Some(Value::String(source_hash)),
-                ..Default::default()
-            },
-        );
-    } else {
-        vars.remove("CHECKSUM");
-    }
-    new.vars = Some(vars.clone());
-    cache.set_vars(vars.clone());
-    // Command bodies and conditions may read it.
-    cache.set_late(true);
-
     // Resolve commands, expanding `for` loops and copying deferred commands.
+    // What a command calls renders now; its body and condition may read
+    // CHECKSUM, rendered pending and noted for `finalize`.
+    cache.field("cmds");
     if !orig_task.cmds.is_empty() {
         let mut cmds = Vec::with_capacity(orig_task.cmds.len());
+        let mut pending = Vec::new();
         for cmd in &orig_task.cmds {
             if let Some(for_) = &cmd.for_ {
-                let (list, keys) = items_from_for(
-                    for_,
-                    &new.compute_dir().to_string_lossy(),
-                    &new.sources,
-                    &new.generates,
-                    Some(&call_vars),
-                    orig_task.location.as_ref(),
-                    &mut calls,
-                )?;
-                let as_ = if for_.as_.is_empty() {
-                    "ITEM"
+                if reads_tree(for_) {
+                    // Expanded against the tree a run hashes, by `resolve`.
+                    cmds.push(cmd.clone());
                 } else {
-                    &for_.as_
-                };
-                for (i, loop_value) in list.iter().enumerate() {
-                    let extra = for_extra(as_, loop_value, &keys, i);
-                    let mut new_cmd = cmd.clone();
-                    new_cmd.for_ = None;
-                    new_cmd.cmd = cache.replace_with_extra(&cmd.cmd, &extra);
-                    new_cmd.task = calls.replace_with_extra(&cmd.task, &extra);
-                    new_cmd.if_ = cache.replace_with_extra(&cmd.if_, &extra);
-                    new_cmd.vars = calls
-                        .replace_vars_with_extra(cmd.vars.as_ref().unwrap_or(&Vars::new()), &extra);
-                    cmds.push(new_cmd);
+                    expand_cmd_loop(
+                        cmd,
+                        for_,
+                        &new,
+                        &vars,
+                        &mut cache,
+                        late,
+                        &mut cmds,
+                        &mut pending,
+                    )?;
                 }
                 continue;
             }
             if cmd.defer {
-                // Deferred commands are templated lazily so EXIT_CODE is known;
-                // what one calls cannot read CHECKSUM, checked now.
-                if evaluate_sh_vars {
-                    check_deferred_call(cmd, &call_vars, orig_task.dialect)
+                // Deferred commands are templated lazily so EXIT_CODE is known.
+                if late && evaluate_sh_vars {
+                    new.reads_checksum |= check_deferred(cmd, &vars, orig_task.dialect)
                         .map_err(CompileError::Template)?;
                 }
                 cmds.push(cmd.clone());
                 continue;
             }
             let mut new_cmd = cmd.clone();
-            new_cmd.cmd = cache.replace(&cmd.cmd);
-            new_cmd.task = calls.replace(&cmd.task);
-            new_cmd.if_ = cache.replace(&cmd.if_);
-            new_cmd.vars = cmd.vars.as_ref().and_then(|v| calls.replace_vars(v));
+            new_cmd.task = cache.replace(&cmd.task);
+            new_cmd.vars = cmd.vars.as_ref().and_then(|v| cache.replace_vars(v));
+            if late {
+                render_late_cmd(
+                    &mut cache,
+                    cmd,
+                    &mut new_cmd,
+                    &IndexMap::new(),
+                    cmds.len(),
+                    &mut pending,
+                );
+            }
             cmds.push(new_cmd);
         }
         new.cmds = cmds;
+        new.reads_checksum |= !pending.is_empty();
+        new.pending_cmds = pending;
     }
 
-    calls.field("setup");
-    new.setup = compile_deps(
-        &orig_task.setup,
-        &new,
-        &call_vars,
-        orig_task.location.as_ref(),
-        &mut calls,
-    )?;
-    calls.field("deps");
-    new.deps = compile_deps(
-        &orig_task.deps,
-        &new,
-        &call_vars,
-        orig_task.location.as_ref(),
-        &mut calls,
-    )?;
-    if evaluate_sh_vars && let Some(err) = calls.err() {
-        return Err(CompileError::Template(err.clone()));
+    // Setup runs before the tree is final: its loops expand against the tree
+    // as it is. A dep's loop over files waits for `resolve`.
+    cache.field("setup");
+    new.setup = compile_deps(&orig_task.setup, &new, &vars, &mut cache, false)?;
+    cache.field("deps");
+    new.deps = compile_deps(&orig_task.deps, &new, &vars, &mut cache, true)?;
+    if evaluate_sh_vars {
+        let cmd_loops = orig_task.cmds.iter().filter_map(|c| {
+            let f = c.for_.as_ref().filter(|f| reads_tree(f))?;
+            Some(("cmds", f, &c.task, c.vars.as_ref()))
+        });
+        let dep_loops = orig_task.deps.iter().filter_map(|d| {
+            let f = d.for_.as_ref().filter(|f| reads_tree(f))?;
+            Some(("deps", f, &d.task, d.vars.as_ref()))
+        });
+        for (field, for_, task, call_vars) in cmd_loops.chain(dep_loops) {
+            check_tree_loop(field, for_, task, call_vars, &vars, orig_task.dialect)
+                .map_err(CompileError::Template)?;
+        }
     }
-    Ok((new, vars, cache))
+    Ok((new, cache))
 }
 
-/// Checks what a deferred command calls, which renders only when it runs:
-/// it cannot read `CHECKSUM`. Other errors wait for the run, which knows
-/// `EXIT_CODE`.
-fn check_deferred_call(cmd: &Cmd, vars: &Vars, dialect: Dialect) -> Result<(), TemplaterError> {
+/// Checks what a loop over files calls, which renders only once `resolve`
+/// expands it after setup: it cannot read `CHECKSUM`, refused before setup.
+/// Its item and `KEY` render empty; other errors wait for the expansion. Each
+/// string renders on its own, so one failing on the empty item hides no read.
+fn check_tree_loop(
+    field: &str,
+    for_: &For,
+    task: &str,
+    call_vars: Option<&Vars>,
+    vars: &Vars,
+    dialect: Dialect,
+) -> Result<(), TemplaterError> {
+    let as_ = if for_.as_.is_empty() {
+        "ITEM"
+    } else {
+        &for_.as_
+    };
+    let extra = for_extra(as_, &Value::String(String::new()), &[String::new()], 0);
+    let check = |render: &dyn Fn(&mut Cache)| {
+        let mut cache = Cache::new(vars.clone());
+        cache.set_dialect(dialect);
+        cache.field(field);
+        render(&mut cache);
+        match cache.err() {
+            Some(err @ TemplaterError::ChecksumUnavailable { .. }) => Err(err.clone()),
+            _ => Ok(()),
+        }
+    };
+    check(&|c| {
+        c.replace_with_extra(task, &extra);
+    })?;
+    for (k, v) in call_vars.into_iter().flat_map(Vars::all) {
+        let mut one = Vars::new();
+        one.set(k.clone(), v.clone());
+        check(&|c| {
+            c.replace_vars_with_extra(&one, &extra);
+        })?;
+    }
+    Ok(())
+}
+
+/// Expands the `for:` loop of `cmd` into `cmds`: what each iteration calls
+/// renders now, and with `late` its body and condition, those reading the
+/// pending `CHECKSUM` noted in `pending`. `task` gives the directory and the
+/// task's own `sources` and `generates`.
+#[allow(clippy::too_many_arguments)]
+fn expand_cmd_loop(
+    cmd: &Cmd,
+    for_: &For,
+    task: &Task,
+    vars: &Vars,
+    cache: &mut Cache,
+    late: bool,
+    cmds: &mut Vec<Cmd>,
+    pending: &mut Vec<PendingCmd>,
+) -> Result<(), CompileError> {
+    let (list, keys) = items_from_for(
+        for_,
+        &task.compute_dir().to_string_lossy(),
+        &task.sources,
+        &task.generates,
+        Some(vars),
+        task.location.as_ref(),
+        cache,
+    )?;
+    let as_ = if for_.as_.is_empty() {
+        "ITEM"
+    } else {
+        &for_.as_
+    };
+    for (i, loop_value) in list.iter().enumerate() {
+        let extra = for_extra(as_, loop_value, &keys, i);
+        let mut new_cmd = cmd.clone();
+        new_cmd.for_ = None;
+        new_cmd.task = cache.replace_with_extra(&cmd.task, &extra);
+        new_cmd.vars =
+            cache.replace_vars_with_extra(cmd.vars.as_ref().unwrap_or(&Vars::new()), &extra);
+        if late {
+            render_late_cmd(cache, cmd, &mut new_cmd, &extra, cmds.len(), pending);
+        }
+        cmds.push(new_cmd);
+    }
+    Ok(())
+}
+
+/// Expands the `for:` loop of `dep` into `deps`, as [`expand_cmd_loop`] does
+/// for a command.
+fn expand_dep_loop(
+    dep: &Dep,
+    for_: &For,
+    task: &Task,
+    vars: &Vars,
+    cache: &mut Cache,
+    deps: &mut Vec<Dep>,
+) -> Result<(), CompileError> {
+    let (list, keys) = items_from_for(
+        for_,
+        &task.compute_dir().to_string_lossy(),
+        &task.sources,
+        &task.generates,
+        Some(vars),
+        task.location.as_ref(),
+        cache,
+    )?;
+    let as_ = if for_.as_.is_empty() {
+        "ITEM"
+    } else {
+        &for_.as_
+    };
+    for (i, loop_value) in list.iter().enumerate() {
+        let extra = for_extra(as_, loop_value, &keys, i);
+        let mut new_dep = dep.clone();
+        new_dep.for_ = None;
+        new_dep.task = cache.replace_with_extra(&dep.task, &extra);
+        new_dep.vars =
+            cache.replace_vars_with_extra(dep.vars.as_ref().unwrap_or(&Vars::new()), &extra);
+        deps.push(new_dep);
+    }
+    Ok(())
+}
+
+/// Renders a command's body and condition from `raw`, the late fields, which
+/// may read the pending `CHECKSUM`: a command that does is noted in `pending`
+/// at `index`, for [`finalize`].
+fn render_late_cmd(
+    cache: &mut Cache,
+    raw: &Cmd,
+    rendered: &mut Cmd,
+    extra: &IndexMap<String, Value>,
+    index: usize,
+    pending: &mut Vec<PendingCmd>,
+) {
+    cache.set_late(true);
+    rendered.cmd = cache.replace_with_extra(&raw.cmd, extra);
+    rendered.if_ = cache.replace_with_extra(&raw.if_, extra);
+    cache.set_late(false);
+    if cache.take_read_checksum() {
+        pending.push(PendingCmd {
+            index,
+            cmd: raw.cmd.clone(),
+            if_: raw.if_.clone(),
+            extra: extra.clone(),
+        });
+    }
+}
+
+/// Checks a deferred command, which renders only when it runs: what it calls
+/// cannot read `CHECKSUM`. Returns whether its body or condition reads it.
+/// Other errors wait for the run, which knows `EXIT_CODE`.
+fn check_deferred(cmd: &Cmd, vars: &Vars, dialect: Dialect) -> Result<bool, TemplaterError> {
     let mut cache = Cache::new(vars.clone());
     cache.set_dialect(dialect);
     cache.field("cmds").replace(&cmd.task);
     if let Some(v) = &cmd.vars {
         cache.replace_vars(v);
     }
-    match cache.err() {
-        Some(err @ TemplaterError::ChecksumUnavailable { .. }) => Err(err.clone()),
-        _ => Ok(()),
+    if let Some(err @ TemplaterError::ChecksumUnavailable { .. }) = cache.err() {
+        return Err(err.clone());
     }
+    let mut cache = Cache::new(vars.clone());
+    cache.set_dialect(dialect);
+    cache.set_late(true);
+    cache.replace(&cmd.cmd);
+    cache.replace(&cmd.if_);
+    Ok(cache.take_read_checksum())
 }
 
 /// The rest of [`compiled_task`], once references are resolved:
-/// preconditions, the cache block and the checks on it. Both may read
-/// `CHECKSUM`.
+/// preconditions, the cache block and the checks on it. Both are late fields,
+/// rendered again by [`finalize`].
 fn finish_compile(
     orig_task: &Task,
     mut new: Task,
@@ -1025,6 +1142,7 @@ fn finish_compile(
         }
         new.cache = Some(resolved);
     }
+    new.reads_checksum |= cache.take_read_checksum();
 
     // Reject cached tasks whose generates escape the project root — such a path
     // would write outside the archive on extraction.
@@ -1332,13 +1450,14 @@ fn product(matrix: &Matrix) -> Vec<crate::yaml::Mapping> {
 }
 
 /// Resolves templates and `for` loops in a list of deps (used for both `setup`
-/// and `deps`). Ports Go `compileDeps`.
+/// and `deps`). With `tree_loops`, a loop over files (see [`reads_tree`]) is
+/// left for [`resolve`]. Ports Go `compileDeps`.
 fn compile_deps(
     deps: &[Dep],
     task: &Task,
     vars: &Vars,
-    location: Option<&Location>,
     cache: &mut Cache,
+    tree_loops: bool,
 ) -> Result<Vec<Dep>, CompileError> {
     if deps.is_empty() {
         return Ok(Vec::new());
@@ -1346,28 +1465,10 @@ fn compile_deps(
     let mut result = Vec::with_capacity(deps.len());
     for dep in deps {
         if let Some(for_) = &dep.for_ {
-            let (list, keys) = items_from_for(
-                for_,
-                &task.compute_dir().to_string_lossy(),
-                &task.sources,
-                &task.generates,
-                Some(vars),
-                location,
-                cache,
-            )?;
-            let as_ = if for_.as_.is_empty() {
-                "ITEM"
+            if tree_loops && reads_tree(for_) {
+                result.push(dep.clone());
             } else {
-                &for_.as_
-            };
-            for (i, loop_value) in list.iter().enumerate() {
-                let extra = for_extra(as_, loop_value, &keys, i);
-                let mut new_dep = dep.clone();
-                new_dep.for_ = None;
-                new_dep.task = cache.replace_with_extra(&dep.task, &extra);
-                new_dep.vars = cache
-                    .replace_vars_with_extra(dep.vars.as_ref().unwrap_or(&Vars::new()), &extra);
-                result.push(new_dep);
+                expand_dep_loop(dep, for_, task, vars, cache, &mut result)?;
             }
             continue;
         }
@@ -1454,24 +1555,25 @@ mod tests {
         )
     }
 
-    fn ctx<'a>(taskfile_env: &'a Vars, tmp: &'a str) -> CompileContext<'a> {
+    fn ctx(taskfile_env: &Vars) -> CompileContext<'_> {
         static EMPTY: std::sync::LazyLock<Caches> = std::sync::LazyLock::new(Caches::default);
-        ctx_with_caches(taskfile_env, tmp, &EMPTY)
+        ctx_with_caches(taskfile_env, &EMPTY)
     }
 
-    fn ctx_with_caches<'a>(
-        taskfile_env: &'a Vars,
-        tmp: &'a str,
-        caches: &'a Caches,
-    ) -> CompileContext<'a> {
+    fn ctx_with_caches<'a>(taskfile_env: &'a Vars, caches: &'a Caches) -> CompileContext<'a> {
         CompileContext {
             dir: "",
             taskfile_env,
-            fingerprint_temp_dir: tmp,
             env_precedence: false,
             caches,
-            eager_checksum: false,
         }
+    }
+
+    /// `t`, compiled from `orig`, finalized as a run would once it hashed the
+    /// sources to `HASH`.
+    const HASH: &str = "0123456789abcdef0123456789abcdef";
+    fn finalized(orig: &Task, t: Task, ctx: &CompileContext<'_>) -> Task {
+        finalize(orig, t, HASH, true, ctx).unwrap()
     }
 
     fn string_var(v: &str) -> Var {
@@ -1515,9 +1617,8 @@ mod tests {
         let env = Vars::new();
         let c = compiler();
         let mut logger = silent_logger();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-        let ctx = ctx_with_caches(&env, &tmp, &caches);
-        let out = compiled_task(&orig, Vars::new(), true, &ctx, &c, &mut logger, None)
+        let ctx = ctx_with_caches(&env, &caches);
+        let out = compiled_task(&orig, Vars::new(), true, &ctx, &c, &mut logger)
             .await
             .unwrap();
         let cache = out.cache.unwrap();
@@ -1573,9 +1674,8 @@ mod tests {
         let env = Vars::new();
         let c = compiler();
         let mut logger = silent_logger();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-        let ctx = ctx_with_caches(&env, &tmp, &caches);
-        let out = compiled_task(&orig, vars, true, &ctx, &c, &mut logger, None)
+        let ctx = ctx_with_caches(&env, &caches);
+        let out = compiled_task(&orig, vars, true, &ctx, &c, &mut logger)
             .await
             .unwrap();
         let cache = out.cache.unwrap();
@@ -1640,15 +1740,14 @@ mod tests {
         let env = Vars::new();
         let c = compiler();
         let mut logger = silent_logger();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-        let ctx = ctx_with_caches(&env, &tmp, &caches);
-        let out = compiled_task(&orig, vk_vars(), true, &ctx, &c, &mut logger, None)
+        let ctx = ctx_with_caches(&env, &caches);
+        let out = compiled_task(&orig, vk_vars(), true, &ctx, &c, &mut logger)
             .await
             .unwrap();
-        let hash = out.source_hash.clone();
+        let out = finalized(&orig, out, &ctx);
         let key = out.cache_checksum.clone();
-        assert!(!hash.is_empty());
-        assert!(key.starts_with(&format!("{hash}-")), "{key}");
+        assert_eq!(out.source_hash, HASH);
+        assert!(key.starts_with(&format!("{HASH}-")), "{key}");
         let cache = out.cache.unwrap();
         assert_eq!(cache.vk, "reg.example/task-cache");
         assert_eq!(cache.api_key, "vkr_k");
@@ -1680,14 +1779,15 @@ mod tests {
         let env = Vars::new();
         let c = compiler();
         let mut logger = silent_logger();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-        let ctx = ctx_with_caches(&env, &tmp, &caches);
-        let a = compiled_task(&direct, vk_vars(), true, &ctx, &c, &mut logger, None)
+        let ctx = ctx_with_caches(&env, &caches);
+        let a = compiled_task(&direct, vk_vars(), true, &ctx, &c, &mut logger)
             .await
             .unwrap();
-        let b = compiled_task(&nested, vk_vars(), true, &ctx, &c, &mut logger, None)
+        let a = finalized(&direct, a, &ctx);
+        let b = compiled_task(&nested, vk_vars(), true, &ctx, &c, &mut logger)
             .await
             .unwrap();
+        let b = finalized(&nested, b, &ctx);
         let key = a.cache_checksum.clone();
         assert!(!key.is_empty());
         assert_eq!(a.cache_checksum, b.cache_checksum);
@@ -1722,21 +1822,20 @@ mod tests {
         let env = Vars::new();
         let c = compiler();
         let mut logger = silent_logger();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-        let ctx = ctx_with_caches(&env, &tmp, &caches);
+        let ctx = ctx_with_caches(&env, &caches);
         let mut urls = Vec::new();
         for t in [
             included("gcc", "gcc"),
             included("clang", "clang"),
             included("gcc2", "gcc"),
         ] {
-            let out = compiled_task(&t, vk_vars(), true, &ctx, &c, &mut logger, None)
+            let out = compiled_task(&t, vk_vars(), true, &ctx, &c, &mut logger)
                 .await
                 .unwrap();
-            let hash = out.source_hash.clone();
+            let out = finalized(&t, out, &ctx);
             let key = out.cache_checksum.clone();
             let url = out.cache.unwrap().url;
-            assert!(key.starts_with(&format!("{hash}-")), "{key}");
+            assert!(key.starts_with(&format!("{HASH}-")), "{key}");
             assert_eq!(
                 url,
                 format!("oci://reg.example/task-cache:gcc-13-build-{key}")
@@ -1760,9 +1859,8 @@ mod tests {
         let env = Vars::new();
         let c = compiler();
         let mut logger = silent_logger();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-        let ctx = ctx_with_caches(&env, &tmp, &caches);
-        let out = compiled_task(&orig, vk_vars(), true, &ctx, &c, &mut logger, None)
+        let ctx = ctx_with_caches(&env, &caches);
+        let out = compiled_task(&orig, vk_vars(), true, &ctx, &c, &mut logger)
             .await
             .unwrap();
         let cache = out.cache.unwrap();
@@ -1784,10 +1882,8 @@ mod tests {
         let env = Vars::new();
         let c = compiler();
         let mut logger = silent_logger();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-        let ctx = ctx_with_caches(&env, &tmp, &caches);
-        let Err(err) = compiled_task(&orig, vk_vars(), true, &ctx, &c, &mut logger, None).await
-        else {
+        let ctx = ctx_with_caches(&env, &caches);
+        let Err(err) = compiled_task(&orig, vk_vars(), true, &ctx, &c, &mut logger).await else {
             panic!("vk with url must fail");
         };
         assert!(
@@ -1808,10 +1904,8 @@ mod tests {
         let env = Vars::new();
         let c = compiler();
         let mut logger = silent_logger();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-        let ctx = ctx_with_caches(&env, &tmp, &caches);
-        let Err(err) = compiled_task(&orig, vk_vars(), true, &ctx, &c, &mut logger, None).await
-        else {
+        let ctx = ctx_with_caches(&env, &caches);
+        let Err(err) = compiled_task(&orig, vk_vars(), true, &ctx, &c, &mut logger).await else {
             panic!("vk with a scheme must fail");
         };
         assert!(
@@ -1838,8 +1932,7 @@ mod tests {
         let env = Vars::new();
         let c = compiler();
         let mut logger = silent_logger();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-        let out = compiled_task(&orig, vars, true, &ctx(&env, &tmp), &c, &mut logger, None)
+        let out = compiled_task(&orig, vars, true, &ctx(&env), &c, &mut logger)
             .await
             .unwrap();
         assert_eq!(out.label, "Build app");
@@ -1867,18 +1960,9 @@ mod tests {
         let env = Vars::new();
         let c = compiler();
         let mut logger = silent_logger();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-        let out = compiled_task(
-            &orig,
-            Vars::new(),
-            true,
-            &ctx(&env, &tmp),
-            &c,
-            &mut logger,
-            None,
-        )
-        .await
-        .unwrap();
+        let out = compiled_task(&orig, Vars::new(), true, &ctx(&env), &c, &mut logger)
+            .await
+            .unwrap();
         assert_eq!(out.cmds.len(), 2);
         assert_eq!(out.cmds[0].cmd, "echo a");
         assert_eq!(out.cmds[1].cmd, "echo b");
@@ -1901,15 +1985,13 @@ mod tests {
         }]);
         let c = compiler();
         let mut logger = silent_logger();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
         let out = compiled_task(
             &orig,
             Vars::new(),
             true,
-            &ctx(&taskfile_env, &tmp),
+            &ctx(&taskfile_env),
             &c,
             &mut logger,
-            None,
         )
         .await
         .unwrap();
@@ -1940,18 +2022,9 @@ mod tests {
         let env = Vars::new();
         let c = compiler();
         let mut logger = silent_logger();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-        let out = compiled_task(
-            &orig,
-            Vars::new(),
-            true,
-            &ctx(&env, &tmp),
-            &c,
-            &mut logger,
-            None,
-        )
-        .await
-        .unwrap();
+        let out = compiled_task(&orig, Vars::new(), true, &ctx(&env), &c, &mut logger)
+            .await
+            .unwrap();
         assert_eq!(
             out.env.unwrap().get("DYN").and_then(|v| v.value.clone()),
             Some(Value::String("from-shell".to_string()))
@@ -2066,19 +2139,11 @@ mod tests {
         let env = Vars::new();
         let c = compiler();
         let mut logger = silent_logger();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
         let counting = Counting(std::cell::Cell::new(0));
-        compiled_task(
-            &orig,
-            Vars::new(),
-            true,
-            &ctx(&env, &tmp),
-            &c,
-            &mut logger,
-            Some(&counting),
-        )
-        .await
-        .unwrap();
+        let t = compiled_task(&orig, Vars::new(), true, &ctx(&env), &c, &mut logger)
+            .await
+            .unwrap();
+        resolve(&orig, t, true, &counting).await.unwrap();
         assert_eq!(counting.0.get(), 0);
     }
 
@@ -2150,60 +2215,74 @@ mod tests {
         }
     }
 
-    async fn compile(t: &Task, eager: bool) -> Task {
+    /// `vars` as the compiler hands them to a task: `CHECKSUM` pending.
+    fn pending_vars() -> Vars {
+        let mut vars = Vars::new();
+        crate::compiler::set_pending_checksum(&mut vars);
+        vars
+    }
+
+    async fn compile(t: &Task) -> Result<Task, CompileError> {
         let env = Vars::new();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-        let mut context = ctx(&env, &tmp);
-        context.eager_checksum = eager;
         compiled_task(
             t,
-            Vars::new(),
+            pending_vars(),
             true,
-            &context,
+            &ctx(&env),
             &compiler(),
             &mut silent_logger(),
-            None,
         )
         .await
-        .unwrap()
     }
 
-    /// A task that never reads CHECKSUM compiles without hashing its sources
-    /// and has the same identity as when they are hashed.
+    /// A compile never hashes the sources: a command reading CHECKSUM renders
+    /// pending, noted for `finalize`, which renders it with the run's value.
     #[tokio::test]
-    async fn checksum_is_left_to_the_run_when_nothing_reads_it() {
+    async fn compile_leaves_checksum_to_the_run() {
+        let (_dir, t) = sourced(vec![Cmd {
+            cmd: "echo {{.CHECKSUM}}".to_string(),
+            if_: "test -n '{{.CHECKSUM}}'".to_string(),
+            ..Default::default()
+        }]);
+        let out = compile(&t).await.unwrap();
+        assert!(out.source_hash.is_empty());
+        assert!(out.cache_checksum.is_empty());
+        assert!(!out.cache_vars_digest.is_empty());
+        assert!(out.reads_checksum);
+        assert_eq!(out.pending_cmds.len(), 1);
+        let env = Vars::new();
+        let out = finalized(&t, out, &ctx(&env));
+        assert_eq!(out.cmds[0].cmd, format!("echo {HASH}"));
+        assert_eq!(out.cmds[0].if_, format!("test -n '{HASH}'"));
+        assert!(out.pending_cmds.is_empty());
+        assert_eq!(
+            out.cache_checksum,
+            crate::hash::join_cache_checksum(HASH, &out.cache_vars_digest)
+        );
+
         let (_dir, t) = sourced(vec![cmd("echo hi")]);
-        let lazy = compile(&t, false).await;
-        assert!(lazy.source_hash.is_empty());
-        assert!(lazy.cache_checksum.is_empty());
-        assert!(!lazy.cache_vars_digest.is_empty());
-        assert!(
-            lazy.vars
-                .as_ref()
-                .is_none_or(|v| v.get("CHECKSUM").is_none())
-        );
-        let eager = compile(&t, true).await;
-        assert!(!eager.source_hash.is_empty());
-        assert_eq!(
-            crate::hash::fingerprint(&lazy).unwrap(),
-            crate::hash::fingerprint(&eager).unwrap()
-        );
-        assert_eq!(
-            crate::hash::join_cache_checksum(&eager.source_hash, &lazy.cache_vars_digest),
-            eager.cache_checksum
-        );
+        let out = compile(&t).await.unwrap();
+        assert!(!out.reads_checksum);
+        assert!(out.source_hash.is_empty());
     }
 
-    /// Each reader of CHECKSUM makes the compile hash, and keeps the identity
-    /// the eager compile gives.
+    /// Command bodies and conditions, deferred ones, preconditions and the
+    /// cache block may read CHECKSUM; everything deciding what the task runs
+    /// or reads is refused it.
     #[tokio::test]
-    async fn each_reader_makes_the_compile_hash() {
+    async fn checksum_is_only_for_late_fields() {
         let with = |f: &dyn Fn(&mut Task)| {
             let (_dir, mut t) = sourced(vec![cmd("echo hi")]);
             f(&mut t);
             t
         };
-        let readers: Vec<(&str, Task)> = vec![
+        let var = |v: Var| {
+            Some(Vars::from_elements([VarElement {
+                key: "C".to_string(),
+                value: v,
+            }]))
+        };
+        let late: Vec<(&str, Task)> = vec![
             ("cmd", with(&|t| t.cmds = vec![cmd("echo {{.CHECKSUM}}")])),
             (
                 "jinja debug",
@@ -2237,94 +2316,39 @@ mod tests {
                     })
                 }),
             ),
-            (
-                "vk",
-                with(&|t| {
-                    t.cache = Some(crate::ast::Cache {
-                        vk: "127.0.0.1:9/repo".to_string(),
-                        ..Default::default()
-                    })
-                }),
-            ),
-            (
-                "requires",
-                with(&|t| {
-                    t.requires = Some(crate::ast::Requires {
-                        vars: vec![crate::ast::VarsWithValidation {
-                            name: "CHECKSUM".to_string(),
-                            ..Default::default()
-                        }],
-                    })
-                }),
-            ),
         ];
-        for (what, t) in readers {
-            let lazy = compile(&t, false).await;
-            let eager = compile(&t, true).await;
-            assert!(!lazy.source_hash.is_empty(), "{what}");
-            assert_eq!(lazy.source_hash, eager.source_hash, "{what}");
-            assert_eq!(lazy.cache_checksum, eager.cache_checksum, "{what}");
-            assert_eq!(
-                crate::hash::fingerprint(&lazy).unwrap(),
-                crate::hash::fingerprint(&eager).unwrap(),
-                "{what}"
-            );
+        for (what, t) in late {
+            let out = compile(&t).await.unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(out.reads_checksum, "{what}");
         }
-    }
-
-    /// A fast compile hashes only for a reader too.
-    #[tokio::test]
-    async fn fast_compile_does_not_hash() {
-        let (_dir, t) = sourced(vec![cmd("echo hi")]);
-        let env = Vars::new();
-        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-        let fast = compiled_task(
-            &t,
-            Vars::new(),
-            false,
-            &ctx(&env, &tmp),
-            &compiler(),
-            &mut silent_logger(),
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(fast.source_hash.is_empty());
-    }
-
-    /// Only command bodies and conditions, deferred commands, preconditions
-    /// and the cache block may read CHECKSUM: what the task calls or reads is
-    /// rendered with it pending, an error. A captured context leaves it out.
-    #[tokio::test]
-    async fn checksum_is_refused_outside_late_fields() {
-        let with = |f: &dyn Fn(&mut Task)| {
-            let (_dir, mut t) = sourced(vec![cmd("echo hi")]);
-            f(&mut t);
-            t
-        };
-        let var = |v: Var| {
-            Some(Vars::from_elements([VarElement {
-                key: "C".to_string(),
-                value: v,
-            }]))
-        };
-        let compile = |t: Task| async move {
-            let env = Vars::new();
-            let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-            let mut vars = Vars::new();
-            crate::compiler::set_pending_checksum(&mut vars);
-            compiled_task(
-                &t,
-                vars,
-                true,
-                &ctx(&env, &tmp),
-                &compiler(),
-                &mut silent_logger(),
-                None,
-            )
-            .await
-        };
-        let refused: Vec<(&str, Task)> = vec![
+        let structural: Vec<(&str, Task)> = vec![
+            (
+                "loop over files task",
+                with(&|t| {
+                    t.cmds = vec![Cmd {
+                        task: "x-{{.CHECKSUM}}".to_string(),
+                        for_: Some(For {
+                            from: "sources".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }]
+                }),
+            ),
+            (
+                "dep loop over files vars",
+                with(&|t| {
+                    t.deps = vec![Dep {
+                        task: "x".to_string(),
+                        vars: var(string_var("{{.ITEM}}{{.CHECKSUM}}")),
+                        for_: Some(For {
+                            from: "sources".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }]
+                }),
+            ),
             (
                 "cmd var",
                 with(&|t| t.cmds[0].vars = var(string_var("{{.CHECKSUM}}"))),
@@ -2384,6 +2408,10 @@ mod tests {
                 }),
             ),
             (
+                "label debug",
+                with(&|t| t.label = "{{ debug() }}".to_string()),
+            ),
+            (
                 "source",
                 with(&|t| t.sources[0].glob = "{{.CHECKSUM}}.txt".to_string()),
             ),
@@ -2397,10 +2425,11 @@ mod tests {
                 }),
             ),
         ];
-        for (what, t) in refused {
-            let Err(err) = compile(t).await else {
-                panic!("{what} must fail");
-            };
+        for (what, mut t) in structural {
+            if what == "label debug" {
+                t.dialect = Dialect::Jinja;
+            }
+            let err = compile(&t).await.expect_err(what);
             assert!(
                 matches!(
                     err,
@@ -2408,15 +2437,23 @@ mod tests {
                 ),
                 "{what}: {err}"
             );
+            assert!(
+                err.to_string().contains(
+                    "CHECKSUM is only available in commands, preconditions and the cache block, \
+                     after setup"
+                ),
+                "{what}: {err}"
+            );
         }
 
+        // A captured context leaves the pending value out.
         let t = with(&|t| {
             t.cmds[0].vars = var(Var {
                 ref_: ".".to_string(),
                 ..Default::default()
             })
         });
-        let out = compile(t).await.unwrap();
+        let out = compile(&t).await.unwrap();
         let Some(Value::Mapping(captured)) = out.cmds[0]
             .vars
             .as_ref()
@@ -2437,8 +2474,27 @@ mod tests {
             t.sources.clear();
             t.cmds = vec![cmd("echo [{{.CHECKSUM}}]")];
         });
-        let out = compile(t).await.unwrap();
+        let env = Vars::new();
+        let out = finalize(&t, compile(&t).await.unwrap(), "", true, &ctx(&env)).unwrap();
         assert_eq!(out.cmds[0].cmd, "echo []");
         assert!(out.vars.unwrap().get("CHECKSUM").is_none());
+    }
+
+    /// A fast compile never hashes either.
+    #[tokio::test]
+    async fn fast_compile_does_not_hash() {
+        let (_dir, t) = sourced(vec![cmd("echo {{.CHECKSUM}}")]);
+        let env = Vars::new();
+        let fast = compiled_task(
+            &t,
+            pending_vars(),
+            false,
+            &ctx(&env),
+            &compiler(),
+            &mut silent_logger(),
+        )
+        .await
+        .unwrap();
+        assert!(fast.source_hash.is_empty());
     }
 }

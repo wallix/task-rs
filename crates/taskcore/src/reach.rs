@@ -717,9 +717,7 @@ pub(crate) fn cmd_calls(t: &Task) -> Result<Vec<(String, Vars)>, CompileError> {
 /// when the task succeeded: from the task's vars, without `EXIT_CODE`, and
 /// with `CHECKSUM` pending, so reading it is an error.
 pub(crate) fn deferred_call(t: &Task, c: &Cmd) -> Result<(String, Option<Vars>), TemplaterError> {
-    let mut vars = t.vars.clone().unwrap_or_default();
-    crate::compiler::set_pending_checksum(&mut vars);
-    let mut cache = Cache::new(vars);
+    let mut cache = Cache::new(t.vars.clone().unwrap_or_default());
     cache.set_dialect(t.dialect);
     let name = cache.field("cmds").replace(&c.task);
     let vars = c.vars.as_ref().and_then(|v| cache.replace_vars(v));

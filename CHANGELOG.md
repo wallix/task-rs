@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **`CHECKSUM`, the cache key and the build-once lock are taken after
+  `setup`, for every task.** When setup changes a task's sources, the run now
+  restores and saves its cache entry, and tasks that differ only in what setup
+  rewrote no longer wait on one shared lock, each rebuilding in turn. A `for:`
+  loop over files in commands or `deps` sees the files setup made; a `setup:`
+  entry's own loop still expands before setup. An error resolving a `task:` or
+  `from:` entry is reported once setup ran, with the same message and exit
+  code. `--summary`, which runs no setup, and a `requires` naming `CHECKSUM`
+  see the sources as they are; `--summary` leaves out what `from:` and
+  `task:` entries fold in.
+- **Breaking: `CHECKSUM` is one value, the final one.** Commands of a task
+  with `from:` or `task:` sources now see the checksum its fingerprint and
+  cache key record, covering what those entries fold in, instead of a
+  checksum of its own entries only. Such commands print a different value,
+  and their fingerprint files are named anew, once.
 - **Breaking: `CHECKSUM` is only available in commands, preconditions, the
   cache block and group markers.** Command bodies and their `if:`, deferred
   commands, `preconditions`, the cache block and templated `output:` group

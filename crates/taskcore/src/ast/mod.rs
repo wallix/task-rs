@@ -47,7 +47,7 @@ pub use precondition::Precondition;
 pub use prompt::Prompt;
 pub use requires::{Requires, VarsWithValidation};
 pub use sandbox::{Grant, GrantKind, Sandbox};
-pub use task::Task;
+pub use task::{PendingCmd, Task};
 pub use taskfile::{NAMESPACE_SEPARATOR, Taskfile};
 pub use tasks::{TaskElement, Tasks};
 pub use var::Var;

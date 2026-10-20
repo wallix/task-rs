@@ -1638,11 +1638,11 @@ fn cache_key_of_a_lazy_task_follows_setup() {
     assert_eq!(state.lines().next(), Some(meta.as_str()), "{comment}");
 }
 
-/// One whose commands read CHECKSUM keeps the value its compile rendered,
-/// from before `setup`. When `setup` changes its sources that key no longer
-/// names what it builds, so the run neither restores nor saves under it.
+/// The commands and cache block reading CHECKSUM, the cache key and the entry
+/// all name the sources `setup` left, and a run from the pre-setup tree
+/// restores that entry.
 #[test]
-fn a_stale_cache_key_skips_restore_and_save() {
+fn cache_key_read_at_compile_follows_setup() {
     let cache = cache_dir();
     std::fs::create_dir_all(&cache).unwrap();
     let taskfile = format!(
@@ -1652,21 +1652,51 @@ fn a_stale_cache_key_skips_restore_and_save() {
     let dir = stage_inline(&taskfile, "before setup\n");
     let (out, code) = run_env(&dir, &["-v", "build"], &[]);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("CHECKSUM="), "{out}");
-    assert!(
-        out.contains("not saved: its sources changed since its cache key was taken"),
-        "{out}"
-    );
-    assert_eq!(dir_len(&cache), 0, "{out}");
-    // Setup writes the same content again: the compile's key is now current.
-    let (out, code) = run_env(&dir, &["-v", "build"], &[]);
-    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("since its cache key was taken"), "{out}");
     assert_eq!(dir_len(&cache), 1, "{out}");
+    let state = std::fs::read_to_string(checksum_file(&dir, "build").unwrap()).unwrap();
+    let sources = state.lines().next().unwrap().to_string();
+    assert!(out.contains(&format!("CHECKSUM={sources}\n")), "{out}");
+    let entry = std::fs::read_dir(&cache).unwrap().next().unwrap().unwrap();
+    assert!(
+        entry.file_name().to_string_lossy().contains(&sources),
+        "{:?}",
+        entry.file_name()
+    );
+
+    // Back to the pre-setup tree, as a fresh checkout: restored, not rebuilt.
+    std::fs::remove_file(dir.join("output.txt")).unwrap();
+    std::fs::remove_dir_all(dir.join(".task")).unwrap();
+    std::fs::write(dir.join("input.txt"), "before setup\n").unwrap();
+    let (out, code) = run_env(&dir, &["build"], &[]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("restored from cache"), "{out}");
+    assert!(!out.contains("CHECKSUM="), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("output.txt")).unwrap(),
+        "generated\n"
+    );
 }
 
-/// Commands reading CHECKSUM see the task's own entries' value, as before,
-/// while the cache key, computed by the run, covers what its references fold
-/// in: never the commands' narrower value.
+/// A `vk:` cache's build-once lock is named after the sources `setup` left,
+/// as its cache key is: tasks whose setup brings their sources to the same
+/// state share one lock, whatever they started from.
+#[test]
+fn lock_name_follows_setup() {
+    let taskfile = "version: '3'\ntasks:\n  gen:\n    cmds: ['echo generated > input.txt']\n  build:\n    setup: [gen]\n    sources: [input.txt]\n    generates: [output.txt]\n    cache:\n      vk: 127.0.0.1:9/repo\n    cmds: ['cp input.txt output.txt']\n";
+    let dir = stage_inline(taskfile, "before setup\n");
+    let (out, code) = run_env(&dir, &["-v", "build"], &[]);
+    assert_eq!(code, 0, "{out}");
+    let state = std::fs::read_to_string(checksum_file(&dir, "build").unwrap()).unwrap();
+    let sources = state.lines().next().unwrap();
+    assert!(
+        out.contains(&format!("name=repo%3Abuild%3A{sources}-")),
+        "{out}"
+    );
+}
+
+/// Commands reading CHECKSUM see the value the cache key and the fingerprint
+/// carry, covering what the task's references fold in.
 #[test]
 fn cache_key_of_a_widened_task_is_the_final_value() {
     let cache = cache_dir();
@@ -1687,6 +1717,5 @@ fn cache_key_of_a_widened_task_is_the_final_value() {
         .to_string();
     let state = std::fs::read_to_string(checksum_file(&dir, "build").unwrap()).unwrap();
     assert_eq!(state.lines().next(), Some(meta.as_str()), "{comment}");
-    assert!(!out.contains(&format!("CHECKSUM={meta}")), "{out}");
-    assert!(out.contains("CHECKSUM="), "{out}");
+    assert!(out.contains(&format!("CHECKSUM={meta}\n")), "{out}");
 }

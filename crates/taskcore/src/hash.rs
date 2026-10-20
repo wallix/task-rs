@@ -255,7 +255,8 @@ fn encode_task(enc: &mut Encoder, t: &ast::Task) -> Result<(), HashError> {
     // dir, sources, etc. (which already bake in resolved variable values) but
     // not the raw variables — including the namespace-specific TASK special var.
     // This lets `run: when_changed` dedup identical invocations of the same
-    // task reached through different includes.
+    // task reached through different includes. `reads_checksum` and
+    // `pending_cmds`, the compile's notes for `finalize`, are not part of it.
     encode_str_slice(enc, &t.dotenv);
     enc.opt_bool(t.silent);
     enc.bool(t.interactive);

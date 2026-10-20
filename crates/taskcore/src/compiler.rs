@@ -161,14 +161,10 @@ impl Compiler {
             );
         }
         // A run's compile refuses CHECKSUM where it cannot have a value; a fast
-        // one (`--list`, `--summary`, prompts) renders it empty there, whatever
-        // the environment holds.
+        // one (`--summary`, prompts) renders it unset there, whatever the
+        // environment holds.
         if task.is_some() {
-            if evaluate_sh_vars {
-                set_pending_checksum(&mut result);
-            } else {
-                result.remove("CHECKSUM");
-            }
+            set_pending_checksum(&mut result);
         }
 
         // The task's directory, used when resolving that task's own vars so
@@ -177,6 +173,7 @@ impl Compiler {
             Some(t) => {
                 let mut cache = Cache::new(result.clone());
                 cache.set_dialect(t.dialect);
+                cache.set_lenient(!evaluate_sh_vars);
                 let dirs = cache.field("dir").replace_vec(&t.dirs);
                 if let Some(err) = cache.err() {
                     return Err(CompilerError::Template(err.clone()));
@@ -292,6 +289,7 @@ impl Compiler {
         // The variable renders in its own file's dialect, stamped at read time.
         let mut cache = Cache::new(result.clone());
         cache.set_dialect(var.dialect);
+        cache.set_lenient(!evaluate_sh_vars);
         cache.field(format!("{layer}: {key}"));
         let new_var = cache.replace_var(var);
 

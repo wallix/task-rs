@@ -176,7 +176,8 @@ pub fn check_allowed_values(task: &Task) -> Result<(), RequiresError> {
 fn string_value(task: &Task, required: &VarsWithValidation) -> Option<String> {
     let var = task.vars.as_ref()?.get(&required.name)?;
     match &var.value {
-        Some(Value::String(s)) => Some(s.clone()),
+        // A pending CHECKSUM has no value to check yet.
+        Some(Value::String(s)) if s != crate::templater::PENDING_CHECKSUM => Some(s.clone()),
         _ => None,
     }
 }

@@ -205,7 +205,7 @@ impl Executor {
         calls: &[Call],
     ) -> Result<(), ExecutorError> {
         for call in calls {
-            let task = self.compiled_task(call).await?;
+            let task = self.finalized_compiled_task(call).await?;
             if task.sources.is_empty() && task.generates.is_empty() {
                 continue;
             }

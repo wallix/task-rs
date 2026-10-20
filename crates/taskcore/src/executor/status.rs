@@ -22,7 +22,7 @@ impl Executor {
     ) -> Result<(), ExecutorError> {
         let mut statuses: Vec<TaskStatus> = Vec::new();
         for call in calls {
-            let task = self.compiled_task(call).await?;
+            let task = self.finalized_compiled_task(call).await?;
             if task.sources.is_empty() && task.generates.is_empty() {
                 if as_json {
                     statuses.push(TaskStatus {
@@ -102,7 +102,7 @@ impl Executor {
     /// checksum is reported not up to date). `None` only when the task cannot be
     /// compiled or fingerprinted at all.
     async fn task_up_to_date(&self, name: &str) -> Option<bool> {
-        let task = self.compiled_task(&Call::new(name)).await.ok()?;
+        let task = self.finalized_compiled_task(&Call::new(name)).await.ok()?;
         let mut checker = ChecksumChecker::new(&self.temp_dir.fingerprint, task);
         checker.is_up_to_date().await.ok()
     }

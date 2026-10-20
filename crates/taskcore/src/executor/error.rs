@@ -31,6 +31,13 @@ pub enum ExecutorError {
     Compiler(Box<CompilerError>),
     /// Compiling a task failed.
     Compile(Box<CompileError>),
+    /// Completing a task's compile after its setup failed: its own error,
+    /// which the run reports as the compile's. Shared, as a `run: once` task's
+    /// result is.
+    Completion(std::sync::Arc<ExecutorError>),
+    /// A [`Self::Completion`]'s error as its task reports it: shown and coded
+    /// as itself, and wrapped by a caller like any other.
+    Shared(std::sync::Arc<ExecutorError>),
     /// A required-variable check failed.
     Requires(Box<RequiresError>),
     /// A precondition was not met or failed to run.
@@ -120,6 +127,7 @@ impl std::fmt::Display for ExecutorError {
             Self::Output(e) => write!(f, "{e}"),
             Self::Compiler(e) => write!(f, "{e}"),
             Self::Compile(e) => write!(f, "{e}"),
+            Self::Completion(e) | Self::Shared(e) => write!(f, "{e}"),
             Self::Requires(e) => write!(f, "{e}"),
             Self::Precondition(e) => write!(f, "{e}"),
             Self::Exec(e) => write!(f, "{e}"),
@@ -202,6 +210,7 @@ impl ExecutorError {
         match self {
             Self::Reader(_) => 100,
             Self::Merge(_) => 107,
+            Self::Completion(e) | Self::Shared(e) => e.code(),
             Self::VersionCheck { .. } => 105,
             Self::TaskNotFound { .. } => 200,
             Self::Compile(e)

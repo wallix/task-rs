@@ -294,7 +294,9 @@ impl Executor {
         if self.summary {
             let logger = self.logger();
             for (i, call) in calls.iter().enumerate() {
+                // Setup does not run: CHECKSUM is read from the tree as it is.
                 let compiled = self.fast_compiled_task(call).await?;
+                let compiled = self.finalized_task(call, compiled, false).await?;
                 let mut logger = logger.borrow_mut();
                 crate::summary::print_space_between_summaries(&mut logger, i);
                 crate::summary::print_task(&mut logger, &compiled);
@@ -437,9 +439,17 @@ impl Executor {
     }
 
     /// Compiles a task for a call, evaluating dynamic variables. Ports Go
-    /// `CompiledTask`.
+    /// `CompiledTask`. `CHECKSUM` is still pending: see
+    /// [`Self::finalized_task`].
     pub async fn compiled_task(&self, call: &Call) -> Result<Task, ExecutorError> {
         self.compiled_task_inner(call, true).await
+    }
+
+    /// [`Self::compiled_task`], finalized against the tree as it is, setup not
+    /// run: what fingerprint state, `--status` and exports look at.
+    pub(crate) async fn finalized_compiled_task(&self, call: &Call) -> Result<Task, ExecutorError> {
+        let t = self.compiled_task(call).await?;
+        self.finalized_task(call, t, true).await
     }
 
     async fn compiled_task_inner(
@@ -447,19 +457,16 @@ impl Executor {
         call: &Call,
         evaluate_sh_vars: bool,
     ) -> Result<Task, ExecutorError> {
-        let resolver = GlobResolver { exec: self, call };
-        self.compiled_task_with(call, evaluate_sh_vars, Some(&resolver))
-            .await
+        self.compiled_task_with(call, evaluate_sh_vars, false).await
     }
 
-    /// The body of [`Self::compiled_task_inner`]: the full compile, resolving
-    /// references through `resolver`, or without one the compile of a task a
-    /// reference reaches ([`variables::reached_task`]).
+    /// The body of [`Self::compiled_task_inner`], or with `reached` the
+    /// compile of a task a reference reaches ([`variables::reached_task`]).
     async fn compiled_task_with(
         &self,
         call: &Call,
         evaluate_sh_vars: bool,
-        resolver: Option<&dyn crate::variables::TaskResolver>,
+        reached: bool,
     ) -> Result<Task, ExecutorError> {
         let (orig, wildcards) = self.get_task_with_match(call)?;
 
@@ -478,10 +485,12 @@ impl Executor {
 
         // A reached task's errors are named by the reference's chain; a
         // wildcard task by the name it was called as.
-        let owner = match resolver {
-            None => "",
-            Some(_) if wildcards.is_empty() => orig.task.as_str(),
-            Some(_) => call.task.as_str(),
+        let owner = if reached {
+            ""
+        } else if wildcards.is_empty() {
+            orig.task.as_str()
+        } else {
+            call.task.as_str()
         };
         let compiler = self.compiler();
         let (mut scratch, sink) = self.scratch_logger();
@@ -490,48 +499,145 @@ impl Executor {
             .await
             .map_err(|e| e.in_task(owner))?;
 
-        let taskfile_env = self
-            .taskfile
-            .as_ref()
-            .map(|tf| tf.env.clone())
-            .unwrap_or_default();
+        let taskfile_env = self.taskfile_env();
         let empty_caches = crate::ast::Caches::default();
-        let caches = self
-            .taskfile
-            .as_ref()
-            .map(|tf| &tf.caches)
-            .unwrap_or(&empty_caches);
-        let ctx = CompileContext {
-            dir: &self.dir,
-            taskfile_env: &taskfile_env,
-            fingerprint_temp_dir: &self.temp_dir.fingerprint,
-            env_precedence: self.env_precedence,
-            caches,
-            // `--summary` prints the compiled vars; group markers render
-            // against the compiled vars again, any var possibly carrying text
-            // that names CHECKSUM.
-            eager_checksum: self.summary
-                || [&self.output_style.group.begin, &self.output_style.group.end]
-                    .iter()
-                    .any(|m| m.contains('{')),
-        };
-        let result = match resolver {
-            Some(resolver) => {
-                variables::compiled_task(
-                    &orig,
-                    vars,
-                    evaluate_sh_vars,
-                    &ctx,
-                    &compiler,
-                    &mut scratch,
-                    Some(resolver),
-                )
+        let ctx = self.compile_context(&taskfile_env, &empty_caches);
+        let result = if reached {
+            variables::reached_task(&orig, vars, &ctx, &compiler, &mut scratch).await
+        } else {
+            variables::compiled_task(&orig, vars, evaluate_sh_vars, &ctx, &compiler, &mut scratch)
                 .await
-            }
-            None => variables::reached_task(&orig, vars, &ctx, &compiler, &mut scratch).await,
         };
         self.flush_scratch(&sink);
         Ok(result.map_err(|e| e.in_task(owner))?)
+    }
+
+    /// Returns a view of `t`, compiled for `call`, for a `requires` check
+    /// naming `CHECKSUM`. Only this check sees the pre-setup sources checksum;
+    /// without sources, `CHECKSUM` is absent. Returns `None` if the check does
+    /// not name it or a reference fails to resolve. The run reports reference
+    /// errors after setup and resolves references again, so the referenced
+    /// tasks' `sh:` vars run twice.
+    async fn requires_view(&self, call: &Call, t: &Task) -> Option<Task> {
+        let names_checksum = t
+            .requires
+            .as_ref()
+            .is_some_and(|r| r.vars.iter().any(|v| v.name == "CHECKSUM"));
+        if !names_checksum {
+            return None;
+        }
+        let resolved = self.resolved_task(call, t.clone(), true).await.ok()?;
+        let mut view = t.clone();
+        let vars = view.vars.get_or_insert_with(Default::default);
+        if resolved.sources.is_empty() {
+            vars.remove("CHECKSUM");
+        } else {
+            let mut checker = ChecksumChecker::new(&self.temp_dir.fingerprint, resolved);
+            let value = checker.source_value().await.to_string();
+            vars.set(
+                "CHECKSUM".to_string(),
+                Var {
+                    value: Some(Value::String(value)),
+                    ..Default::default()
+                },
+            );
+        }
+        Some(view)
+    }
+
+    fn taskfile_env(&self) -> crate::ast::Vars {
+        self.taskfile
+            .as_ref()
+            .map(|tf| tf.env.clone())
+            .unwrap_or_default()
+    }
+
+    /// The compile inputs taken from the executor; `taskfile_env` is
+    /// [`Self::taskfile_env`], `empty_caches` the models without a Taskfile.
+    fn compile_context<'a>(
+        &'a self,
+        taskfile_env: &'a crate::ast::Vars,
+        empty_caches: &'a crate::ast::Caches,
+    ) -> CompileContext<'a> {
+        CompileContext {
+            dir: &self.dir,
+            taskfile_env,
+            env_precedence: self.env_precedence,
+            caches: self.taskfile.as_ref().map_or(empty_caches, |tf| &tf.caches),
+        }
+    }
+
+    /// `t`, compiled for `call`, completed against the tree as it is
+    /// ([`variables::resolve`]): its loops over files expanded, its `from:`
+    /// and `task:` entries resolved. `CHECKSUM` is still pending.
+    pub(crate) async fn resolved_task(
+        &self,
+        call: &Call,
+        t: Task,
+        evaluate_sh_vars: bool,
+    ) -> Result<Task, ExecutorError> {
+        let (orig, wildcards) = self.get_task_with_match(call)?;
+        self.resolve_for(call, &orig, &wildcards, t, evaluate_sh_vars)
+            .await
+    }
+
+    /// [`Self::resolved_task`], with the task `call` matches, `orig`, and
+    /// the `wildcards` it captured.
+    async fn resolve_for(
+        &self,
+        call: &Call,
+        orig: &Task,
+        wildcards: &[String],
+        t: Task,
+        evaluate_sh_vars: bool,
+    ) -> Result<Task, ExecutorError> {
+        let owner = if wildcards.is_empty() {
+            &orig.task
+        } else {
+            &call.task
+        };
+        let resolver = GlobResolver { exec: self, call };
+        Ok(variables::resolve(orig, t, evaluate_sh_vars, &resolver)
+            .await
+            .map_err(|e| e.in_task(owner))?)
+    }
+
+    /// `t`, compiled for `call`, resolved against the tree as it is (for a
+    /// run, after setup) and with its `CHECKSUM` set: the sources are hashed
+    /// once, then, when something needs the value — the build-once lock and
+    /// cache key, a field reading it, `--summary`, templated group markers.
+    /// Otherwise it stays empty and the up-to-date check reads the sources.
+    pub(crate) async fn finalized_task(
+        &self,
+        call: &Call,
+        t: Task,
+        evaluate_sh_vars: bool,
+    ) -> Result<Task, ExecutorError> {
+        let (orig, wildcards) = self.get_task_with_match(call)?;
+        let t = self
+            .resolve_for(call, &orig, &wildcards, t, evaluate_sh_vars)
+            .await?;
+        let markers = [&self.output_style.group.begin, &self.output_style.group.end]
+            .iter()
+            .any(|m| m.contains('{'));
+        let needed = !t.sources.is_empty()
+            && (self.takes_lock(&t) || t.reads_checksum || self.summary || markers);
+        let source_hash = if needed {
+            let mut checker = ChecksumChecker::new(&self.temp_dir.fingerprint, t.clone());
+            checker.source_value().await.to_string()
+        } else {
+            String::new()
+        };
+        let taskfile_env = self.taskfile_env();
+        let empty_caches = crate::ast::Caches::default();
+        let ctx = self.compile_context(&taskfile_env, &empty_caches);
+        Ok(variables::finalize(
+            &orig,
+            t,
+            &source_hash,
+            evaluate_sh_vars,
+            &ctx,
+        )?)
     }
 
     /// Queues a task on the runtime's local task set and returns its handle.
@@ -731,8 +837,9 @@ impl Executor {
             t = self.compiled_task(&call).await?;
         }
 
-        requires::check_required_vars_set(&t)?;
-        requires::check_allowed_values(&t)?;
+        let view = self.requires_view(&call, &t).await;
+        requires::check_required_vars_set(view.as_ref().unwrap_or(&t))?;
+        requires::check_allowed_values(view.as_ref().unwrap_or(&t))?;
 
         // A task already running on this path with the same compiled body
         // depends on itself and will keep doing so. Reported here rather than
@@ -760,7 +867,8 @@ impl Executor {
         // commands render differently each turn — makes progress rather than
         // reading as a repeat. `crate::hash::hash` does not hash the vars field
         // itself, but the compiled `cmds`/`dirs`/`sources` it does hash have
-        // the resolved values baked in.
+        // the resolved values baked in — taken before `finalize`, so with
+        // `CHECKSUM` pending and loops over files unexpanded.
         //
         // The digest only sees the compiled body, so recursion whose progress
         // lives outside it — a counter in a file, read by `if:` or by a command
@@ -800,9 +908,14 @@ impl Executor {
         }
 
         let result = self.start_execution(&t, &call, callee_ancestors).await;
-        result.map_err(|source| ExecutorError::TaskRun {
-            task_name: t.name().to_string(),
-            source: Box::new(unwrap_arc(source)),
+        result.map_err(|source| match &*source {
+            // The task's own compile, completed after setup: reported as the
+            // part before setup is.
+            ExecutorError::Completion(inner) => ExecutorError::Shared(Arc::clone(inner)),
+            _ => ExecutorError::TaskRun {
+                task_name: t.name().to_string(),
+                source: Box::new(unwrap_arc(source)),
+            },
         })
     }
 
@@ -867,21 +980,23 @@ impl Executor {
             .verbose_errf(Color::Magenta, &format!("task: {:?} started\n", call.task));
 
         self.run_setup(t, &ancestors).await?;
+        // What depends on the tree — loops over files, `from:` and `task:`
+        // entries, the sources hash, `CHECKSUM` — is taken from the one setup
+        // left.
+        let t = &self
+            .finalized_task(call, t.clone(), true)
+            .await
+            .map_err(|e| ExecutorError::Completion(Arc::new(e)))?;
 
         let cache_url = self.cache_url(t);
 
         // Acquire the build-once lock covering deps, fingerprint, execution and
         // the up-to-date write, for tasks with fingerprint state. Its name
-        // carries the sources checksum: the compile's when it computed one,
-        // else read now, after setup, and kept as the run's value.
-        let mut checker = ChecksumChecker::new(&self.temp_dir.fingerprint, t.clone());
-        let lock_key = if self.takes_lock(t) {
-            checker.cache_checksum().await
-        } else {
-            String::new()
-        };
+        // carries the cache key `finalized_task` read, the sources value kept
+        // as the run's.
+        let checker = ChecksumChecker::new(&self.temp_dir.fingerprint, t.clone());
         let lock = self
-            .acquire_task_lock(t, &lock_key, cache_url.as_ref())
+            .acquire_task_lock(t, &t.cache_checksum, cache_url.as_ref())
             .await?;
 
         let result = self
@@ -936,10 +1051,10 @@ impl Executor {
                 return Ok(());
             }
 
-            // The entry is keyed by the run's sources value (the compile's,
-            // the lock's, or the up-to-date reading). One taken before the
-            // sources changed would restore outputs of other sources and
-            // record them as up to date: skip the cache then.
+            // The entry is keyed by the run's sources value (read after setup,
+            // or the up-to-date reading). One taken before the sources changed
+            // — during the lock wait — would restore outputs of other sources
+            // and record them as up to date: skip the cache then.
             let keyed = !checker.known_source_value().is_empty();
             let stale_key = keyed && !checker.source_value_is_the_reading();
             if cache_active && !self.dry && stale_key {
@@ -2241,7 +2356,7 @@ impl crate::variables::TaskResolver for GlobResolver<'_> {
             let raw = self.exec.get_task(&call).map_err(to_compile_error)?;
             let task = self
                 .exec
-                .compiled_task_with(&call, true, None)
+                .compiled_task_with(&call, true, true)
                 .await
                 .map_err(to_compile_error)?;
             Ok(crate::variables::ReachedTask { task, raw })

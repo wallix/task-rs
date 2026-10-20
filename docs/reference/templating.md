@@ -232,7 +232,7 @@ tasks:
 
 | Variable | Type | Description |
 | --- | --- | --- |
-| `CHECKSUM` | `string` | Checksum of the task's `sources`: available in commands, `preconditions` and the `cache` block only (see below) |
+| `CHECKSUM` | `string` | Checksum of the task's `sources`, taken after `setup`: available in commands, `preconditions`, the `cache` block and group markers only (see below) |
 
 ```yaml
 tasks:
@@ -244,10 +244,17 @@ tasks:
       - cargo build --release
 ```
 
-Only command bodies and their `if:`, deferred commands, `preconditions`, the
-cache block and templated `output:` group markers may read `CHECKSUM`.
-Everything that decides what the task runs or reads fails when it reads it,
-directly, through a `ref:` or Jinja's `debug()`, naming the task and field:
+`CHECKSUM` is the checksum of the task's sources, its commands as written
+and its `generates` rules, the value its fingerprint records. A run takes it
+once, after `setup`, from the final sources, `from:` and `task:` entries
+included; the cache key adds a digest of the task's declared `vars` to it,
+and names the build-once lock.
+
+Only what renders after that may read it: command bodies and their `if:`,
+deferred commands, `preconditions`, the cache block and templated `output:`
+group markers. Everything that decides what the task runs or reads fails
+when it reads it, directly, through a `ref:` or Jinja's `debug()`, naming the
+task and field:
 `task: build: setup: template "…" reads CHECKSUM: CHECKSUM is only available
 in commands, preconditions and the cache block, after setup`. That covers
 Taskfile-level `vars` and `env`, failing every task, task and include `vars`,
@@ -256,6 +263,16 @@ Taskfile-level `vars` and `env`, failing every task, task and include `vars`,
 commands, deferred ones included, the task-level `if:`, `run:`, `label`,
 `desc` and `prefix`; `--summary` renders it empty there. A `ref: "."`
 capture leaves `CHECKSUM` out, and a var named `CHECKSUM` is ignored.
+
+`--summary` runs no setup: it shows the checksum of the sources as they are,
+as does a `requires` naming `CHECKSUM`, for its check only. `--summary` also
+leaves out what `from:` and `task:` entries fold in, as resolving them would
+run the `sh:` vars of the tasks they reach.
+
+The sources are hashed only when something needs the value: the build-once
+lock and cache key of a task with `generates`, a field reading `CHECKSUM`,
+`--summary` or templated group markers. Otherwise the up-to-date check's
+reading is the run's.
 
 ### Loop
 

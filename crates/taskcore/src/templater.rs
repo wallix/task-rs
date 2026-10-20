@@ -372,6 +372,8 @@ pub struct Cache {
     cache_map: Option<IndexMap<String, YamlValue>>,
     err: Option<TemplaterError>,
     late: bool,
+    lenient: bool,
+    read_checksum: bool,
     field: String,
 }
 
@@ -387,6 +389,8 @@ impl Cache {
             cache_map: None,
             err: None,
             late: false,
+            lenient: false,
+            read_checksum: false,
             field: String::new(),
         }
     }
@@ -396,6 +400,19 @@ impl Cache {
     /// [`PENDING_CHECKSUM`]. Off, reading it is an error.
     pub fn set_late(&mut self, late: bool) {
         self.late = late;
+    }
+
+    /// Whether a read of [`PENDING_CHECKSUM`] outside a late field renders
+    /// as unset instead of failing: a fast compile (`--summary`, prompts)
+    /// runs no setup and reports no refusal.
+    pub fn set_lenient(&mut self, lenient: bool) {
+        self.lenient = lenient;
+    }
+
+    /// Whether a late field read [`PENDING_CHECKSUM`] since the last call,
+    /// clearing the note.
+    pub fn take_read_checksum(&mut self) -> bool {
+        std::mem::take(&mut self.read_checksum)
     }
 
     /// Names the field being rendered for [`TemplaterError::ChecksumUnavailable`].
@@ -415,6 +432,7 @@ impl Cache {
     /// field; otherwise records an error and returns false.
     fn checksum_read(&mut self, tmpl: &str) -> bool {
         if self.late {
+            self.read_checksum = true;
             return true;
         }
         self.err = Some(TemplaterError::ChecksumUnavailable {
@@ -464,6 +482,17 @@ impl Cache {
         self.cache_map.get_or_insert_with(IndexMap::new)
     }
 
+    /// The variables a render sees: without a pending `CHECKSUM` when lenient
+    /// outside a late field.
+    fn render_data(&mut self) -> IndexMap<String, YamlValue> {
+        self.ensure_cache_map();
+        let mut data = self.cache_map.clone().unwrap_or_default();
+        if self.lenient && !self.late {
+            data.retain(|_, v| !holds_pending_checksum(v));
+        }
+        data
+    }
+
     /// Renders `tmpl` against the current variables, merging `extra` on top.
     ///
     /// If an error was already recorded, or rendering fails, the input is
@@ -476,10 +505,7 @@ impl Cache {
         if self.err.is_some() {
             return tmpl.to_string();
         }
-        self.ensure_cache_map();
-        // The map is present after `ensure_cache_map`.
-        let base = self.cache_map.clone().unwrap_or_default();
-        let mut data = base;
+        let mut data = self.render_data();
         for (k, v) in extra {
             data.insert(k.clone(), v.clone());
         }
@@ -539,8 +565,7 @@ impl Cache {
         if self.err.is_some() {
             return YamlValue::Null;
         }
-        self.ensure_cache_map();
-        let data = self.cache_map.clone().unwrap_or_default();
+        let data = self.render_data();
         if ref_ == "." {
             // A pending CHECKSUM is no value yet: the capture leaves it out.
             return YamlValue::Mapping(
@@ -2286,6 +2311,22 @@ mod tests {
         assert_eq!(c.replace(r#"{{eq .X "x"}}"#), "true");
         c.set_late(true);
         assert_eq!(c.replace("{{.CHECKSUM}}"), PENDING_CHECKSUM);
+        assert!(c.err().is_none());
+    }
+
+    /// Lenient, a pending CHECKSUM read outside a late field renders unset,
+    /// with no error; a late field still notes the read.
+    #[test]
+    fn lenient_renders_pending_checksum_unset() {
+        let mut c = cache_with(&[("CHECKSUM", PENDING_CHECKSUM)]);
+        c.set_lenient(true);
+        assert_eq!(c.replace("[{{.CHECKSUM}}]"), "[]");
+        assert_eq!(c.resolve_ref(".CHECKSUM"), YamlValue::String(String::new()));
+        assert!(c.err().is_none());
+        assert!(!c.take_read_checksum());
+        c.set_late(true);
+        assert_eq!(c.replace("{{.CHECKSUM}}"), PENDING_CHECKSUM);
+        assert!(c.take_read_checksum());
         assert!(c.err().is_none());
     }
 

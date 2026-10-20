@@ -157,8 +157,8 @@ impl Spec {
 impl ChecksumChecker {
     /// Creates a checker bound to `task`. It precomputes the source globs and
     /// metadata but does not access disk for the source hash: it reuses
-    /// `task.source_hash` when available (set during compilation). When that is
-    /// empty, [`ChecksumChecker::source_value`] computes it lazily.
+    /// `task.source_hash` when available (set by the run, after setup). When
+    /// that is empty, [`ChecksumChecker::source_value`] computes it lazily.
     pub fn new(temp_dir: impl Into<String>, task: Task) -> Self {
         let dir = task.compute_dir().to_string_lossy().into_owned();
         let (sources, data) = build_checksum_data(&dir, &task);
@@ -250,8 +250,8 @@ impl ChecksumChecker {
 
     /// Returns the sources checksum for use as the `CHECKSUM` template variable,
     /// lock keys, and cache keys, computing it lazily from disk (off the
-    /// engine's thread) on first call when it was not precomputed during
-    /// compilation. A reading error leaves it empty.
+    /// engine's thread) on first call when the run did not set it. A reading
+    /// error leaves it empty.
     pub async fn source_value(&mut self) -> &str {
         if self.source_hash.is_empty() && self.spec.has_sources {
             let spec = self.spec.clone();
@@ -267,8 +267,8 @@ impl ChecksumChecker {
         &self.source_hash
     }
 
-    /// Whether the run's sources value is what the up-to-date check read: a
-    /// value taken earlier (compile, lock) may predate changes to the sources.
+    /// Whether the run's sources value is what the up-to-date check read: one
+    /// taken before the lock wait may predate changes to the sources.
     pub fn source_value_is_the_reading(&self) -> bool {
         self.pre_exec
             .as_ref()
@@ -280,17 +280,6 @@ impl ChecksumChecker {
         if self.source_hash.is_empty() && self.spec.has_sources {
             self.source_hash = value.to_string();
         }
-    }
-
-    /// The cache entry and lock checksum (`hash::cache_checksum`): the
-    /// compile's, or one from [`ChecksumChecker::source_value`] and the
-    /// compiled vars digest. Empty without a sources value.
-    pub async fn cache_checksum(&mut self) -> String {
-        if !self.task.cache_checksum.is_empty() {
-            return self.task.cache_checksum.clone();
-        }
-        let digest = self.task.cache_vars_digest.clone();
-        crate::hash::join_cache_checksum(self.source_value().await, &digest)
     }
 
     /// Records the current sources and generates hashes as up to date, read

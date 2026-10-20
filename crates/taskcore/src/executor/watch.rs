@@ -220,6 +220,7 @@ impl Executor {
         let mut stack = vec![call.clone()];
         while let Some(current) = stack.pop() {
             let task = self.compiled_task(&current).await?;
+            let task = self.resolved_task(&current, task, true).await?;
             let key = task.name().to_string();
             if !visited.insert(key) {
                 continue;
