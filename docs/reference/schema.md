@@ -1032,6 +1032,14 @@ What a command can change inside the root directory:
 - nothing else: a command cannot create a file in a directory that holds files
   it may not read.
 
+A rule can only grant a directory that exists, so task creates the missing
+`generates` and `writes` directories, and their missing parents, before the
+commands run. Once the whole run is over, it removes those still empty, even
+one a command also created and meant to keep empty, unless a symlink now stands
+on the way. A process running beside the run, or one a command left running in
+the background, may still mean to write in one; a sandboxed one cannot create
+it again.
+
 The root directory itself is never writable, even when every file in it is
 readable: nothing can be created, removed or renamed directly in it, and its
 own files can only be read. A file generated directly in it

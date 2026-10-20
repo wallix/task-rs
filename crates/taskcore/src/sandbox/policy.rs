@@ -20,10 +20,14 @@
 //! are not. Outside the root everything is allowed, except in the root's own
 //! ancestors: they may only be listed, as Landlock cannot grant creating or
 //! removing entries in one without granting it throughout the root too.
+//!
+//! A directory the commands may write in has to exist for a rule to grant it,
+//! so building the rules creates the missing ones; those still empty once the
+//! run is over are removed again (see [`CreatedDir`]).
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Landlock filesystem access rights (`include/uapi/linux/landlock.h`).
 /// Elsewhere only the policy is built, never enforced.
@@ -96,6 +100,9 @@ pub struct Policy {
     /// The lock held on `tmpdir` while the policy lives, which keeps
     /// [`remove_stale_tmp`] off it.
     _tmp_lock: Option<TmpLock>,
+    /// The directories building the rules created, until
+    /// [`Policy::take_created`] hands them to the run.
+    created: std::sync::Mutex<Vec<CreatedDir>>,
     /// The Landlock ruleset built from `rules`, on first use.
     #[cfg(target_os = "linux")]
     pub(crate) ruleset: std::sync::OnceLock<Result<std::os::fd::OwnedFd, String>>,
@@ -166,6 +173,8 @@ impl Policy {
         let tmp_lock = tmpdir.as_deref().map(private_tmp).transpose()?;
         let mut warnings = Vec::new();
         let mut writable = HashSet::new();
+        // Removed again should the build fail.
+        let mut created = Created(Vec::new());
         // What each directory is, and what to do about it, for the warning.
         let fix = "list the directories beneath it that the commands change";
         let declared = input
@@ -187,10 +196,18 @@ impl Policy {
             let fix = "set TASK_TEMP_DIR to a directory beneath it";
             (dir, "the commands' TMPDIR (in TASK_TEMP_DIR)", fix)
         });
-        for (dir, what, fix) in declared.chain([temp_dir]).chain(tmp) {
+        let declared = declared.map(|d| (d, true));
+        let own = [temp_dir].into_iter().chain(tmp).map(|d| (d, false));
+        for ((dir, what, fix), granted) in declared.chain(own) {
             // One outside the root is created too: directly in an ancestor of
-            // the root, the commands could not create it themselves.
-            let Some(real) = beneath(&root, dir)? else {
+            // the root, the commands could not create it themselves. The
+            // task's own temporary directories stay task's to manage.
+            let real = if granted {
+                created.grant(&root, dir)?
+            } else {
+                beneath(&root, dir)?
+            };
+            let Some(real) = real else {
                 warnings.push(format!(
                     "{what} {:?} is the root directory or above it and is ignored; {fix}",
                     dir.display()
@@ -215,7 +232,7 @@ impl Policy {
             if unrestricted(&root, dir) {
                 continue;
             }
-            let Some(dir) = beneath(&root, dir)? else {
+            let Some(dir) = created.grant(&root, dir)? else {
                 warnings.push(format!(
                     "{what} writes in the root directory or above it, which is not \
                      made writable; put the outputs in a subdirectory (e.g. bin/app)"
@@ -267,9 +284,22 @@ impl Policy {
             rules,
             by_path,
             _tmp_lock: tmp_lock,
+            created: std::sync::Mutex::new(std::mem::take(&mut created.0)),
             #[cfg(target_os = "linux")]
             ruleset: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Returns directories created for the rules, for [`remove_created`] after
+    /// the run. Untaken directories are cleaned up when the policy is dropped,
+    /// including when the run is cancelled during policy construction.
+    pub(crate) fn take_created(&self) -> Vec<CreatedDir> {
+        std::mem::take(
+            &mut *self
+                .created
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// A policy of just `rules`, for testing how they are enforced.
@@ -283,6 +313,7 @@ impl Policy {
             warnings: Vec::new(),
             rules,
             _tmp_lock: None,
+            created: std::sync::Mutex::new(Vec::new()),
             ruleset: std::sync::OnceLock::new(),
         }
     }
@@ -573,6 +604,117 @@ pub fn remove_stale_tmp(tmp: &Path) {
     }
 }
 
+impl Drop for Policy {
+    // As for a failed build: a concurrent one that granted a directory this
+    // one created loses it, on a run being cancelled.
+    fn drop(&mut self) {
+        remove_created(self.take_created());
+    }
+}
+
+/// A directory building a policy created, as it was then. Removed once the
+/// run is over (or at once, should the build fail or be cancelled), and only
+/// if it is still that directory, reached without a symlink, and empty. A
+/// background or foreign process may still have meant to write in it.
+#[derive(Debug)]
+pub(crate) struct CreatedDir {
+    path: PathBuf,
+    #[cfg(unix)]
+    id: (u64, u64),
+}
+
+impl CreatedDir {
+    /// `path`, canonical, as it is now; `None` once it is gone.
+    fn new(path: PathBuf) -> Option<Self> {
+        let _meta = std::fs::symlink_metadata(&path).ok()?;
+        Some(Self {
+            #[cfg(unix)]
+            id: {
+                use std::os::unix::fs::MetadataExt;
+                (_meta.dev(), _meta.ino())
+            },
+            path,
+        })
+    }
+
+    /// Whether `path` still names the directory created, through no symlink.
+    fn unchanged(&self) -> bool {
+        if std::fs::canonicalize(&self.path).ok().as_ref() != Some(&self.path) {
+            return false;
+        }
+        let Ok(_meta) = std::fs::symlink_metadata(&self.path) else {
+            return false;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if (_meta.dev(), _meta.ino()) != self.id {
+                return false;
+            }
+        }
+        _meta.is_dir()
+    }
+}
+
+/// Removes empty `dirs`, innermost first, including parents emptied by removing
+/// their children. Written files and their containing directories stay.
+pub(crate) fn remove_created(mut dirs: Vec<CreatedDir>) {
+    dirs.sort_by(|a, b| {
+        let depth = |d: &CreatedDir| d.path.components().count();
+        depth(b).cmp(&depth(a)).then_with(|| a.path.cmp(&b.path))
+    });
+    // A path created again since is recorded twice: either record may be
+    // the one still there.
+    for dir in dirs.iter().filter(|d| d.unchanged()) {
+        // Checked, then removed: a symlink swapped in between by another
+        // process could only cost an empty directory.
+        let _ = std::fs::remove_dir(&dir.path);
+    }
+}
+
+/// The directories a policy build created so far, removed again if it fails.
+struct Created(Vec<CreatedDir>);
+
+impl Created {
+    /// Calls [`beneath`] and records created directories even if it fails or
+    /// `dir` resolves to the root: those directories still need cleanup.
+    fn grant(&mut self, root: &Path, dir: &Path) -> io::Result<Option<PathBuf>> {
+        let missing = missing_ancestors(dir);
+        let real = beneath(root, dir);
+        self.0.extend(
+            missing
+                .iter()
+                .filter_map(|d| std::fs::canonicalize(d).ok())
+                .filter_map(CreatedDir::new),
+        );
+        real
+    }
+}
+
+impl Drop for Created {
+    // Removed on the spot, not when the run is over: a concurrent build that
+    // found one existing and granted it loses it, on a run already failing.
+    fn drop(&mut self) {
+        remove_created(std::mem::take(&mut self.0));
+    }
+}
+
+/// The missing directories on the way to `dir`, innermost first. None for a
+/// path through `.` or `..`, where a missing name may stand for one that
+/// exists.
+fn missing_ancestors(dir: &Path) -> Vec<PathBuf> {
+    if dir
+        .components()
+        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+    {
+        return Vec::new();
+    }
+    dir.ancestors()
+        .take_while(|d| d.symlink_metadata().is_err())
+        .map(Path::to_path_buf)
+        .collect()
+}
+
 /// `dir` canonical, created when missing, or `None` when it is `root` or an
 /// ancestor of it. Checked before creating it and again after: a symlink on the
 /// way may lead back to the root.
@@ -699,6 +841,27 @@ mod tests {
         .unwrap()
     }
 
+    /// [`build_with`] for a second live policy, with a private TMPDIR of its
+    /// own, as concurrent runs get.
+    fn build_second(root: &Path, writable: &[&str], generated: &[&str]) -> Policy {
+        Policy::build(PolicyInput {
+            task: "t2",
+            root,
+            readable: vec![root.join("src/a.c")],
+            writable: writable.iter().map(|p| root.join(p)).collect(),
+            temp_dir: root.join(".task"),
+            generated: generated
+                .iter()
+                .map(|p| (format!("generates {p:?}"), root.join(p)))
+                .collect(),
+            referenced: Vec::new(),
+            imported: Vec::new(),
+            system_tmp: std::env::temp_dir(),
+            private_tmp: root.join(".task/tmp2"),
+        })
+        .unwrap()
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_generated_directory_leading_back_to_the_root_is_not_writable() {
@@ -708,6 +871,86 @@ mod tests {
         assert!(!p.allows(&root.join("secret"), READ_FILE));
         assert_eq!(p.warnings.len(), 2, "{:?}", p.warnings);
         assert!(p.warnings[0].contains("put the outputs in a subdirectory"));
+    }
+
+    #[test]
+    fn created_directories_left_empty_are_removed() {
+        let (_d, root) = tree(&["src/a.c"]);
+        std::fs::create_dir(root.join("existing")).unwrap();
+        let p = build_with(&root, &["src/a.c"], &["cache", "existing"], &["out/sub"]);
+        assert!(root.join("out/sub").is_dir());
+        assert!(root.join("cache").is_dir());
+        std::fs::write(root.join("cache/x"), "x").unwrap();
+        remove_created(p.take_created());
+        // Created and left empty, its parent with it.
+        assert!(!root.join("out").exists());
+        // Written in, or there already.
+        assert!(root.join("cache/x").exists());
+        assert!(root.join("existing").is_dir());
+    }
+
+    /// One run creates a parent and its own child, another a sibling: the
+    /// parent goes once both children have.
+    #[test]
+    fn a_parent_another_policy_created_beneath_is_removed() {
+        let (_d, root) = tree(&["src/a.c"]);
+        let first = build_with(&root, &["src/a.c"], &[], &["out/a"]);
+        let second = build_second(&root, &[], &["out/b"]);
+        let mut dirs = first.take_created();
+        dirs.extend(second.take_created());
+        remove_created(dirs);
+        assert!(!root.join("out").exists());
+    }
+
+    /// A failed build removes what it created.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_build_removes_what_it_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, root) = tree(&["src/a.c"]);
+        std::fs::create_dir(root.join("ro")).unwrap();
+        std::fs::set_permissions(root.join("ro"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root may create in it anyway: nothing to test then.
+        if std::fs::create_dir(root.join("ro/probe")).is_ok() {
+            return;
+        }
+        let built = Policy::build(PolicyInput {
+            task: "t",
+            root: &root,
+            readable: vec![root.join("src/a.c")],
+            writable: vec![root.join("out/a"), root.join("ro/x")],
+            temp_dir: root.join(".task"),
+            generated: Vec::new(),
+            referenced: Vec::new(),
+            imported: Vec::new(),
+            system_tmp: std::env::temp_dir(),
+            private_tmp: root.join(".task/tmp"),
+        });
+        assert!(built.is_err());
+        assert!(!root.join("out").exists());
+        std::fs::set_permissions(root.join("ro"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Nothing is removed through a symlink the commands put on the way, nor
+    /// for a path through `..`, where a missing name may stand for one that
+    /// exists.
+    #[cfg(unix)]
+    #[test]
+    fn removal_follows_no_symlink_and_skips_dot_dot() {
+        let (_d, root) = tree(&["src/a.c"]);
+        let p = build_with(&root, &["src/a.c"], &["out/a", "out/a/b/c"], &[]);
+        // The commands, free in out/a, swap out/a/b for a link to an empty c.
+        std::fs::create_dir_all(root.join("elsewhere/c")).unwrap();
+        std::fs::remove_dir(root.join("out/a/b/c")).unwrap();
+        std::fs::remove_dir(root.join("out/a/b")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("out/a/b")).unwrap();
+        remove_created(p.take_created());
+        assert!(root.join("elsewhere/c").is_dir());
+
+        let p = build_second(&root, &["dots/x/../y"], &[]);
+        assert!(root.join("dots/y").is_dir());
+        remove_created(p.take_created());
+        assert!(root.join("dots/y").is_dir());
     }
 
     #[test]

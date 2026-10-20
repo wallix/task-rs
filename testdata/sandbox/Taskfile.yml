@@ -16,6 +16,28 @@ tasks:
       # src holds only sources, so the command may create and remove files in it
       - echo tmp > src/b.tmp && rm src/b.tmp
 
+  # Two output directories and a writes one, all missing: only the one written
+  # in is left.
+  outputs-left-empty:
+    sources: [src/**]
+    generates: [empty-out/sub/*.txt, written/out/*.txt]
+    sandbox:
+      writes: [unused]
+    cmds:
+      - cat src/a.txt > written/out/a.txt
+
+  # A sandboxed dep creates shared-out for its rules; an unsandboxed one
+  # beside it writes in it after the first is done, before the run is over.
+  mixed-parallel:
+    deps: [mixed-sandboxed, mixed-plain]
+  mixed-sandboxed:
+    sandbox: true
+    sources: [src/**]
+    generates: [shared-out/a/*.txt]
+    cmds: ['sleep 0.3']
+  mixed-plain:
+    cmds: ['sleep 0.1; mkdir -p shared-out; sleep 0.5; echo b > shared-out/b']
+
   # The fingerprints of an unsandboxed task are read while a sandboxed
   # command runs, and may read what that sandbox denies.
   hash-beside-sandbox:

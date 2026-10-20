@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **A sandboxed run no longer leaves behind the empty `generates` and
+  `writes` directories it had to create** for its rules: those still empty
+  once the run is over are removed.
 - **`CHECKSUM`, the cache key and the build-once lock are taken after
   `setup`, for every task.** When setup changes a task's sources, the run now
   restores and saves its cache entry, and tasks that differ only in what setup

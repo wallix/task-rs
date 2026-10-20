@@ -59,6 +59,7 @@ pub fn supervisor_available() -> Result<(), String> {
     }
 }
 
+pub(crate) use policy::{CreatedDir, remove_created};
 pub use policy::{Policy, PolicyInput, remove_stale_tmp, remove_tmp};
 
 /// What `TASK_SANDBOX` asks for.

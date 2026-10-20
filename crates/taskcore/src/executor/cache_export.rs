@@ -29,6 +29,8 @@ impl Executor {
     /// Must be awaited inside a [`tokio::task::LocalSet`]: dependencies, setup
     /// tasks and nested `task:` commands are queued with `spawn_local`, which
     /// panics outside one.
+    ///
+    /// A failing setup stops processes as a failing [`Executor::run`] does.
     pub async fn export_cache(
         self: &Rc<Self>,
         zip_path: &Path,
@@ -80,6 +82,8 @@ impl Executor {
     /// Must be awaited inside a [`tokio::task::LocalSet`]: dependencies, setup
     /// tasks and nested `task:` commands are queued with `spawn_local`, which
     /// panics outside one.
+    ///
+    /// A failing setup stops processes as a failing [`Executor::run`] does.
     pub async fn import_cache(
         self: &Rc<Self>,
         zip_path: &Path,
@@ -181,6 +185,13 @@ impl Executor {
     /// export and preparation steps are applied after an import. Ports Go
     /// `runSetupForCalls`.
     async fn run_setup_for_calls(self: &Rc<Self>, calls: &[Call]) -> Result<(), ExecutorError> {
+        let result = self.run_setups(calls).await;
+        // A teardown boundary, as the end of a run is.
+        self.drain_queue(result.is_err()).await;
+        result
+    }
+
+    async fn run_setups(self: &Rc<Self>, calls: &[Call]) -> Result<(), ExecutorError> {
         for call in calls {
             let task = self.compiled_task(call).await?;
             for dep in &task.setup {

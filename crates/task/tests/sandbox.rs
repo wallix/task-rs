@@ -47,6 +47,41 @@ fn condition_available(mode: &str) -> bool {
     available(mode) && (mode != "landlock" || available("seccomp"))
 }
 
+/// The directories the sandbox creates for its rules are removed after the
+/// run when the commands wrote nothing in them.
+#[test]
+fn created_directories_left_empty_are_removed() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        let dir = stage("sandbox");
+        let r = run_with_env(&dir, &["outputs-left-empty"], &[("TASK_SANDBOX", mode)]);
+        assert!(r.ok(), "{mode}: {}", r.combined());
+        assert!(!dir.join("unused").exists(), "{mode}");
+        assert!(!dir.join("empty-out").exists(), "{mode}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("written/out/a.txt")).unwrap(),
+            "a\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The directories a sandbox created are removed once the whole run is over:
+/// an unsandboxed task running beside it may still write in them.
+#[test]
+fn created_directories_stay_while_the_run_goes_on() {
+    for mode in ENFORCING.into_iter().filter(|m| available(m)) {
+        let dir = stage("sandbox");
+        let r = run_with_env(&dir, &["mixed-parallel"], &[("TASK_SANDBOX", mode)]);
+        assert!(r.ok(), "{mode}: {}", r.combined());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("shared-out/b")).unwrap(),
+            "b\n"
+        );
+        assert!(!dir.join("shared-out/a").exists(), "{mode}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[test]
 fn sources_and_outputs_are_allowed() {
     for mode in ENFORCING.into_iter().filter(|m| available(m)) {
@@ -877,7 +912,8 @@ fn writes_naming_a_task_follow_its_vars() {
         assert!(!r.ok(), "{mode}: expected a failure: {}", r.combined());
         let mixed = std::fs::canonicalize(&dir).unwrap().join("mixed");
         assert_denied_create(&r, mode, "gen-lang", &mixed);
-        assert!(dir.join("mixed/de").is_dir(), "{mode}");
+        // Created for the grant, and removed again: nothing was written in it.
+        assert!(!dir.join("mixed/de").exists(), "{mode}");
         assert!(!dir.join("mixed/fr").exists(), "{mode}");
         let _ = std::fs::remove_dir_all(&dir);
     }

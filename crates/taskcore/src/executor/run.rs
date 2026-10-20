@@ -716,6 +716,10 @@ impl Executor {
                 "left by the cancelled run",
             );
         }
+        // The run is over: the directories its sandboxes created and left
+        // empty go, a few cheap syscalls each. A process a command left
+        // running in the background may still have meant to write in one.
+        crate::sandbox::remove_created(std::mem::take(&mut *self.sandbox_dirs.borrow_mut()));
     }
 
     /// Logs what a sweep did, `occasion` naming what prompted it. What it
@@ -1895,6 +1899,8 @@ impl Executor {
         .await
         .map_err(|e| fail(std::io::Error::other(e)))?
         .map_err(fail)?;
+        // Handed over before anything can still reject the policy.
+        self.sandbox_dirs.borrow_mut().extend(policy.take_created());
         if let Some(tmp) = &policy.tmpdir
             && tmp.to_str().is_none()
         {

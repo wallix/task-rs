@@ -204,6 +204,9 @@ pub struct Executor {
     /// Tracks the tasks queued on the runtime so an abandoned run can tear them
     /// down instead of leaving their commands behind.
     pub(crate) queue: run::TaskQueue,
+    /// The directories sandboxes created for their rules, removed when left
+    /// empty once the run is over (see [`crate::sandbox::remove_created`]).
+    pub(crate) sandbox_dirs: RefCell<Vec<crate::sandbox::CreatedDir>>,
 }
 
 impl Default for Executor {
@@ -257,6 +260,7 @@ impl Default for Executor {
             prompt_turn: Mutex::new(()),
             run_once: Mutex::new(HashMap::new()),
             queue: run::TaskQueue::default(),
+            sandbox_dirs: RefCell::new(Vec::new()),
         }
     }
 }
