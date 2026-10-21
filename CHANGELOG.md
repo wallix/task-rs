@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.11.0 - 2026-10-21
+
 - **Breaking: a keyword argument to Jinja's `default` filter is an error**,
   as for every other filter. `{{ X | default("y", boolean=false) }}` used to
   substitute for an empty `X` despite `boolean=false`; pass the second
