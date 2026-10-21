@@ -92,7 +92,7 @@ clap = { version = "4", features = ["derive", "env", "string"] }
 # of the dedup cache format. Kept in step with virtkit's pins (the eventual
 # merge target). No stdlib equivalent; the chunk boundaries and the
 # compressed/hashed bytes are part of the on-registry format.
-fastcdc = "4"
+fastcdc = "5"
 zstd = "0.13"
 sha2 = "0.11"
 # Fast non-cryptographic hashing (xxHash3) for the file-content fingerprint and
