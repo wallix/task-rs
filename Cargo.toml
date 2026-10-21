@@ -93,7 +93,7 @@ clap = { version = "4", features = ["derive", "env", "string"] }
 # merge target). No stdlib equivalent; the chunk boundaries and the
 # compressed/hashed bytes are part of the on-registry format.
 fastcdc = "5"
-zstd = "0.13"
+zstd = "0.14"
 sha2 = "0.11"
 # Fast non-cryptographic hashing (xxHash3) for the file-content fingerprint and
 # task-identity hashes — the cache hot path. Not security-sensitive; matches the
