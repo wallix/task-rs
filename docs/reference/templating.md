@@ -430,11 +430,9 @@ this page used to recommend for hand-written Jinja — fails with
 `unknown function`.
 
 Pass that second argument **positionally**. Filter arguments are positional
-throughout, and most filters reject a keyword outright —
-`{{ P | trimPrefix(prefix="dir/") }}` is an error — but `default` reads its
-second argument loosely enough that a keyword lands there as a value that is
-always on, so `{{ X | default("y", boolean=false) }}` substitutes for an empty
-`X` instead of leaving it: the opposite of what it says.
+throughout, and a keyword is an error: `{{ X | default("y", boolean=true) }}`
+fails with `unexpected keyword arguments`, as does
+`{{ P | trimPrefix(prefix="dir/") }}`.
 
 Where the two differ:
 

@@ -734,10 +734,10 @@ fn build_context(data: &IndexMap<String, YamlValue>) -> JinjaValue {
             YamlValue::String(s) if s == PENDING_CHECKSUM => {
                 (k.clone(), JinjaValue::from_object(PendingChecksum))
             }
-            _ => (k.clone(), JinjaValue::from_serialize(v)),
+            _ => (k.clone(), JinjaValue::from(minijinja::value::Serde(v))),
         })
         .collect();
-    context!(..JinjaValue::from_serialize(&map))
+    context!(..JinjaValue::from(minijinja::value::Serde(&map)))
 }
 
 /// Known Go template functions that take no arguments, so a bare `{{OS}}`
@@ -3128,23 +3128,26 @@ mod tests {
         assert!(to_jinja(r#"{{ default "a" .X "b" }}"#).is_err());
     }
 
-    // minijinja takes the builtin `default` filter's arguments as a `Rest`, so
-    // a keyword argument arrives as a map that its second argument reads as a
-    // truthy value: `boolean=false` turns the empty-value substitution *on*.
-    // The templating reference warns against the keyword form because of this;
-    // if a minijinja release starts rejecting or honouring it, update that
-    // warning along with this test.
+    // The builtin `default` filter rejects a keyword argument, as the other
+    // filters do; minijinja 2 read `boolean=false` as on. The templating
+    // reference documents the positional form; if a minijinja release starts
+    // accepting the keyword again, update it along with this test.
     #[test]
-    fn default_keyword_argument_is_read_as_on() {
+    fn default_keyword_argument_is_rejected() {
         let mut c = cache_with(&[("EMPTY", "")]);
         c.set_dialect(Dialect::Jinja);
-        assert_eq!(
-            c.replace(r#"{{ EMPTY | default("fb", boolean=false) }}"#),
-            "fb"
-        );
         // Positionally it means what it says.
         assert_eq!(c.replace(r#"{{ EMPTY | default("fb", false) }}"#), "");
+        assert_eq!(c.replace(r#"{{ EMPTY | default("fb", true) }}"#), "fb");
         assert!(!c.is_err(), "recorded {:?}", c.err());
+        let kw = r#"{{ EMPTY | default("fb", boolean=false) }}"#;
+        assert_eq!(c.replace(kw), kw);
+        assert!(
+            matches!(c.err(), Some(TemplaterError::Render { message, .. })
+                if message.contains("unexpected keyword arguments")),
+            "recorded {:?}",
+            c.err()
+        );
     }
 
     // minijinja passes a filter's subject first, so neither sprig-ordered

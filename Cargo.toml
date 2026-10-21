@@ -50,10 +50,11 @@ indexmap = { version = "2", features = ["serde"] }
 ryu = "1"
 itoa = "1"
 # Template engine for Taskfile variable interpolation. Go's text/template has no
-# stdlib-equivalent semantics; minijinja is the chosen engine. `custom_syntax`
+# stdlib-equivalent semantics; minijinja is the chosen engine. Its custom syntax
 # lets the Go-mode renderer use sentinel block/comment delimiters so raw Jinja
-# syntax in a Taskfile string stays literal (matches Go text/template).
-minijinja = { version = "2", features = ["custom_syntax"] }
+# syntax in a Taskfile string stays literal (matches Go text/template); `serde`
+# converts YAML values to template values.
+minijinja = { version = "3", features = ["serde"] }
 # SemVer parsing/comparison for the Taskfile `version:` field (correctness-critical;
 # reimplementing risks subtle bugs). notify for `--watch` filesystem events (no
 # stdlib equivalent).

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Breaking: a keyword argument to Jinja's `default` filter is an error**,
+  as for every other filter. `{{ X | default("y", boolean=false) }}` used to
+  substitute for an empty `X` despite `boolean=false`; pass the second
+  argument positionally.
+- **Breaking: a list or map variable renders its strings single-quoted**, as
+  Jinja2 does: `['a', 'b']` and `{'k': 'v'}` rather than `["a", "b"]` and
+  `{"k": "v"}`, in both dialects.
 - **A sandboxed run no longer leaves behind the empty `generates` and
   `writes` directories it had to create** for its rules: those still empty
   once the run is over are removed.

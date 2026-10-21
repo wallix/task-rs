@@ -348,8 +348,8 @@ fn decoded_values_render_as_pinned() {
         ("HUGE", "18446744073709551615", "18446744073709551615"),
         ("NEG", "-9223372036854775808", "-9223372036854775808"),
         ("BIG", "1e20", "100000000000000000000.0"),
-        ("TAG", "!foo bar", r#"{"!foo": "bar"}"#),
-        ("TAGN", "!foo 5", r#"{"!foo": 5}"#),
+        ("TAG", "!foo bar", "{'!foo': 'bar'}"),
+        ("TAGN", "!foo 5", "{'!foo': 5}"),
         ("STR", "!!str 1", "1"),
         ("YES", "yes", "yes"),
         ("TRU", "True", "true"),
@@ -360,8 +360,8 @@ fn decoded_values_render_as_pinned() {
         ("NAN", ".nan", "NaN"),
         ("NZ", "-0.0", "-0.0"),
         ("NUL", "~", "None"),
-        ("SEQ", "[1, yes, ~, 1.0]", r#"[1, "yes", None, 1.0]"#),
-        ("MAP", "{map: {a: 1, b: [x]}}", r#"{"a": 1, "b": ["x"]}"#),
+        ("SEQ", "[1, yes, ~, 1.0]", "[1, 'yes', None, 1.0]"),
+        ("MAP", "{map: {a: 1, b: [x]}}", "{'a': 1, 'b': ['x']}"),
     ];
     let mut yaml = String::from("version: '3'\nvars:\n");
     for (name, value, _) in cases {
