@@ -294,9 +294,7 @@ impl Executor {
         if self.summary {
             let logger = self.logger();
             for (i, call) in calls.iter().enumerate() {
-                // Setup does not run: CHECKSUM is read from the tree as it is.
-                let compiled = self.fast_compiled_task(call).await?;
-                let compiled = self.finalized_task(call, compiled, false).await?;
+                let compiled = self.summary_task(call).await?;
                 let mut logger = logger.borrow_mut();
                 crate::summary::print_space_between_summaries(&mut logger, i);
                 crate::summary::print_task(&mut logger, &compiled);
@@ -617,27 +615,76 @@ impl Executor {
         let t = self
             .resolve_for(call, &orig, &wildcards, t, evaluate_sh_vars)
             .await?;
+        let source_hash = self.source_hash(&t).await;
+        self.with_checksum(&orig, t, &source_hash, evaluate_sh_vars)
+    }
+
+    /// The checksum of `t`'s resolved sources when something needs it — the
+    /// build-once lock and cache key, a field reading it, `--summary`,
+    /// templated group markers — and empty otherwise.
+    async fn source_hash(&self, t: &Task) -> String {
         let markers = [&self.output_style.group.begin, &self.output_style.group.end]
             .iter()
             .any(|m| m.contains('{'));
         let needed = !t.sources.is_empty()
-            && (self.takes_lock(&t) || t.reads_checksum || self.summary || markers);
-        let source_hash = if needed {
-            let mut checker = ChecksumChecker::new(&self.temp_dir.fingerprint, t.clone());
-            checker.source_value().await.to_string()
-        } else {
-            String::new()
-        };
+            && (self.takes_lock(t) || t.reads_checksum || self.summary || markers);
+        if !needed {
+            return String::new();
+        }
+        let mut checker = ChecksumChecker::new(&self.temp_dir.fingerprint, t.clone());
+        checker.source_value().await.to_string()
+    }
+
+    /// `t`, compiled from `orig` and resolved, with `CHECKSUM` set to
+    /// `source_hash`.
+    fn with_checksum(
+        &self,
+        orig: &Task,
+        t: Task,
+        source_hash: &str,
+        evaluate_sh_vars: bool,
+    ) -> Result<Task, ExecutorError> {
         let taskfile_env = self.taskfile_env();
         let empty_caches = crate::ast::Caches::default();
         let ctx = self.compile_context(&taskfile_env, &empty_caches);
         Ok(variables::finalize(
-            &orig,
+            orig,
             t,
-            &source_hash,
+            source_hash,
             evaluate_sh_vars,
             &ctx,
         )?)
+    }
+
+    /// Builds `--summary` from the fast compile, which runs no `sh:` vars,
+    /// against the current tree without setup. For `from:` or `task:` sources,
+    /// takes `CHECKSUM` from the full compile: only it resolves references,
+    /// evaluating the task's and referenced tasks' `sh:` vars as `--status`
+    /// does, and reporting errors as a run would. Without references, or when
+    /// the run refuses `CHECKSUM`, hashes sources templated from `sh:` vars
+    /// as the fast compile renders them.
+    async fn summary_task(&self, call: &Call) -> Result<Task, ExecutorError> {
+        let (orig, wildcards) = self.get_task_with_match(call)?;
+        let fast = self.fast_compiled_task(call).await?;
+        let fast = self
+            .resolve_for(call, &orig, &wildcards, fast, false)
+            .await?;
+        let full = if variables::has_from_entries(&orig.sources) {
+            match self.compiled_task(call).await {
+                Ok(full) => Some(
+                    self.resolve_for(call, &orig, &wildcards, full, true)
+                        .await?,
+                ),
+                // A run refusing CHECKSUM has none: the summary shows the
+                // fast compile's, rendering the refused field empty.
+                Err(e) if refuses_checksum(&e) => None,
+                Err(e) => return Err(e),
+            }
+        } else {
+            None
+        };
+        let source_hash = self.source_hash(full.as_ref().unwrap_or(&fast)).await;
+        self.with_checksum(&orig, fast, &source_hash, false)
     }
 
     /// Queues a task on the runtime's local task set and returns its handle.
@@ -2502,6 +2549,24 @@ fn split_env(list: Option<Vec<String>>) -> Vec<(String, String)> {
             None => (e, String::new()),
         })
         .collect()
+}
+
+/// Whether `e` is a refused read of the pending `CHECKSUM`.
+fn refuses_checksum(e: &ExecutorError) -> bool {
+    use crate::compiler::CompilerError;
+    use crate::templater::TemplaterError::ChecksumUnavailable;
+    use crate::variables::CompileError;
+    let compiler =
+        |e: &CompilerError| matches!(e, CompilerError::Template(ChecksumUnavailable { .. }));
+    match e {
+        ExecutorError::Compiler(e) => compiler(e),
+        ExecutorError::Compile(e) => match &**e {
+            CompileError::Template(ChecksumUnavailable { .. }) => true,
+            CompileError::Compiler(e) => compiler(e),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Unwraps an `Arc<ExecutorError>` into an owned error, cloning if shared.

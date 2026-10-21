@@ -265,9 +265,11 @@ commands, deferred ones included, the task-level `if:`, `run:`, `label`,
 capture leaves `CHECKSUM` out, and a var named `CHECKSUM` is ignored.
 
 `--summary` runs no setup: it shows the checksum of the sources as they are,
-as does a `requires` naming `CHECKSUM`, for its check only. `--summary` also
-leaves out what `from:` and `task:` entries fold in, as resolving them would
-run the `sh:` vars of the tasks they reach.
+as does a `requires` naming `CHECKSUM`, for its check only. It covers what
+`from:` and `task:` entries fold in, as the run's does: resolving them runs the
+`sh:` vars of the task and of the tasks they reach, as `--status` does, and
+reports their errors as the run would. Otherwise `--summary` runs no `sh:` var,
+and hashes sources templated from one as they render without it.
 
 The sources are hashed only when something needs the value: the build-once
 lock and cache key of a task with `generates`, a field reading `CHECKSUM`,

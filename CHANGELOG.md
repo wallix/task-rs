@@ -13,8 +13,10 @@
   entry's own loop still expands before setup. An error resolving a `task:` or
   `from:` entry is reported once setup ran, with the same message and exit
   code. `--summary`, which runs no setup, and a `requires` naming `CHECKSUM`
-  see the sources as they are; `--summary` leaves out what `from:` and
-  `task:` entries fold in.
+  see the sources as they are. `--summary` shows the run's `CHECKSUM` for a
+  task with `from:` or `task:` entries: resolving them runs the `sh:` vars of
+  the task and of the tasks they reach, and reports their errors, as the run
+  does.
 - **Breaking: `CHECKSUM` is one value, the final one.** Commands of a task
   with `from:` or `task:` sources now see the checksum its fingerprint and
   cache key record, covering what those entries fold in, instead of a

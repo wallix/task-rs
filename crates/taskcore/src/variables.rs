@@ -1192,7 +1192,7 @@ fn compute_full_name(orig_task: &Task, vars: &Vars) -> String {
 
 /// Reports whether any glob in the slice carries a `from:` or `task:`
 /// reference.
-fn has_from_entries(globs: &[Glob]) -> bool {
+pub(crate) fn has_from_entries(globs: &[Glob]) -> bool {
     globs.iter().any(Glob::is_reference)
 }
 

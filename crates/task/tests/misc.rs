@@ -428,7 +428,7 @@ fn task_reference_with_sh_var() {
 
 /// A `task:` name, or a dep name read by `from: deps`, templated from a
 /// task-level `sh:` var resolves when the task runs and under `--summary`,
-/// whose fast compile does not run `sh:`.
+/// which resolves it through the full compile.
 #[test]
 fn task_reference_name_from_sh_var() {
     let dir = scratch(
@@ -1189,20 +1189,66 @@ fn requires_checksum_without_sources_is_missing() {
     );
 }
 
-/// `--summary` does not resolve `task:` entries: that would run the `sh:`
-/// vars of the tasks they reach.
+/// `--summary` shows the run's CHECKSUM for a task with `from:` or `task:`
+/// entries: it resolves them as the run does, running the `sh:` vars of the
+/// tasks they reach.
 #[test]
-fn summary_runs_no_shell_for_references() {
+fn summary_checksum_covers_references() {
     let dir = scratch(concat!(
         "version: '3'\ntasks:\n  lib:\n    vars: {X: {sh: 'touch lib-ran'}}\n    sources: [l.txt]\n",
         "  wide:\n    sources: [x.txt, {task: lib}]\n    cmds: ['echo W={{.CHECKSUM}}']\n",
+        "  wrapper:\n    deps: [lib]\n    sources: [x.txt, {from: deps}]\n",
+        "    cmds: ['echo W={{.CHECKSUM}}']\n",
     ));
     write(&dir, "x.txt", "x");
     write(&dir, "l.txt", "l");
-    let out = run(&dir, &["--summary", "wide"]);
+    let value = |out: &str| {
+        let at = out.find("W=").map(|i| i + 2).unwrap_or(out.len());
+        out[at..]
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .collect::<String>()
+    };
+    for task in ["wide", "wrapper"] {
+        let _ = std::fs::remove_file(dir.join("lib-ran"));
+        let summary = run(&dir, &["--summary", task]);
+        assert!(summary.ok(), "{task}: {}", summary.combined());
+        assert!(dir.join("lib-ran").exists(), "{task}");
+        let shown = value(&summary.stdout);
+        assert_eq!(shown.len(), 32, "{task}: {}", summary.combined());
+        let out = run(&dir, &[task]);
+        assert!(out.ok(), "{task}: {}", out.combined());
+        assert_eq!(value(&out.stdout), shown, "{task}: {}", out.combined());
+    }
+}
+
+/// `--summary` of a task without `from:` or `task:` entries runs no `sh:`
+/// var; with them, it fails on a bad reference as the run does, and renders
+/// a refused CHECKSUM empty, as without them.
+#[test]
+fn summary_runs_the_full_compile_only_for_references() {
+    let dir = scratch(concat!(
+        "version: '3'\ntasks:\n  lib:\n    sources: [l.txt]\n",
+        "  own:\n    vars: {X: {sh: 'touch own-ran'}}\n    sources: [x.txt]\n    cmds: [echo]\n",
+        "  bad:\n    sources: [x.txt, {task: missing}]\n    cmds: [echo]\n",
+        "  refused:\n    desc: 'd-{{.CHECKSUM}}-'\n    sources: [x.txt, {task: lib}]\n    cmds: [echo]\n",
+    ));
+    write(&dir, "x.txt", "x");
+    write(&dir, "l.txt", "l");
+    let out = run(&dir, &["--summary", "own"]);
     assert!(out.ok(), "{}", out.combined());
-    assert!(out.stdout.contains("echo W="), "{}", out.combined());
-    assert!(!dir.join("lib-ran").exists());
+    assert!(!dir.join("own-ran").exists());
+    let out = run(&dir, &["--summary", "bad"]);
+    assert_eq!(out.code, 200, "{}", out.combined());
+    assert!(
+        out.stderr
+            .contains("task: bad: sources: task \"missing\" does not exist"),
+        "{}",
+        out.stderr
+    );
+    let out = run(&dir, &["--summary", "refused"]);
+    assert!(out.ok(), "{}", out.combined());
+    assert!(out.stdout.contains("d--\n"), "{}", out.combined());
 }
 
 /// A var named CHECKSUM, at any level, is ignored: commands see the
