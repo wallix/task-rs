@@ -155,7 +155,7 @@ impl CacheLock {
                 u.password.clone(),
                 &u.path,
                 timeout,
-            )))),
+            )?))),
             other => Err(CacheError::unsupported(format!(
                 "unsupported lock scheme {other:?}"
             ))),

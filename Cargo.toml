@@ -79,8 +79,8 @@ rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 # stays free of system C libraries.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Redis client for the distributed `cache.lock` backend (SET NX EX + heartbeat).
-# No stdlib equivalent; tokio async to match the engine runtime.
-redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
+# No stdlib equivalent; blocking connections only, run on tokio's blocking pool.
+redis = { version = "1", default-features = false }
 # Regular expressions for the sprig `regexReplaceAll` template helper (Go's RE2
 # syntax maps directly onto the regex crate). No stdlib regex; already present
 # in the build graph via brush.

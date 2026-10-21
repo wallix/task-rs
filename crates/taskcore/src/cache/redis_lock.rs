@@ -15,25 +15,50 @@ use tokio::sync::oneshot;
 
 use super::error::CacheError;
 
-/// Opens a single (non-multiplexed) async connection. The multiplexed connection
-/// spawns a background driver that starves on the engine's current-thread
-/// runtime (a ~40s stall), so a plain connection is used instead — which also
-/// mirrors Go, where every lock operation dials its own connection.
-#[allow(deprecated)]
-async fn open(info: &redis::ConnectionInfo) -> Result<redis::aio::Connection, redis::RedisError> {
-    let client = redis::Client::open(info.clone())?;
-    client.get_async_connection().await
+/// Runs `f` on the blocking pool. Lock operations use blocking connections
+/// there: redis' only async connection is the multiplexed one, whose
+/// background driver starves on the engine's current-thread runtime (a ~40s
+/// stall).
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, redis::RedisError> + Send + 'static,
+) -> Result<T, redis::RedisError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| std::io::Error::other(e).into())
+        .and_then(|r| r)
 }
 
-/// [`open`] bounded by [`CONNECT_TIMEOUT`], returning `None` on connect error or
-/// timeout — for the heartbeat, whose renewals are best-effort and must never
-/// stall on a dropped SYN (`get_async_connection` has no built-in bound).
-#[allow(deprecated)]
-async fn open_bounded(info: &redis::ConnectionInfo) -> Option<redis::aio::Connection> {
-    tokio::time::timeout(CONNECT_TIMEOUT, open(info))
-        .await
-        .ok()
-        .and_then(Result::ok)
+/// Opens a single blocking connection, bounded by [`CONNECT_TIMEOUT`] to
+/// connect and `io` for each command. Each acquire attempt dials its own, as
+/// in Go; the heartbeat reuses one until a renewal fails.
+async fn open(
+    info: &redis::ConnectionInfo,
+    io: Duration,
+) -> Result<redis::Connection, redis::RedisError> {
+    let info = info.clone();
+    blocking(move || {
+        let conn = redis::Client::open(info)?.get_connection_with_timeout(CONNECT_TIMEOUT)?;
+        conn.set_read_timeout(Some(io))?;
+        conn.set_write_timeout(Some(io))?;
+        Ok(conn)
+    })
+    .await
+}
+
+/// Runs `cmd` over `conn` on the blocking pool, returning the connection.
+async fn query<T: redis::FromRedisValue + Send + 'static>(
+    mut conn: redis::Connection,
+    cmd: redis::Cmd,
+) -> (Option<redis::Connection>, Result<T, redis::RedisError>) {
+    let result = blocking(move || {
+        let reply = cmd.query::<T>(&mut conn);
+        Ok((conn, reply))
+    })
+    .await;
+    match result {
+        Ok((conn, reply)) => (Some(conn), reply),
+        Err(e) => (None, Err(e)),
+    }
 }
 
 /// Lock TTL in seconds; refreshed by the heartbeat.
@@ -46,10 +71,11 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_ACQUIRE_MAX: Duration = Duration::from_secs(3600);
 /// How long to keep retrying connection failures before giving up.
 const CONNECT_GIVE_UP: Duration = Duration::from_secs(30);
-/// Connect timeout for a single acquire attempt: `get_async_connection` has no
-/// built-in bound, so a dropped SYN would stall ~2 min per attempt and defeat
-/// the `CONNECT_GIVE_UP` budget above.
+/// Connect timeout for a single attempt: unbounded, a dropped SYN would stall
+/// ~2 min per attempt and defeat the `CONNECT_GIVE_UP` budget above.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Read and write timeout of an acquire attempt's `SET`.
+const ACQUIRE_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Connection timeout for the blocking release in `Drop`, so a slow or
 /// unreachable Redis cannot stall task teardown.
 const RELEASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -74,21 +100,25 @@ impl RedisLocker {
         password: Option<String>,
         path: &str,
         timeout: Option<Duration>,
-    ) -> Self {
+    ) -> Result<Self, CacheError> {
+        use redis::IntoConnectionInfo;
         let (host, port) = split_host_port(host);
-        let conn_info = redis::ConnectionInfo {
-            addr: redis::ConnectionAddr::Tcp(host, port),
-            redis: redis::RedisConnectionInfo {
-                username: (!username.is_empty()).then(|| username.to_string()),
-                password,
-                ..Default::default()
-            },
-        };
-        Self {
+        let mut settings = redis::RedisConnectionInfo::default();
+        if !username.is_empty() {
+            settings = settings.set_username(username);
+        }
+        if let Some(password) = password {
+            settings = settings.set_password(password);
+        }
+        let conn_info = redis::ConnectionAddr::Tcp(host, port)
+            .into_connection_info()
+            .map_err(|e| CacheError::msg(format!("redis lock: {e}")))?
+            .set_redis_settings(settings);
+        Ok(Self {
             conn_info,
             key_prefix: path.trim_start_matches('/').to_string(),
             acquire_max: timeout.unwrap_or(DEFAULT_ACQUIRE_MAX),
-        }
+        })
     }
 
     /// The Redis key for `name`: the URL path prefix joined with `name` by `:`
@@ -119,9 +149,8 @@ impl RedisLocker {
         let mut notify: Option<F> = Some(on_contention);
 
         loop {
-            let mut conn = match tokio::time::timeout(CONNECT_TIMEOUT, open(&self.conn_info)).await
-            {
-                Ok(Ok(conn)) => {
+            let conn = match open(&self.conn_info, ACQUIRE_IO_TIMEOUT).await {
+                Ok(conn) => {
                     // Only consecutive failures count toward the connect budget.
                     connect_deadline = Instant::now().checked_add(CONNECT_GIVE_UP);
                     conn
@@ -129,28 +158,24 @@ impl RedisLocker {
                 // A connect error, or a connect that timed out, both count as a
                 // failure: retry until the connect budget is exhausted, then give
                 // up so the caller can fall back to a local lock.
-                res => {
+                Err(e) => {
                     if reached(connect_deadline) {
-                        return Err(match res {
-                            Ok(Err(e)) => map_err("connect", &key, e),
-                            _ => CacheError::msg(format!(
-                                "redis lock connect for {key:?}: timed out after {CONNECT_TIMEOUT:?}"
-                            )),
-                        });
+                        return Err(map_err("connect", &key, e));
                     }
                     tokio::time::sleep(RETRY_INTERVAL).await;
                     continue;
                 }
             };
 
-            let reply: redis::Value = redis::cmd("SET")
-                .arg(&key)
+            let mut set = redis::cmd("SET");
+            set.arg(&key)
                 .arg(&owner)
                 .arg("NX")
                 .arg("EX")
-                .arg(LOCK_TTL_SECS)
-                .query_async(&mut conn)
+                .arg(LOCK_TTL_SECS);
+            let reply: redis::Value = query(conn, set)
                 .await
+                .1
                 .map_err(|e| map_err("SET NX", &key, e))?;
 
             // A nil reply means the key already existed (held by someone else);
@@ -275,7 +300,9 @@ async fn heartbeat(
 ) {
     // The last moment Redis confirmed the key was ours.
     let mut last_ok = acquired;
-    let mut conn = open_bounded(&conn_info).await;
+    // Bounded: a renewal that outlives one heartbeat interval is a lost
+    // renewal, not a slow one; a half-open connection must not park this loop.
+    let mut conn = open(&conn_info, HEARTBEAT).await.ok();
     let mut ticker = tokio::time::interval(HEARTBEAT);
     ticker.tick().await; // the first tick completes immediately; skip it
     loop {
@@ -283,9 +310,9 @@ async fn heartbeat(
             _ = &mut stop => return,
             _ = ticker.tick() => {
                 if conn.is_none() {
-                    conn = open_bounded(&conn_info).await;
+                    conn = open(&conn_info, HEARTBEAT).await.ok();
                 }
-                let renewed: Option<i64> = match conn.as_mut() {
+                let renewed: Option<i64> = match conn.take() {
                     Some(c) => {
                         let mut renew = redis::cmd("EVAL");
                         renew
@@ -294,15 +321,9 @@ async fn heartbeat(
                             .arg(&key)
                             .arg(&owner)
                             .arg(LOCK_TTL_SECS);
-                        // Bounded: a renewal that outlives one heartbeat
-                        // interval is a lost renewal, not a slow one. Unbounded
-                        // (`query_async` has no timeout of its own), a half-open
-                        // connection would park this loop forever and the
-                        // give-up check below would never run.
-                        tokio::time::timeout(HEARTBEAT, renew.query_async::<i64>(c))
-                            .await
-                            .ok()
-                            .and_then(Result::ok)
+                        let (back, reply) = query(c, renew).await;
+                        conn = back;
+                        reply.ok()
                     }
                     // No connection to ask over — same as a failed renewal.
                     None => None,
@@ -389,10 +410,10 @@ mod tests {
 
     #[test]
     fn key_joins_prefix_and_name() {
-        let l = RedisLocker::new("h", "", None, "/locks", None);
+        let l = RedisLocker::new("h", "", None, "/locks", None).unwrap();
         assert_eq!(l.key("t:hash"), "locks:t:hash");
         // An empty path prefix uses the name alone.
-        let l = RedisLocker::new("h", "", None, "/", None);
+        let l = RedisLocker::new("h", "", None, "/", None).unwrap();
         assert_eq!(l.key("t"), "t");
     }
 
@@ -405,7 +426,7 @@ mod tests {
             return;
         };
         let name = format!("excl-{}", now_nanos());
-        let locker = RedisLocker::new(&addr, "", None, "/task-test-lock", None);
+        let locker = RedisLocker::new(&addr, "", None, "/task-test-lock", None).unwrap();
 
         let held = locker.lock(&name, || {}).await.expect("first acquire");
 
@@ -416,7 +437,8 @@ mod tests {
             None,
             "/task-test-lock",
             Some(Duration::from_millis(1)),
-        );
+        )
+        .unwrap();
         assert!(
             contended.lock(&name, || {}).await.is_err(),
             "second acquire should time out while held"
