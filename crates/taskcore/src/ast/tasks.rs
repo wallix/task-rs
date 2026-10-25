@@ -93,6 +93,26 @@ impl Tasks {
         self.all(sorter).into_iter().map(|(_, t)| t).collect()
     }
 
+    /// Resolves root task references by stripping `::` after all includes are merged.
+    pub(crate) fn resolve_root_refs(&mut self) {
+        fn resolve(name: &mut String) {
+            if let Some(after) = name.strip_prefix(ROOT_PREFIX) {
+                *name = after.to_string();
+            }
+        }
+        for task in self.om.values_mut() {
+            for dep in task.setup.iter_mut().chain(task.deps.iter_mut()) {
+                resolve(&mut dep.task);
+            }
+            for g in task.glob_entries_mut() {
+                resolve(&mut g.task);
+            }
+            for cmd in &mut task.cmds {
+                resolve(&mut cmd.task);
+            }
+        }
+    }
+
     /// Merges the tasks of `other` into `self`, applying namespacing, exclude,
     /// flatten, and advanced-import rules from `include`. `included_taskfile_vars`
     /// carries the parent's variables so advanced imports can propagate them.
@@ -119,26 +139,26 @@ impl Tasks {
                 // Namespace the task's setup dependencies.
                 for dep in &mut task.setup {
                     if !dep.task.is_empty() {
-                        dep.task = task_name_with_namespace(&dep.task, &include.namespace);
+                        dep.task = ref_with_namespace(&dep.task, &include.namespace);
                     }
                 }
                 // Namespace the task's dependencies.
                 for dep in &mut task.deps {
                     if !dep.task.is_empty() {
-                        dep.task = task_name_with_namespace(&dep.task, &include.namespace);
+                        dep.task = ref_with_namespace(&dep.task, &include.namespace);
                     }
                 }
                 // Namespace the task references in sources, generates and
                 // sandbox.
                 for g in task.glob_entries_mut() {
                     if !g.task.is_empty() {
-                        g.task = task_name_with_namespace(&g.task, &include.namespace);
+                        g.task = ref_with_namespace(&g.task, &include.namespace);
                     }
                 }
                 // Namespace the task's command calls.
                 for cmd in &mut task.cmds {
                     if !cmd.task.is_empty() {
-                        cmd.task = task_name_with_namespace(&cmd.task, &include.namespace);
+                        cmd.task = ref_with_namespace(&cmd.task, &include.namespace);
                     }
                 }
                 // Namespace the existing aliases.
@@ -245,9 +265,21 @@ impl<'de> Deserialize<'de> for Tasks {
     }
 }
 
+/// Root task reference prefix at any include depth: [`NAMESPACE_SEPARATOR`] doubled.
+const ROOT_PREFIX: &str = "::";
+
+/// [`task_name_with_namespace`] for a task reference, except that a root
+/// reference (`::name`) is kept as-is for [`Tasks::resolve_root_refs`].
+fn ref_with_namespace(task_name: &str, namespace: &str) -> String {
+    if task_name.starts_with(ROOT_PREFIX) {
+        return task_name.to_string();
+    }
+    task_name_with_namespace(task_name, namespace)
+}
+
 /// Prefixes `task_name` with `namespace` and the namespace separator, unless
-/// the name already begins with the separator (an absolute reference), in which
-/// case the leading separator is stripped and the name used as-is.
+/// the name begins with the separator: that is stripped instead, and the name
+/// left to the including Taskfile (one level up).
 fn task_name_with_namespace(task_name: &str, namespace: &str) -> String {
     if let Some(after) = task_name.strip_prefix(NAMESPACE_SEPARATOR) {
         return after.to_string();
@@ -258,6 +290,7 @@ fn task_name_with_namespace(task_name: &str, namespace: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::Dep;
 
     #[test]
     fn preserves_insertion_order() {
@@ -418,5 +451,43 @@ mod tests {
         base.merge(&other, &include, &Vars::new()).unwrap();
         let default_task = base.get("sub:default").unwrap();
         assert!(default_task.aliases.contains(&"sub".to_string()));
+    }
+
+    // Two include levels down, `:x` loses its `:` at the first merge and is
+    // namespaced by the second, while `::x` passes both and names the root's
+    // `x` once resolved.
+    #[test]
+    fn merge_nested_include_keeps_root_refs_until_resolved() {
+        let mut inner = Tasks::new();
+        inner.set(
+            "build".to_string(),
+            Task {
+                deps: vec![
+                    Dep {
+                        task: ":x".to_string(),
+                        ..Default::default()
+                    },
+                    Dep {
+                        task: "::x".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ..build_task()
+            },
+        );
+        let mut mid = Tasks::new();
+        mid.merge(&inner, &include("sub", false), &Vars::new())
+            .unwrap();
+        let mut root = Tasks::new();
+        root.merge(&mid, &include("outer", false), &Vars::new())
+            .unwrap();
+
+        let deps = |tasks: &Tasks| -> Vec<String> {
+            let t = tasks.get("outer:sub:build").unwrap();
+            t.deps.iter().map(|d| d.task.clone()).collect()
+        };
+        assert_eq!(deps(&root), ["outer:x", "::x"]);
+        root.resolve_root_refs();
+        assert_eq!(deps(&root), ["outer:x", "x"]);
     }
 }

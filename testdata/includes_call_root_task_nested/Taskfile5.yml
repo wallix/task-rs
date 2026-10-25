@@ -1,0 +1,6 @@
+version: '3'
+
+tasks:
+  flat-call-root:
+    cmds:
+      - task: ::target

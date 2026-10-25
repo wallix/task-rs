@@ -971,12 +971,12 @@ tasks:
 ```
 
 In an included Taskfile, the name resolves like a `deps` entry: within the
-include, or from the root with a leading `:`. A name that does not exist, or
-that renders empty, is an error. References are followed through the
-referenced tasks' own `from:` and `task:` entries. Each task counts once with
-the same vars, so a cycle between references is no error; one called with
-other vars counts again (a task calling itself for another language covers
-both).
+include, from the including Taskfile with a leading `:`, or from the root with
+a leading `::`. A name that does not exist, or that renders empty, is an
+error. References are followed through the referenced tasks' own `from:` and
+`task:` entries. Each task counts once with the same vars, so a cycle between
+references is no error; one called with other vars counts again (a task
+calling itself for another language covers both).
 
 What a task runs is found without running anything, conservatively: an `if:`
 on a task or command, `requires`, prompts and a command's `platforms:` are

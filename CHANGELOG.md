@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Breaking: a leading `::` names a task of the root Taskfile from an
+  include at any depth**, in `deps`, `setup`, `task:` commands and `task:`
+  entries of `sources`, `generates` and `sandbox.writes`. Go Task, and task-rs
+  until now, go up one include level per `:`, so `::name` reached the root
+  only from exactly two levels down; from three or more it now names a root
+  task instead of an intermediate include's, and `:::name` names no task. A
+  leading `:` still names a task of the including Taskfile, one level up; the
+  docs said root.
+
 ## v4.11.0 - 2026-10-21
 
 - **Breaking: a keyword argument to Jinja's `default` filter is an error**,

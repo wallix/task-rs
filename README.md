@@ -310,6 +310,9 @@ v3 are intentional.
 - Representative fingerprint files for large `sources` or `generates` globs.
 - `from: deps`, `from: cmds` and `task:` inheritance for sources and generated
   files.
+- A leading `::` in a task reference names a root task from any include depth,
+  where Go Task goes up two include levels; a leading `:` names one of the
+  including Taskfile, as in Go Task.
 - `--status`, `--export-cache`, `--import-cache`, and self-update commands.
 - Native Jinja templating and an automated migration path from Go templates.
 - Duplicate YAML task keys are errors instead of last-definition-wins.

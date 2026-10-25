@@ -1,0 +1,36 @@
+version: '3'
+
+tasks:
+  call-root:
+    cmds:
+      - task: ::target
+
+  dep-root:
+    deps: ['::target']
+
+  sources-root:
+    sources:
+      - task: ::root-only
+    cmds:
+      - echo "ok" > target.txt
+
+  setup-root:
+    setup: ['::target']
+
+  defer-root:
+    cmds:
+      - defer: {task: ::target}
+
+  generates-root:
+    generates:
+      - task: ::root-only
+    cmds:
+      - echo "ok" > target.txt
+
+  writes-root:
+    sandbox:
+      writes: [{task: ::root-only}]
+
+  triple-root:
+    cmds:
+      - task: :::target

@@ -1,0 +1,16 @@
+version: '3'
+
+includes:
+  deep: Taskfile4.yml
+
+tasks:
+  target:
+    cmds:
+      - echo "leaf" > target.txt
+
+  call-parent:
+    cmds:
+      - task: :target
+
+  dep-parent:
+    deps: [':target']

@@ -130,6 +130,48 @@ fn includes_calling_root() {
     assert_file(&dir, "root_task.txt", "root task");
 }
 
+// A leading `:` escapes one include level: from a nested include it names a
+// task of the parent include. A leading `::` names a root task at any depth,
+// including from a flattened include; `:::` names no task.
+#[test]
+fn includes_calling_parent_and_root_from_nested() {
+    for (task, want) in [
+        ("mid:leaf:call-parent", "mid"),
+        ("mid:leaf:dep-parent", "mid"),
+        ("mid:leaf:deep:call-root", "root"),
+        ("mid:leaf:deep:dep-root", "root"),
+        ("mid:leaf:deep:sources-root", "ok"),
+        ("mid:leaf:deep:setup-root", "root"),
+        ("mid:leaf:deep:defer-root", "root"),
+        ("mid:leaf:deep:generates-root", "ok"),
+        ("mid:flat-call-root", "root"),
+        ("mid:call-root", "root"),
+        ("call-root", "root"),
+    ] {
+        let dir = stage("includes_call_root_task_nested");
+        let o = run(&dir, &[task]);
+        assert!(o.ok(), "{task}: run failed: {}", o.combined());
+        assert_file(&dir, "target.txt", want);
+    }
+
+    // `sandbox.writes` resolves its references whatever the sandbox mode.
+    let dir = stage("includes_call_root_task_nested");
+    let o = run_with_env(
+        &dir,
+        &["mid:leaf:deep:writes-root"],
+        &[("TASK_SANDBOX", "off")],
+    );
+    assert!(o.ok(), "writes-root: run failed: {}", o.combined());
+
+    let o = run(&dir, &["mid:leaf:deep:triple-root"]);
+    assert!(!o.ok(), "triple-root: unexpectedly ran");
+    assert!(
+        o.combined().contains(r#"Task ":target" does not exist"#),
+        "triple-root: {}",
+        o.combined()
+    );
+}
+
 // Ports Go `TestIncludesOptional`.
 #[test]
 fn includes_optional() {

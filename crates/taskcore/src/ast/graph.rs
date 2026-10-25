@@ -217,11 +217,13 @@ impl TaskfileGraph {
         let root_hash = hashes
             .first()
             .ok_or_else(|| "task: empty Taskfile graph".to_string())?;
-        Ok(self
+        let mut root = self
             .vertex(root_hash)
             .ok_or_else(|| format!("task: vertex {root_hash} not found"))?
             .taskfile
-            .clone())
+            .clone();
+        root.tasks.resolve_root_refs();
+        Ok(root)
     }
 }
 

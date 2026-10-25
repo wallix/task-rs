@@ -757,9 +757,15 @@ The above syntax is also supported in `deps`.
 
 ::: tip
 
-NOTE: If you want to call a task declared in the root Taskfile from within an
+NOTE: To call a task of the including Taskfile from within an
 [included Taskfile](#including-other-taskfiles), add a leading `:` like this:
-`task: :task-name`.
+`task: :task-name`. The `:` goes up one include level: from a Taskfile included
+as `a:b`, `:task-name` names `a:task-name`. From a flattened include, `:`
+resolves as if written in the Taskfile that flattens it. To call a task of the
+root Taskfile from any depth, use `::`: `task: ::task-name`. Unlike Go Task,
+where `::` goes up two levels, `::` always names the root, and three or more
+leading colons name no task. The prefix must be written literally, not
+produced by a template.
 
 :::
 

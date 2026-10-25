@@ -1,0 +1,16 @@
+version: '3'
+
+includes:
+  mid: Taskfile2.yml
+
+tasks:
+  target:
+    cmds:
+      - echo "root" > target.txt
+
+  root-only:
+    sources: [Taskfile.yml]
+
+  call-root:
+    cmds:
+      - task: ::target

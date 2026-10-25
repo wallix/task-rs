@@ -1,0 +1,16 @@
+version: '3'
+
+includes:
+  leaf: Taskfile3.yml
+  flat:
+    taskfile: Taskfile5.yml
+    flatten: true
+
+tasks:
+  target:
+    cmds:
+      - echo "mid" > target.txt
+
+  call-root:
+    cmds:
+      - task: ::target
