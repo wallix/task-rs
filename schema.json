@@ -232,7 +232,7 @@
                   "type": "string"
                 },
                 "vk": {
-                  "description": "Template string for a vk-registry repository (host[:port]/repo) serving both the cache and the lock; url and lock are derived from it. Rendering empty disables the cache.",
+                  "description": "Template string for a vk-registry repository ([http[s]://]host[:port]/repo; http:// for plain HTTP) serving both the cache and the lock; url and lock are derived from it. Rendering empty disables the cache.",
                   "type": "string"
                 },
                 "api_key": {
@@ -972,7 +972,7 @@
                   "type": "string"
                 },
                 "vk": {
-                  "description": "Template string for a vk-registry repository (host[:port]/repo) serving both the cache and the lock; url and lock are derived from it. Rendering empty disables the cache.",
+                  "description": "Template string for a vk-registry repository ([http[s]://]host[:port]/repo; http:// for plain HTTP) serving both the cache and the lock; url and lock are derived from it. Rendering empty disables the cache.",
                   "type": "string"
                 },
                 "api_key": {

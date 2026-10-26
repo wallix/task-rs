@@ -1,11 +1,16 @@
 //! The `cache.vk` model: one vk-registry repository serving both the cache and
 //! the lock, so a Taskfile names the registry once and the `oci://` and
-//! `vks://` URLs are derived here.
+//! `vks://` (or `vk://`) URLs are derived here.
 //!
 //! ```text
-//! vk: host[:port]/repo      →  url:  oci://host[:port]/repo:<namespace>-<task>-<checksum>
-//!                              lock: vks://host[:port]/repo/<namespace>
+//! vk: host[:port]/repo         →  url:  oci://host[:port]/repo:<namespace>-<task>-<checksum>
+//!                                 lock: vks://host[:port]/repo/<namespace>
+//! vk: http://host[:port]/repo  →  url:  oci://host[:port]/repo:<…>?plainhttp=1
+//!                                 lock: vk://host[:port]/repo/<namespace>
 //! ```
+//!
+//! `http://` is for virtkit's guest registry proxy (`http://registry.vk`);
+//! `https://` explicitly selects the default HTTPS transport.
 //!
 //! `<task>` is the task's name in the Taskfile that defines it, with no include
 //! namespace or `label`, so every include path to a task shares its entry.
@@ -23,10 +28,22 @@ const MAX_TAG_LEN: usize = 128;
 /// name annotation makes the collision a verified miss, not a wrong restore.
 const MAX_TASK_LEN: usize = 48;
 
-/// Whether a rendered `vk` is a bare `host[:port]/repo`: no scheme, credentials,
-/// query, fragment, tag or whitespace, since all of those would be copied
+/// Returns the TLS flag and `host[:port]/repo` after stripping an optional
+/// `http://` or `https://` prefix. Other spellings stay in the host and fail
+/// [`is_valid`]; only lowercase schemes match.
+fn split_scheme(vk: &str) -> (bool, &str) {
+    if let Some(rest) = vk.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        (true, vk.strip_prefix("https://").unwrap_or(vk))
+    }
+}
+
+/// Validates a rendered `[http[s]://]host[:port]/repo`. Rejects credentials,
+/// query, fragment, tag and whitespace, which would otherwise be copied
 /// verbatim into the derived URLs.
 pub fn is_valid(vk: &str) -> bool {
+    let (_, vk) = split_scheme(vk);
     let Some((host, repo)) = vk.split_once('/') else {
         return false;
     };
@@ -43,17 +60,21 @@ pub fn is_valid(vk: &str) -> bool {
 
 /// The `oci://` cache URL for `task`'s entry at `checksum` under `vk`.
 pub fn cache_url(vk: &str, namespace: &str, task: &str, checksum: &str) -> String {
-    format!("oci://{vk}:{}", tag(namespace, task, checksum))
+    let (tls, vk) = split_scheme(vk);
+    let plain = if tls { "" } else { "?plainhttp=1" };
+    format!("oci://{vk}:{}{plain}", tag(namespace, task, checksum))
 }
 
-/// The `vks://` lock URL under `vk`: the namespace is the key prefix, the
-/// executor appends the task name and checksum.
+/// The `vks://` (`vk://` over plain HTTP) lock URL under `vk`: the namespace
+/// is the key prefix, the executor appends the task name and checksum.
 pub fn lock_url(vk: &str, namespace: &str) -> String {
+    let (tls, vk) = split_scheme(vk);
+    let scheme = if tls { "vks" } else { "vk" };
     let ns = sanitize(namespace);
     if ns.is_empty() {
-        format!("vks://{vk}")
+        format!("{scheme}://{vk}")
     } else {
-        format!("vks://{vk}/{ns}")
+        format!("{scheme}://{vk}/{ns}")
     }
 }
 
@@ -125,6 +146,26 @@ mod tests {
             lock_url("reg.example/task-cache", ""),
             "vks://reg.example/task-cache"
         );
+        assert_eq!(
+            cache_url("https://reg.example/task-cache", "", "build", "abc"),
+            "oci://reg.example/task-cache:build-abc"
+        );
+        assert_eq!(
+            lock_url("https://reg.example/task-cache", ""),
+            "vks://reg.example/task-cache"
+        );
+    }
+
+    #[test]
+    fn http_selects_plain_http() {
+        assert_eq!(
+            cache_url("http://registry.vk/task-cache", "gcc-13", "build", "abc"),
+            "oci://registry.vk/task-cache:gcc-13-build-abc?plainhttp=1"
+        );
+        assert_eq!(
+            lock_url("http://registry.vk/task-cache", "gcc-13"),
+            "vk://registry.vk/task-cache/gcc-13"
+        );
     }
 
     #[test]
@@ -133,6 +174,8 @@ mod tests {
             "reg.example/task-cache",
             "reg:5000/a/b",
             "127.0.0.1:1/task-cache",
+            "http://registry.vk/task-cache",
+            "https://reg/repo",
         ] {
             assert!(is_valid(ok), "{ok}");
         }
@@ -141,7 +184,10 @@ mod tests {
             "reg",
             "reg/",
             "/repo",
-            "https://reg/repo",
+            "http://",
+            "ftp://reg/repo",
+            "http://user@reg/repo",
+            "HTTP://reg/repo",
             "reg/repo:tag",
             "reg/repo?ca=x",
             "reg/repo#f",

@@ -1510,6 +1510,33 @@ fn cache_vk_derives_cache_and_lock_from_the_registry() {
     );
 }
 
+// An `http://` prefix on `vk:` makes the derived cache and lock plain HTTP, as
+// virtkit's guest registry proxy (`http://registry.vk`) serves them.
+#[test]
+fn cache_vk_over_http_uses_plain_http() {
+    let dir = stage("cache_vk");
+    let env = [
+        ("VK_REGISTRY", "http://127.0.0.1:1/task-cache"),
+        ("VK_NAMESPACE", "gcc 13"),
+    ];
+    let (out, code) = run_env(&dir, &["--verbose", "build"], &env);
+    assert_eq!(code, 0, "run failed: {out}");
+    assert!(dir.join("output.txt").exists());
+    assert!(
+        out.contains("cache registry 127.0.0.1:1 unreachable, continuing without cache"),
+        "{out}"
+    );
+    assert!(
+        out.contains("http://127.0.0.1:1/lock/acquire?name=task-cache%2Fgcc-13%3Abuild%3A"),
+        "{out}"
+    );
+    assert!(out.contains("http://127.0.0.1:1/v2/"), "{out}");
+    assert!(
+        !out.contains("https://127.0.0.1:1"),
+        "nothing should go over TLS: {out}"
+    );
+}
+
 // The nested copy (`outer:sub:build`) takes the same build-once lock as the
 // directly included one (`sub:build`): the key carries the task's local name
 // and cache checksum, not the include path.

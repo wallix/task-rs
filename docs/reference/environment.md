@@ -163,7 +163,8 @@ credentials and neither bearer-token variable is set.
 The vk-registry API key (a bearer token) for a `cache.vk:` model whose block
 sets no `api_key` of its own. Also read by a `cache.url: oci://...` registry
 when the URL carries no `user:pass@` credentials, taking precedence over
-`TASK_CACHE_OCI_USER` / `TASK_CACHE_OCI_PASSWORD`.
+`TASK_CACHE_OCI_USER` / `TASK_CACHE_OCI_PASSWORD`. Under `cache.vk: http://...`
+it is sent in the clear; see [`cache`](schema.md#cache).
 
 A `cache.lock: vk://...` lock reads the same token when `TASK_VK_LOCK_TOKEN` is
 unset. If both tokens are unset, it uses the OCI Basic pair instead. The lock

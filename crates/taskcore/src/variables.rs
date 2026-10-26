@@ -346,7 +346,7 @@ impl std::fmt::Display for CompileError {
             ),
             Self::CacheVkInvalid { task, vk } => write!(
                 f,
-                "task: {task}: cache: `vk` must be a bare host[:port]/repo, got {vk:?}"
+                "task: {task}: cache: `vk` must be [http[s]://]host[:port]/repo, got {vk:?}"
             ),
             Self::CacheKey { task, message } => {
                 write!(
@@ -1892,11 +1892,37 @@ mod tests {
         );
     }
 
-    /// A `vk` carrying a scheme (or anything else beyond `host[:port]/repo`)
-    /// would be copied verbatim into both derived URLs, so it is refused.
+    /// `http://` makes the derived cache and lock plain HTTP.
     #[tokio::test]
-    async fn vk_with_a_scheme_is_an_error() {
-        let caches = vk_model("https://reg.example/task-cache");
+    async fn vk_over_http_derives_plain_http_urls() {
+        let caches = vk_model("http://registry.vk/task-cache");
+        let orig = vk_task(crate::ast::Cache {
+            inherit: "default".to_string(),
+            ..Default::default()
+        });
+        let env = Vars::new();
+        let c = compiler();
+        let mut logger = silent_logger();
+        let ctx = ctx_with_caches(&env, &caches);
+        let out = compiled_task(&orig, vk_vars(), true, &ctx, &c, &mut logger)
+            .await
+            .unwrap();
+        let out = finalized(&orig, out, &ctx);
+        let key = out.cache_checksum.clone();
+        let cache = out.cache.unwrap();
+        assert_eq!(
+            cache.url,
+            format!("oci://registry.vk/task-cache:gcc-13-build-{key}?plainhttp=1")
+        );
+        assert_eq!(cache.lock, "vk://registry.vk/task-cache/gcc-13");
+    }
+
+    /// A `vk` carrying another scheme (or anything else beyond
+    /// `[http[s]://]host[:port]/repo`) would be copied verbatim into both
+    /// derived URLs, so it is refused.
+    #[tokio::test]
+    async fn vk_with_an_unsupported_scheme_is_an_error() {
+        let caches = vk_model("ftp://reg.example/task-cache");
         let orig = vk_task(crate::ast::Cache {
             inherit: "default".to_string(),
             ..Default::default()
@@ -1906,7 +1932,7 @@ mod tests {
         let mut logger = silent_logger();
         let ctx = ctx_with_caches(&env, &caches);
         let Err(err) = compiled_task(&orig, vk_vars(), true, &ctx, &c, &mut logger).await else {
-            panic!("vk with a scheme must fail");
+            panic!("vk with an unsupported scheme must fail");
         };
         assert!(
             matches!(err, CompileError::CacheVkInvalid { .. }),

@@ -13,9 +13,9 @@ single small host:
   (and, optionally, `redis://` cache entries for small blobs).
 
 With a [vk-registry](https://github.com/wallix/virtkit) neither half needs
-configuring separately: a `cache.vk: <host>/<repo>` model derives the cache
-entries and takes the lock over the registry's own `/lock` API, and one API key
-in `TASK_VK_API_KEY` authenticates both — see
+configuring separately: a `cache.vk: [http[s]://]<host>/<repo>` model derives
+the cache entries and takes the lock over the registry's own `/lock` API, and
+one API key in `TASK_VK_API_KEY` authenticates both — see
 [`cache`](reference/schema.md#cache) in the schema reference. The rest of this
 page covers the generic OCI registry + Redis deployment.
 

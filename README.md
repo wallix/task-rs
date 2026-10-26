@@ -158,6 +158,10 @@ tasks:
     cmds: [yarn build]
 ```
 
+An `http://` prefix (`vk: http://registry.vk/task-cache`) uses plain HTTP for
+both the cache and the lock, supporting virtkit's guest registry proxy. Any
+configured credential is sent unencrypted.
+
 For CI systems that move state as an artifact rather than expose a shared cache
 service, fingerprint state and generated files can be exported together:
 

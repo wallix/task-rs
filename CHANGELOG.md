@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **`cache.vk` supports plain HTTP**: `vk: http://registry.vk/task-cache`
+  uses HTTP for both the cache and the lock, supporting virtkit's guest
+  registry proxy (`$VK_REGISTRY`), which injects the job's credential. Any
+  configured credential is sent unencrypted. An explicit `https://` prefix,
+  previously rejected, selects the default HTTPS transport.
+
 - **Breaking: a leading `::` names a task of the root Taskfile from an
   include at any depth**, in `deps`, `setup`, `task:` commands and `task:`
   entries of `sources`, `generates` and `sandbox.writes`. Go Task, and task-rs
