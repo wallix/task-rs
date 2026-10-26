@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **A `cache.vk` namespace such as `GCC_13` keeps its build-once lock in
+  fleet jobs**: a vk-registry refused the lock for a namespace with uppercase
+  letters or other characters outside its repository-name rules. The lock now
+  uses the namespace lowercased, with other characters made `-` if need be;
+  cache entries and namespaces already valid are unchanged. A namespace that
+  changes form takes a different lock than in 4.11, so builds under both
+  versions do not wait on each other while a fleet upgrades.
+
 - **`cache.vk` supports plain HTTP**: `vk: http://registry.vk/task-cache`
   uses HTTP for both the cache and the lock, supporting virtkit's guest
   registry proxy (`$VK_REGISTRY`), which injects the job's credential. Any

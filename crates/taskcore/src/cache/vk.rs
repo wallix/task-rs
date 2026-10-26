@@ -9,6 +9,9 @@
 //!                                 lock: vk://host[:port]/repo/<namespace>
 //! ```
 //!
+//! In the lock, `<namespace>` is made a repository name component
+//! ([`lock_component`]).
+//!
 //! `http://` is for virtkit's guest registry proxy (`http://registry.vk`);
 //! `https://` explicitly selects the default HTTPS transport.
 //!
@@ -70,7 +73,7 @@ pub fn cache_url(vk: &str, namespace: &str, task: &str, checksum: &str) -> Strin
 pub fn lock_url(vk: &str, namespace: &str) -> String {
     let (tls, vk) = split_scheme(vk);
     let scheme = if tls { "vks" } else { "vk" };
-    let ns = sanitize(namespace);
+    let ns = lock_component(namespace);
     if ns.is_empty() {
         format!("{scheme}://{vk}")
     } else {
@@ -108,6 +111,51 @@ fn tag(namespace: &str, task: &str, checksum: &str) -> String {
         tag.push_str(checksum);
     }
     tag
+}
+
+/// Normalize `namespace` to the lock name's last repository path component.
+/// vk-registry rejects fleet job locks whose paths fall outside repository
+/// grammar when checking a hub token's grants.
+///
+/// Replace characters outside `[A-Za-z0-9._-]` with `-` and lowercase. If still
+/// invalid, replace everything outside `[a-z0-9]` with `-` and trim the ends.
+/// Return empty when nothing remains. Distinct namespaces can share a
+/// component; that only serializes their builds, as each keeps its own tag.
+fn lock_component(namespace: &str) -> String {
+    // Sanitize first to preserve `.` and `_` when replacing spaces or other
+    // invalid characters suffices, avoiding the all-`-` fallback.
+    let ns = sanitize(namespace).to_ascii_lowercase();
+    if is_component(&ns) {
+        return ns;
+    }
+    let dashed: String = ns
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    dashed.trim_matches('-').to_string()
+}
+
+/// Whether `c` is a repository name component, OCI's
+/// `[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*`. Mirrors vk-hub-proto's
+/// `valid_component`, which the registry checks lock names with.
+fn is_component(c: &str) -> bool {
+    let alnum = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    let mut rest = c.as_bytes();
+    loop {
+        let run = rest.iter().take_while(|b| alnum(b)).count();
+        if run == 0 {
+            return false;
+        }
+        rest = rest.get(run..).unwrap_or_default();
+        let sep = match rest {
+            [] => return true,
+            [b'_', b'_', ..] => 2,
+            [b'.' | b'_', ..] => 1,
+            [b'-', ..] => rest.iter().take_while(|&&b| b == b'-').count(),
+            _ => return false,
+        };
+        rest = rest.get(sep..).unwrap_or_default();
+    }
 }
 
 /// Map every character outside `[A-Za-z0-9._-]` to `-`.
@@ -200,6 +248,35 @@ mod tests {
         ] {
             assert!(!is_valid(bad), "{bad}");
         }
+    }
+
+    /// A lock name's namespace component stays in repository-name grammar, so
+    /// a hub token's grants can match it; one already in it is unchanged.
+    #[test]
+    fn lock_namespace_is_a_repository_name_component() {
+        for (ns, want) in [
+            ("gcc-13", "gcc-13"),
+            ("gcc_13", "gcc_13"),
+            ("a.b__c", "a.b__c"),
+            ("GCC_13", "gcc_13"),
+            ("gcc 13", "gcc-13"),
+            ("-dev", "dev"),
+            ("a._b", "a--b"),
+            ("a/b", "a-b"),
+            ("...", ""),
+            ("", ""),
+            ("v1.2", "v1.2"),
+            ("a-", "a"),
+            ("a___b", "a---b"),
+            ("gcc\u{2013}13", "gcc-13"),
+            ("\u{e9}", ""),
+            ("gcc_1 3", "gcc_1-3"),
+        ] {
+            assert_eq!(lock_component(ns), want, "{ns:?}");
+            assert!(want.is_empty() || is_component(want), "{want:?}");
+        }
+        assert_eq!(lock_url("reg/repo", "GCC_13"), "vks://reg/repo/gcc_13");
+        assert_eq!(lock_url("reg/repo", "..."), "vks://reg/repo");
     }
 
     #[test]

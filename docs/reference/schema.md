@@ -776,8 +776,13 @@ credential is `api_key` (a bearer token, minted by the registry), else
 `$TASK_VK_API_KEY` (the lock also honours `$TASK_VK_LOCK_TOKEN` in between); the
 trust anchor for a private certificate is `$TASK_CACHE_OCI_CA` (HTTPS only).
 `namespace` keeps entries built by different toolchains apart (it has no effect
-without `vk`). A `vk` that renders empty — its CI variable unset on a developer
-machine — disables the block; one that renders to anything but
+without `vk`); in the lock name it becomes one repository name component
+(`[a-z0-9]` runs joined by `.`, `_`, `__` or `-`): characters outside
+`[A-Za-z0-9._-]` are made `-` and the result lowercased; if still invalid, every
+character but `[a-z0-9]` is made `-` and the ends trimmed, since a vk-registry
+checks a fleet job's lock names in that grammar. A namespace with nothing left
+takes no lock component. A `vk` that renders empty — its CI variable unset on a
+developer machine — disables the block; one that renders to anything but
 `[http[s]://]host[:port]/repo` (the scheme in lowercase) is an error. `vk`
 cannot be combined with `url` or `lock`. `api_key` also works with an explicit
 `oci://` URL and `vk://` lock, where it outranks every other credential.

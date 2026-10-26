@@ -1510,6 +1510,23 @@ fn cache_vk_derives_cache_and_lock_from_the_registry() {
     );
 }
 
+// A namespace outside repository-name grammar is lowercased in the lock name,
+// which a vk-registry checks in that grammar; the cache tag keeps its case.
+#[test]
+fn cache_vk_lowercases_the_lock_namespace() {
+    let dir = stage("cache_vk");
+    let env = [
+        ("VK_REGISTRY", "127.0.0.1:1/task-cache"),
+        ("VK_NAMESPACE", "GCC_13"),
+    ];
+    let (out, code) = run_env(&dir, &["--verbose", "build"], &env);
+    assert_eq!(code, 0, "run failed: {out}");
+    assert!(
+        out.contains("https://127.0.0.1:1/lock/acquire?name=task-cache%2Fgcc_13%3Abuild%3A"),
+        "{out}"
+    );
+}
+
 // An `http://` prefix on `vk:` makes the derived cache and lock plain HTTP, as
 // virtkit's guest registry proxy (`http://registry.vk`) serves them.
 #[test]
