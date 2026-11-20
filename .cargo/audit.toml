@@ -1,0 +1,19 @@
+# RUSTSEC advisories ignored by `cargo audit` (./audit.sh and the CI quality workflow).
+# Every entry states why it is ignored, the residual risk, and when to remove it.
+
+[advisories]
+ignore = [
+  # RUSTSEC-2026-0543 — chrono is unmaintained (informational, no vulnerability; all
+  # versions affected, no patched release).
+  #
+  # Rationale: no workspace crate depends on chrono directly. It is only pulled in
+  # transitively by brush-core / brush-builtins (and their procfs / procfs-core) and by
+  # oci-client, so it cannot be removed until those crates move to jiff or time.
+  #
+  # Residual risk: a vulnerability found in chrono later would not get an upstream fix.
+  # Such a vulnerability would be published under its own RUSTSEC id, which this entry
+  # does not cover, so `cargo audit --deny warnings` would still fail on it.
+  #
+  # Remove once `cargo tree -i chrono` is empty.
+  "RUSTSEC-2026-0543",
+]
