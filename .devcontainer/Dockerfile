@@ -12,9 +12,9 @@
 #     host needs no Nix, only docker or vk. Sources are content-addressed: the same lock
 #     rebuilds the exact toolchain years later, from cache.nixos.org or from source.
 
-# nixos/nix 2.35.3 by manifest-list digest. ./update.sh refreshes it
+# nixos/nix 2.36.0 by manifest-list digest. ./update.sh refreshes it
 # (`docker buildx imagetools inspect nixos/nix:<ver>` -> Digest).
-FROM nixos/nix:2.35.3@sha256:ff480dbb23511aa1c10710aa068ceea5b93fed9bfce5f5379f3a6b07282cbc7b AS task-build
+FROM nixos/nix:2.36.0@sha256:746280551ddc1c72177d1a597c05eacac86dfaa18d5d649bf86411278bcd5470 AS task-build
 
 # Flakes are gated behind experimental-features on the stock image, and the Nix sandbox
 # needs user namespaces neither Docker's builder nor vk's give it. Turning the sandbox off

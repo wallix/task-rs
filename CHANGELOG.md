@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Built with Rust 1.100.0.
 - The unused `jsonwebtoken` dependency is dropped.
 
 ## v4.12.0 - 2026-10-26
