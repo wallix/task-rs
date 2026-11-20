@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **rustix updated for RUSTSEC-2026-0486.**
 - Built with Rust 1.100.0.
 - The unused `jsonwebtoken` dependency is dropped.
 
