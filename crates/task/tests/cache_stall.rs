@@ -6,7 +6,8 @@
 //! a time: a save or restore that walked every remaining chunk through those
 //! retries would take hours to fail. The tests below drive the real binary
 //! against an in-process registry that stalls on demand, and assert that the
-//! first failed round ends the transfer.
+//! first failed round ends the transfer, and that waiting on a held lock is
+//! said out loud.
 //!
 //! The stall tests wait on the client's real timeouts and take minutes, hence
 //! `#[ignore]`:
@@ -406,4 +407,251 @@ fn a_stalled_registry_fails_the_restore_once() {
         elapsed < ONE_REQUEST_BUDGET,
         "the restore took {elapsed:?}, more than one request's retries"
     );
+}
+
+/// A vk-registry lock API with one peer holding every lock until the test
+/// releases it. An acquire is refused while it does, after holding the request
+/// for up to a second; once released, acquires are granted.
+struct LockServer {
+    url: String,
+    held: Arc<AtomicBool>,
+}
+
+impl LockServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = Arc::new(AtomicBool::new(true));
+        let shared = held.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let held = shared.clone();
+                std::thread::spawn(move || {
+                    let Some(req) = read_request(&stream) else {
+                        return;
+                    };
+                    let body: &[u8] = match req.path.as_str() {
+                        "/lock/acquire" => {
+                            let polls = if req.query.contains("wait=0") { 0 } else { 50 };
+                            for _ in 0..polls {
+                                if !held.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            if held.load(Ordering::Relaxed) {
+                                return respond(stream, 409, &[length(2)], b"{}");
+                            }
+                            br#"{"owner":"murphy"}"#
+                        }
+                        "/lock/renew" => br#"{"renewed":1,"of":1}"#,
+                        _ => br#"{"released":1}"#,
+                    };
+                    respond(stream, 200, &[length(body.len())], body);
+                });
+            }
+        });
+        LockServer {
+            url: format!("vk://{addr}/locks"),
+            held,
+        }
+    }
+
+    fn release(&self) {
+        self.held.store(false, Ordering::Relaxed);
+    }
+}
+
+/// A project whose `build` task takes its build-once lock from `lock_url`,
+/// waiting `lock_timeout` on a held one.
+fn locked_project(case: &str, lock_url: &str, lock_timeout: &str) -> std::path::PathBuf {
+    let cache = empty_case_dir(&format!("{case}_store"));
+    let taskfile = format!(
+        r#"version: '3'
+tasks:
+  build:
+    sources: [input.txt]
+    generates: [output.txt]
+    cache:
+      url: 'file://{}/build-{{{{.CHECKSUM}}}}.zip'
+      lock: '{lock_url}'
+      lock_timeout: {lock_timeout}
+    cmds:
+      - cp input.txt output.txt
+"#,
+        cache.display()
+    );
+    let dir = empty_case_dir(case);
+    std::fs::write(dir.join("Taskfile.yml"), taskfile).unwrap();
+    std::fs::write(dir.join("input.txt"), "Clarence Boddicker\n").unwrap();
+    dir
+}
+
+/// A running `task build` whose output is read as it is written, so a test
+/// can tell what the user has been told so far from what is said at the end.
+struct Live {
+    child: std::process::Child,
+    started: Instant,
+    lines: std::sync::mpsc::Receiver<String>,
+    /// Every line read so far.
+    seen: String,
+}
+
+impl Live {
+    fn build(dir: &Path) -> Self {
+        let mut child = Command::new(BIN)
+            .arg("build")
+            .current_dir(dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn task binary");
+        let (tx, lines) = std::sync::mpsc::channel();
+        let follow = |pipe: Box<dyn Read + Send>, tx: std::sync::mpsc::Sender<String>| {
+            std::thread::spawn(move || {
+                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                    // The receiver outlives the child; a failed test drops it.
+                    let _ = tx.send(line);
+                }
+            });
+        };
+        follow(Box::new(child.stdout.take().unwrap()), tx.clone());
+        follow(Box::new(child.stderr.take().unwrap()), tx);
+        Live {
+            child,
+            started: Instant::now(),
+            lines,
+            seen: String::new(),
+        }
+    }
+
+    /// Waits for a line containing `needle` and returns when it was read,
+    /// since the start. The child is still running then: its output is not
+    /// over. Lines read on the way are not searched again.
+    fn wait_for(&mut self, needle: &str) -> Duration {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Ok(line) = self.lines.recv_timeout(left) else {
+                // Not left waiting on a lock nobody will release.
+                let _ = self.child.kill();
+                panic!("no line containing {needle:?} in:\n{}", self.seen);
+            };
+            self.seen.push_str(&line);
+            self.seen.push('\n');
+            if line.contains(needle) {
+                return self.started.elapsed();
+            }
+        }
+    }
+
+    /// Waits for the child to exit; returns everything it wrote and its code.
+    fn finish(mut self) -> (String, i32) {
+        let code = self.child.wait().unwrap().code().unwrap_or(-1);
+        for line in self.lines.iter() {
+            self.seen.push_str(&line);
+            self.seen.push('\n');
+        }
+        eprintln!("--- task output:\n{}---", self.seen);
+        (self.seen, code)
+    }
+}
+
+// A peer holds the build-once lock and only lets go once the task has said,
+// at default verbosity, that it is waiting, for which task and for how long at
+// most: with the default timeout an hour otherwise passes in silence. The task
+// then gets the remote lock and says how long that took.
+#[test]
+fn waiting_on_a_held_lock_is_said_before_it_is_acquired() {
+    let server = LockServer::start();
+    let dir = locked_project("cache_stall_lock", &server.url, "90s");
+
+    let mut task = Live::build(&dir);
+    task.wait_for(
+        r#"task: "build" waits for its build-once lock, held by another run (up to 90s)"#,
+    );
+    assert!(
+        task.child.try_wait().unwrap().is_none(),
+        "the task did not wait for the held lock"
+    );
+    assert!(!dir.join("output.txt").exists(), "built without the lock");
+
+    server.release();
+    task.wait_for(r#"task: "build" acquired its build-once lock after "#);
+    let (out, code) = task.finish();
+    assert_eq!(code, 0, "{out}");
+    assert!(dir.join("output.txt").exists(), "{out}");
+    assert!(!out.contains("WARNING"), "{out}");
+}
+
+// A peer holds the build-once lock for longer than `lock_timeout`. The wait
+// is announced when it starts, not along with its outcome, and the task then
+// warns that it falls back to a local lock, and builds.
+#[test]
+fn a_lock_held_past_its_timeout_falls_back_with_a_warning() {
+    let server = LockServer::start();
+    let dir = locked_project("cache_stall_lock_fallback", &server.url, "4s");
+
+    let mut task = Live::build(&dir);
+    let announced = task
+        .wait_for(r#"task: "build" waits for its build-once lock, held by another run (up to 4s)"#);
+    let warned = task.wait_for(r#"task: WARNING: remote lock for "build" failed: "#);
+    assert!(
+        task.seen.ends_with("falling back to a local lock\n"),
+        "{}",
+        task.seen
+    );
+    assert!(
+        warned.saturating_sub(announced) >= Duration::from_secs(3),
+        "the wait was announced at {announced:?} and given up at {warned:?}: not while waiting"
+    );
+    let (out, code) = task.finish();
+    assert_eq!(code, 0, "{out}");
+    assert!(dir.join("output.txt").exists(), "{out}");
+}
+
+// Two deps of one run reach the same task, so the second waits on the lock
+// the first holds. That is the run's own work, not a peer's: nothing is said
+// about it unless asked, and never that another run holds the lock.
+#[test]
+fn a_lock_held_by_the_same_run_is_only_said_in_verbose_mode() {
+    let dir = empty_case_dir("cache_stall_lock_same_run");
+    let taskfile = r#"version: '3'
+tasks:
+  default:
+    deps: [lewis, morton]
+  lewis:
+    deps: [build]
+  morton:
+    deps: [build]
+  build:
+    sources: [input.txt]
+    generates: [output.txt]
+    cmds:
+      - sleep 1
+      - cp input.txt output.txt
+"#;
+    std::fs::write(dir.join("Taskfile.yml"), taskfile).unwrap();
+    let run = |input: &str, args: &[&str]| {
+        std::fs::write(dir.join("input.txt"), input).unwrap();
+        let out = Command::new(BIN)
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .expect("spawn task binary");
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{err}");
+        err
+    };
+
+    let quiet = run("Bob Morton\n", &[]);
+    assert!(!quiet.contains("build-once lock"), "{quiet}");
+
+    let verbose = run("Anne Lewis\n", &["-v"]);
+    assert!(
+        verbose.contains(r#"task: "build" waits for its build-once lock, held by this run"#),
+        "{verbose}"
+    );
+    assert!(!verbose.contains("another run"), "{verbose}");
 }

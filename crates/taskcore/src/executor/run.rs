@@ -1070,6 +1070,9 @@ impl Executor {
                 &format!("task: failed to release the lock for {:?}: {e}\n", t.name()),
             );
         }
+        self.held_locks
+            .borrow_mut()
+            .remove(&task_lock_name(t, &t.cache_checksum));
         result
     }
 
@@ -2223,39 +2226,93 @@ impl Executor {
         if !self.takes_lock(t) {
             return Ok(None);
         }
-        let lock_name = if cache_checksum.is_empty() {
-            t.local_name()
-        } else {
-            format!("{}:{}", t.local_name(), cache_checksum)
-        };
+        let lock_name = task_lock_name(t, cache_checksum);
 
         let file_locker = CacheLock::File {
             dir: std::path::Path::new(&self.temp_dir.fingerprint).join("locks"),
             timeout: None,
         };
 
-        // The contention callback would need a logger borrow across an await;
-        // kept quiet to avoid a borrow conflict (a known minor gap vs Go).
-        let guard = match self.cache_lock(t) {
-            // A remote (redis) lock: if it cannot be acquired — e.g. Redis is
-            // unreachable — fall back to the local file lock so a Redis outage
-            // degrades to local locking instead of failing the build (Go does
-            // the same).
-            Some(remote) => match remote.lock(&lock_name, || {}).await {
-                Ok(guard) => guard,
-                Err(e) => {
-                    self.logger().borrow_mut().verbose_errf(
+        // A held lock is waited on for up to an hour by default, and the wait
+        // covers the holder's whole restore or build: say so when it starts,
+        // and how long it took once over. The callback runs synchronously,
+        // once, so its borrows never span an await.
+        //
+        // Two paths of one run to the same task (a diamond of deps) contend
+        // too: that wait is the run's own work and ends with it, so it is
+        // only said in verbose mode. `contended` holds whether the holder was
+        // this run.
+        let started = std::time::Instant::now();
+        let contended = Rc::new(std::cell::Cell::new(None));
+        let on_contention = |locker: &CacheLock| {
+            let logger = self.logger();
+            let contended = Rc::clone(&contended);
+            let held = &self.held_locks;
+            let lock_name = &lock_name;
+            let name = t.name().to_string();
+            let limit = locker.timeout();
+            move || {
+                let ours = held.borrow().contains(lock_name);
+                contended.set(Some(ours));
+                let mut logger = logger.borrow_mut();
+                if ours {
+                    logger.verbose_errf(
                         Color::Yellow,
                         &format!(
-                            "task: remote lock failed for {:?}: {e} (falling back to local)\n",
+                            "task: {name:?} waits for its build-once lock, held by this run\n"
+                        ),
+                    );
+                } else {
+                    logger.errf(
+                        Color::Yellow,
+                        &format!(
+                            "task: {name:?} waits for its build-once lock, held by another run (up to {limit:?})\n"
+                        ),
+                    );
+                }
+            }
+        };
+        let guard = match self.cache_lock(t) {
+            // A remote (vk, redis) lock: if it cannot be acquired — the
+            // service is unreachable, or a peer held it past the timeout —
+            // fall back to the local file lock so an outage degrades to local
+            // locking instead of failing the build (Go does the same).
+            Some(remote) => match remote.lock(&lock_name, on_contention(&remote)).await {
+                Ok(guard) => guard,
+                Err(e) => {
+                    self.logger().borrow_mut().errf(
+                        Color::Yellow,
+                        &format!(
+                            "task: WARNING: remote lock for {:?} failed: {e}; falling back to a local lock\n",
                             t.name()
                         ),
                     );
-                    file_locker.lock(&lock_name, || {}).await?
+                    file_locker
+                        .lock(&lock_name, on_contention(&file_locker))
+                        .await?
                 }
             },
-            None => file_locker.lock(&lock_name, || {}).await?,
+            None => {
+                file_locker
+                    .lock(&lock_name, on_contention(&file_locker))
+                    .await?
+            }
         };
+        if let Some(ours) = contended.get() {
+            let waited = started.elapsed().as_secs();
+            let message = format!(
+                "task: {:?} acquired its build-once lock after {waited}s\n",
+                t.name()
+            );
+            let logger = self.logger();
+            let mut logger = logger.borrow_mut();
+            if ours {
+                logger.verbose_errf(Color::Yellow, &message);
+            } else {
+                logger.errf(Color::Yellow, &message);
+            }
+        }
+        self.held_locks.borrow_mut().insert(lock_name);
         Ok(Some(guard))
     }
 
@@ -2440,6 +2497,16 @@ fn to_compile_error(e: ExecutorError) -> CompileError {
         },
         ExecutorError::Compile(e) => *e,
         other => CompileError::FromTask(other.to_string()),
+    }
+}
+
+/// The name of `t`'s build-once lock: its local name and `cache_checksum`
+/// (see [`Executor::acquire_task_lock`]).
+fn task_lock_name(t: &Task, cache_checksum: &str) -> String {
+    if cache_checksum.is_empty() {
+        t.local_name()
+    } else {
+        format!("{}:{}", t.local_name(), cache_checksum)
     }
 }
 

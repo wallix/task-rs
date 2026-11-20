@@ -10,6 +10,11 @@
   requests and never answered them kept `task` silent for hours. The restore
   then counts as a miss and the task runs; a failed save is warned about as
   before.
+- **Waiting on a held build-once lock is logged.** A task whose lock
+  (`cache.lock`, or the local lock of any task with sources and generates)
+  is held by another run says so at default verbosity, with the wait limit,
+  and says how long it waited once it has the lock. Falling back to a local
+  lock after the remote lock failed or timed out is now a visible warning.
 
 ## v4.12.1 - 2026-11-20
 
