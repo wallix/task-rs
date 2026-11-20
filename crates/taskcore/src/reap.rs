@@ -897,11 +897,12 @@ mod tests {
         );
         let shell_pid = i32::try_from(child.0.id()).expect("pid fits");
 
-        // The grandchild appears only once `sh` has got that far.
-        let tree = ProcessTree::read();
+        // The grandchild appears only once `sh` has got that far, so the process
+        // table is re-read on every attempt: a snapshot taken before the fork
+        // would never show it.
         let mut grandchildren = Vec::new();
         for _ in 0..100 {
-            grandchildren = tree.children_of(shell_pid).pids;
+            grandchildren = ProcessTree::read().children_of(shell_pid).pids;
             if !grandchildren.is_empty() {
                 break;
             }
