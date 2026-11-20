@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- The unused `jsonwebtoken` dependency is dropped.
+
 ## v4.12.0 - 2026-10-26
 
 - **Breaking: a leading `::` names a task of the root Taskfile from an
