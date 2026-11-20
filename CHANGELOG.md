@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Cache transfers stop when the first chunk fails.** If the registry stops
+  answering chunk requests, a save or restore gives up after about two minutes.
+  Large transfers could previously hang for hours. A failed restore counts as a
+  cache miss and the task runs. A failed save still prints a warning.
+
 ## v4.12.1 - 2026-11-20
 
 - **rustix updated for RUSTSEC-2026-0486.**

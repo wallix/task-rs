@@ -27,9 +27,28 @@ use crate::restore::{self, Tree, Written};
 /// path, so the stream and its serialization are deterministic for a given
 /// tree. When `transparent`, chunks are keyed by their uncompressed digest (the
 /// vk-registry transparent-zstd scheme); otherwise by the compressed digest.
-pub fn build<S>(base_dir: &Path, paths: &[String], mut sink: S, transparent: bool) -> Result<Index>
+pub fn build<S>(base_dir: &Path, paths: &[String], sink: S, transparent: bool) -> Result<Index>
 where
     S: FnMut(&ChunkRef, &[u8]) -> Result<()>,
+{
+    build_unless(base_dir, paths, sink, transparent, || false)
+}
+
+/// [`build`], given up with an error once `cancelled` answers true. It is asked
+/// for every chunk, before it is compressed, rather than only when one is
+/// emitted: a stream that repeats itself (a sparse or zero-filled file) is
+/// read, compressed and hashed for gigabytes without `sink` being called once,
+/// so a sink that refuses is not a way to stop it.
+pub(crate) fn build_unless<S, C>(
+    base_dir: &Path,
+    paths: &[String],
+    mut sink: S,
+    transparent: bool,
+    cancelled: C,
+) -> Result<Index>
+where
+    S: FnMut(&ChunkRef, &[u8]) -> Result<()>,
+    C: Fn() -> bool,
 {
     let mut idx = Index::new();
     idx.transparent = transparent;
@@ -82,6 +101,9 @@ where
     let chunker =
         fastcdc::v2020::StreamCDC::new(&mut concat, MIN_CHUNK_SIZE, AVG_CHUNK_SIZE, MAX_CHUNK_SIZE);
     for chunk in chunker {
+        if cancelled() {
+            return Err(Error::format("chunking cancelled"));
+        }
         let chunk = chunk.map_err(|e| Error::format(format!("chunking: {e}")))?;
         let raw = &chunk.data;
         zstd_frame_into(raw, &mut frame)?;
@@ -473,6 +495,45 @@ mod tests {
         )
         .unwrap();
         (idx, store)
+    }
+
+    /// A stream of identical chunks emits one and then calls the sink no more,
+    /// so only the cancellation check can stop it: it is asked per chunk, and
+    /// the first "yes" ends the build before the next chunk is processed.
+    #[test]
+    fn a_cancelled_build_stops_amid_duplicate_chunks() {
+        use std::cell::Cell;
+        let src = tmpdir("cancel");
+        // Zeros cut into maximum-size chunks, all the same.
+        let chunks = 8;
+        write_file(&src, "zeros", &vec![0; chunks * MAX_CHUNK_SIZE]);
+        let paths = ["zeros".to_string()];
+
+        let emitted = Cell::new(0);
+        let count = |_: &ChunkRef, _: &[u8]| {
+            emitted.set(emitted.get() + 1);
+            Ok(())
+        };
+        let asked = Cell::new(0);
+        let idx = build_unless(&src, &paths, count, false, || {
+            asked.set(asked.get() + 1);
+            false
+        })
+        .unwrap();
+        assert_eq!(idx.chunks.len(), chunks);
+        assert_eq!(emitted.get(), 1, "the duplicates reach the sink");
+        assert_eq!(asked.get(), chunks, "not asked once per chunk");
+
+        // Cancelled from the third chunk on, long after the last emission.
+        asked.set(0);
+        let error = build_unless(&src, &paths, count, false, || {
+            asked.set(asked.get() + 1);
+            asked.get() > 2
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert_eq!(asked.get(), 3, "the build went on after it was cancelled");
+        std::fs::remove_dir_all(&src).ok();
     }
 
     fn mem_source(store: &HashMap<String, Vec<u8>>) -> impl FnMut(&str) -> Result<Vec<u8>> + '_ {
