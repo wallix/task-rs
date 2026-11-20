@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinSet};
 
 use crate::auth::Auth;
-use crate::cas::{assemble, build, digest_hex, sha256_hex};
+use crate::cas::{assemble, build_unless, digest_hex, sha256_hex};
 use crate::error::{Error, Result, with_causes};
 use crate::index::{
     ARTIFACT_TYPE, ChunkRef, Index, MAX_CHUNK_BLOB, MAX_INDEX_BLOB, MEDIA_TYPE_CHUNK,
@@ -246,7 +246,7 @@ impl Store {
         let transparent = self.transparent;
         let build_handle = tokio::task::spawn_blocking(move || {
             let tx = tx;
-            build(
+            build_unless(
                 &base,
                 &owned_paths,
                 |refc, frame| {
@@ -254,43 +254,69 @@ impl Store {
                         .map_err(|_| Error::format("upload channel closed"))
                 },
                 transparent,
+                // The push gave up and dropped its end.
+                || tx.is_closed(),
             )
         });
 
         let counters = Arc::new(Counters::default());
         let sem = Arc::new(Semaphore::new(FETCH_CONCURRENCY));
         let mut uploads: JoinSet<Result<()>> = JoinSet::new();
-        while let Some((refc, frame)) = rx.recv().await {
-            let permit = sem
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| Error::format("upload semaphore closed"))?;
-            let client = self.client.clone();
-            let http = self.http.clone();
-            let image = image.clone();
-            let auth = self.auth.clone();
-            let scheme = self.scheme;
-            let registry = self.registry.clone();
-            let repository = self.repository.clone();
-            let counters = counters.clone();
-            uploads.spawn(async move {
-                let _permit = permit;
-                upload_chunk(
-                    &client,
-                    &http,
-                    &image,
-                    transparent,
-                    scheme,
-                    &registry,
-                    &repository,
-                    &auth,
-                    &refc,
-                    frame,
-                    &counters,
-                )
-                .await
-            });
+        let queued: Result<()> = async {
+            loop {
+                // The builder can go a long while without a frame (it emits a
+                // chunk once, however often the stream repeats it), so the
+                // uploads are watched while waiting for one, not only when a
+                // slot is needed.
+                let (refc, frame) = tokio::select! {
+                    biased;
+                    Some(res) = uploads.join_next(), if !uploads.is_empty() => {
+                        res.map_err(join_err)??;
+                        continue;
+                    }
+                    next = rx.recv() => match next {
+                        Some(next) => next,
+                        None => return Ok(()),
+                    },
+                };
+                let permit = next_slot(&sem, &mut uploads).await?;
+                let client = self.client.clone();
+                let http = self.http.clone();
+                let image = image.clone();
+                let auth = self.auth.clone();
+                let scheme = self.scheme;
+                let registry = self.registry.clone();
+                let repository = self.repository.clone();
+                let counters = counters.clone();
+                uploads.spawn(async move {
+                    let _permit = permit;
+                    upload_chunk(
+                        &client,
+                        &http,
+                        &image,
+                        transparent,
+                        scheme,
+                        &registry,
+                        &repository,
+                        &auth,
+                        &refc,
+                        frame,
+                        &counters,
+                    )
+                    .await
+                });
+            }
+        }
+        .await;
+        if let Err(e) = queued {
+            // An upload failed: abandon the others, and tell the builder, which
+            // sees the closed channel before its next chunk. It is waited for,
+            // so no thread is still reading the files once the push has
+            // returned; its own error is only that it was stopped.
+            drop(uploads);
+            drop(rx);
+            let _ = build_handle.await;
+            return Err(e);
         }
 
         // build finished (tx dropped, channel closed): surface its result first,
@@ -440,11 +466,7 @@ impl Store {
                 if cas_valid(&dir, &c.digest) {
                     continue;
                 }
-                let permit = sem
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| Error::format("fetch semaphore closed"))?;
+                let permit = next_slot(&sem, &mut set).await?;
                 let client = self.client.clone();
                 let image = image.clone();
                 let dir = dir.clone();
@@ -821,6 +843,34 @@ fn join_err(e: JoinError) -> Error {
     Error::format(format!("task join: {e}"))
 }
 
+/// A slot for the next of `set`'s transfers, once one is free — unless a
+/// transfer already running has failed, which is returned instead.
+///
+/// An entry is thousands of chunks, [`FETCH_CONCURRENCY`] in flight at a time,
+/// and every chunk request retries on its own before it fails
+/// ([`crate::retry::with_retry`]). Taking slots as they free up and only
+/// looking at the outcomes once everything was queued would walk every
+/// remaining chunk through those same retries after a registry stopped
+/// answering, which is tens of minutes of silence for a failure already
+/// decided by the first round. So a finished transfer is checked before a
+/// slot is handed out, and the first failure ends the whole transfer: the
+/// caller's `?` drops `set`, aborting the transfers still in flight.
+async fn next_slot(
+    sem: &Arc<Semaphore>,
+    set: &mut JoinSet<Result<()>>,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    loop {
+        tokio::select! {
+            // Outcomes first: a freed slot usually means a transfer just ended.
+            biased;
+            Some(res) = set.join_next(), if !set.is_empty() => res.map_err(join_err)??,
+            permit = sem.clone().acquire_owned() => {
+                return permit.map_err(|_| Error::format("transfer semaphore closed"));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1028,6 +1078,174 @@ mod tests {
         assert_eq!(seen[2].query, seen[4].query);
         assert_eq!(counters.pushed.load(Ordering::Relaxed), 1);
         assert_eq!(counters.bytes.load(Ordering::Relaxed), frame.len() as i64);
+    }
+
+    /// A registry that answers the probe, serves the first chunk GET corrupt
+    /// and holds every later connection open without answering, as a proxy
+    /// whose upstream has gone does. Returns its authority and the count of
+    /// chunk GETs it received.
+    fn one_corrupt_then_silent() -> (String, Arc<AtomicI64>, Arc<std::sync::atomic::AtomicBool>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::AtomicBool;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let gets = Arc::new(AtomicI64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (gets_, stop_) = (gets.clone(), stop.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let (gets, stop) = (gets_.clone(), stop_.clone());
+                std::thread::spawn(move || {
+                    let mut line = String::new();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let _ = reader.read_line(&mut line);
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                            break;
+                        }
+                    }
+                    let response = if line.starts_with("GET /v2/ ") {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                    } else if gets.fetch_add(1, Ordering::Relaxed) == 0 {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncorrupt"
+                    } else {
+                        while !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        return;
+                    };
+                    let _ = stream.write_all(response.as_bytes());
+                });
+            }
+        });
+        (authority, gets, stop)
+    }
+
+    /// Once a chunk has failed for good, the prefetch ends: the chunks still
+    /// queued are never requested and the ones in flight are abandoned, rather
+    /// than each waiting out its own read timeout and retries.
+    #[tokio::test]
+    async fn a_failed_chunk_ends_the_prefetch() {
+        install_crypto();
+        let (authority, gets, stop) = one_corrupt_then_silent();
+        let store = Store::open(
+            &format!("{authority}/repo"),
+            RemoteOptions {
+                plain_http: true,
+                cache_dir: Some(cas_tmp("ends")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut idx = Index::new();
+        idx.chunks = (0..3 * FETCH_CONCURRENCY)
+            .map(|i| {
+                let data = format!("chunk {i}");
+                ChunkRef {
+                    digest: sha256_hex(data.as_bytes()),
+                    size: data.len() as i64,
+                    raw_size: data.len() as i64,
+                }
+            })
+            .collect();
+        let image = store.reference("tag").unwrap();
+
+        // Well under one read timeout: a prefetch that waits on the silent
+        // connections has not stopped at the failure.
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(10), store.chunk_source(&image, &idx)).await;
+        stop.store(true, Ordering::Relaxed);
+        let error = outcome
+            .expect("the prefetch ends at the first failed chunk")
+            .err()
+            .expect("the corrupt chunk fails the prefetch");
+        assert!(error.to_string().contains("digest"), "{error}");
+        let requested = gets.load(Ordering::Relaxed) as usize;
+        assert!(
+            (1..=FETCH_CONCURRENCY).contains(&requested),
+            "{requested} chunks requested after the first failed"
+        );
+    }
+
+    /// A registry that answers the probe and refuses everything else with a
+    /// 500, which is final at once. Returns its authority and the count of
+    /// refusals.
+    fn refusing_registry() -> (String, Arc<AtomicI64>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let refused = Arc::new(AtomicI64::new(0));
+        let refused_ = refused.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                        break;
+                    }
+                }
+                let response = if line.starts_with("GET /v2/ ") {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                } else {
+                    refused_.fetch_add(1, Ordering::Relaxed);
+                    "HTTP/1.1 500 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                // Best-effort: the client may have gone.
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (authority, refused)
+    }
+
+    /// A sparse file is one chunk repeated: the builder emits it once and then
+    /// chunks on without sending anything. The upload of that one chunk
+    /// failing must end the push there, builder included, rather than once
+    /// the rest of the file has been read.
+    #[tokio::test]
+    async fn a_failed_upload_ends_the_push_while_the_builder_sends_nothing() {
+        install_crypto();
+        let (authority, refused) = refusing_registry();
+        let store = Store::open(
+            &format!("{authority}/repo"),
+            RemoteOptions {
+                plain_http: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A minute or more of chunking, were the push to wait for the end of
+        // the file.
+        let dir = cas_tmp("sparse");
+        std::fs::File::create(dir.join("sparse"))
+            .unwrap()
+            .set_len(16 << 30)
+            .unwrap();
+
+        // The push returns once its builder has stopped, so its returning at
+        // all is the builder having been cancelled.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.push("tag", &dir, &["sparse".to_string()], BTreeMap::new()),
+        )
+        .await;
+        let error = outcome
+            .expect("the push ends at the failed upload")
+            .expect_err("the refused chunk fails the push");
+        assert!(error.to_string().contains("500"), "{error}");
+        assert_eq!(
+            refused.load(Ordering::Relaxed),
+            1,
+            "one distinct chunk, so one request"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn registry_error(code: &str) -> OciDistributionError {
