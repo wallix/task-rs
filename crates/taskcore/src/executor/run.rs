@@ -1056,19 +1056,21 @@ impl Executor {
                 call,
                 ancestors,
                 cache_url.as_ref(),
-                lock.as_ref(),
+                lock.as_ref().map(|(guard, _)| guard),
                 checker,
             )
             .await;
         // Release explicitly: a dropped vk lease only stops its heartbeat and
         // keeps peers waiting until it expires server-side.
-        if let Some(guard) = lock
-            && let Err(e) = guard.unlock().await
-        {
-            self.logger().borrow_mut().verbose_errf(
-                Color::Yellow,
-                &format!("task: failed to release the lock for {:?}: {e}\n", t.name()),
-            );
+        if let Some((guard, held)) = lock {
+            if let Err(e) = guard.unlock().await {
+                self.logger().borrow_mut().verbose_errf(
+                    Color::Yellow,
+                    &format!("task: failed to release the lock for {:?}: {e}\n", t.name()),
+                );
+            }
+            // Count this holder through the unlock attempt.
+            drop(held);
         }
         result
     }
@@ -2219,44 +2221,93 @@ impl Executor {
         t: &Task,
         cache_checksum: &str,
         _cache_url: Option<&CacheUrl>,
-    ) -> Result<Option<cache::Guard>, ExecutorError> {
+    ) -> Result<Option<(cache::Guard, HeldLock<'_>)>, ExecutorError> {
         if !self.takes_lock(t) {
             return Ok(None);
         }
-        let lock_name = if cache_checksum.is_empty() {
-            t.local_name()
-        } else {
-            format!("{}:{}", t.local_name(), cache_checksum)
-        };
+        let lock_name = task_lock_name(t, cache_checksum);
 
         let file_locker = CacheLock::File {
             dir: std::path::Path::new(&self.temp_dir.fingerprint).join("locks"),
             timeout: None,
         };
 
-        // The contention callback would need a logger borrow across an await;
-        // kept quiet to avoid a borrow conflict (a known minor gap vs Go).
-        let guard = match self.cache_lock(t) {
-            // A remote (redis) lock: if it cannot be acquired — e.g. Redis is
-            // unreachable — fall back to the local file lock so a Redis outage
-            // degrades to local locking instead of failing the build (Go does
-            // the same).
-            Some(remote) => match remote.lock(&lock_name, || {}).await {
-                Ok(guard) => guard,
-                Err(e) => {
-                    self.logger().borrow_mut().verbose_errf(
+        // A peer's restore or build can keep this task waiting for an hour by
+        // default. Report the limit on contention and elapsed time on success.
+        // A dependency diamond can also contend within this run. Record whether
+        // we hold the name so both messages for that wait use verbose output.
+        // Each locker calls back once, synchronously, so no borrow spans an await.
+        let started = std::time::Instant::now();
+        let contended = std::cell::Cell::new(None);
+        let on_contention = |locker: &CacheLock| {
+            let logger = self.logger();
+            let contended = &contended;
+            let held = &self.held_locks;
+            let lock_name = &lock_name;
+            let name = t.name().to_string();
+            let limit = locker.timeout();
+            move || {
+                let ours = held.holds(lock_name);
+                contended.set(Some(ours));
+                let mut logger = logger.borrow_mut();
+                if ours {
+                    logger.verbose_errf(
                         Color::Yellow,
                         &format!(
-                            "task: remote lock failed for {:?}: {e} (falling back to local)\n",
+                            "task: {name:?} waits for its build-once lock, held by this run\n"
+                        ),
+                    );
+                } else {
+                    logger.errf(
+                        Color::Yellow,
+                        &format!(
+                            "task: {name:?} waits for its build-once lock, held by another run (up to {limit:?})\n"
+                        ),
+                    );
+                }
+            }
+        };
+        let guard = match self.cache_lock(t) {
+            // A remote (vk, redis) lock: if it cannot be acquired — the
+            // service is unreachable, or a peer held it past the timeout —
+            // fall back to the local file lock so an outage degrades to local
+            // locking instead of failing the build (Go does the same).
+            Some(remote) => match remote.lock(&lock_name, on_contention(&remote)).await {
+                Ok(guard) => guard,
+                Err(e) => {
+                    self.logger().borrow_mut().errf(
+                        Color::Yellow,
+                        &format!(
+                            "task: WARNING: remote lock for {:?} failed: {e}; falling back to a local lock\n",
                             t.name()
                         ),
                     );
-                    file_locker.lock(&lock_name, || {}).await?
+                    file_locker
+                        .lock(&lock_name, on_contention(&file_locker))
+                        .await?
                 }
             },
-            None => file_locker.lock(&lock_name, || {}).await?,
+            None => {
+                file_locker
+                    .lock(&lock_name, on_contention(&file_locker))
+                    .await?
+            }
         };
-        Ok(Some(guard))
+        if let Some(ours) = contended.get() {
+            let waited = started.elapsed().as_secs_f64();
+            let message = format!(
+                "task: {:?} acquired its build-once lock after {waited:.1}s\n",
+                t.name()
+            );
+            let logger = self.logger();
+            let mut logger = logger.borrow_mut();
+            if ours {
+                logger.verbose_errf(Color::Yellow, &message);
+            } else {
+                logger.errf(Color::Yellow, &message);
+            }
+        }
+        Ok(Some((guard, self.held_locks.hold(lock_name))))
     }
 
     /// Parses the task's resolved `cache.lock` into a distributed locker. Ports
@@ -2440,6 +2491,53 @@ fn to_compile_error(e: ExecutorError) -> CompileError {
         },
         ExecutorError::Compile(e) => *e,
         other => CompileError::FromTask(other.to_string()),
+    }
+}
+
+/// Count holders by lock name. Another path can acquire the lock before
+/// the releasing path drops its guard.
+#[derive(Default)]
+pub(crate) struct HeldLocks(std::cell::RefCell<std::collections::HashMap<String, usize>>);
+
+impl HeldLocks {
+    /// Count this holder until its guard drops, including on cancellation.
+    fn hold(&self, name: String) -> HeldLock<'_> {
+        let mut held = self.0.borrow_mut();
+        let holders = held.entry(name.clone()).or_insert(0);
+        *holders = holders.saturating_add(1);
+        HeldLock { locks: self, name }
+    }
+
+    fn holds(&self, name: &str) -> bool {
+        self.0.borrow().contains_key(name)
+    }
+}
+
+/// One path's hold on a lock in [`HeldLocks`], given up when dropped.
+pub(crate) struct HeldLock<'a> {
+    locks: &'a HeldLocks,
+    name: String,
+}
+
+impl Drop for HeldLock<'_> {
+    fn drop(&mut self) {
+        let mut held = self.locks.0.borrow_mut();
+        if let Some(holders) = held.get_mut(&self.name) {
+            *holders = holders.saturating_sub(1);
+            if *holders == 0 {
+                held.remove(&self.name);
+            }
+        }
+    }
+}
+
+/// [`Executor::acquire_task_lock`] uses the local task name, suffixed with
+/// the cache checksum when present.
+fn task_lock_name(t: &Task, cache_checksum: &str) -> String {
+    if cache_checksum.is_empty() {
+        t.local_name()
+    } else {
+        format!("{}:{}", t.local_name(), cache_checksum)
     }
 }
 
@@ -2711,6 +2809,20 @@ impl std::io::Write for SharedBytes {
 #[cfg(test)]
 mod tests {
     use super::CallPath;
+
+    /// A lock released by one path of the run while another already holds it
+    /// again is still the run's: a third path waiting on it waits on this run.
+    #[test]
+    fn a_lock_taken_over_within_the_run_stays_held() {
+        let held = super::HeldLocks::default();
+        let first = held.hold("build".to_string());
+        // The second path acquires before the first has forgotten the lock.
+        let second = held.hold("build".to_string());
+        drop(first);
+        assert!(held.holds("build"));
+        drop(second);
+        assert!(!held.holds("build"));
+    }
 
     /// A level whose key and reported name are the same, for the cases where
     /// the digest half is not what is under test.

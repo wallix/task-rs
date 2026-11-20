@@ -201,6 +201,9 @@ pub struct Executor {
     pub(crate) prompt_turn: Mutex<()>,
     /// Deduplicates concurrent executions of the same task hash.
     pub(crate) run_once: Mutex<HashMap<String, Arc<OnceCell<RunOnceResult>>>>,
+    /// The build-once locks this run holds, so a wait on one of them is told
+    /// apart from a wait on another run.
+    pub(crate) held_locks: run::HeldLocks,
     /// Tracks the tasks queued on the runtime so an abandoned run can tear them
     /// down instead of leaving their commands behind.
     pub(crate) queue: run::TaskQueue,
@@ -259,6 +262,7 @@ impl Default for Executor {
             mkdir_locks: Mutex::new(HashMap::new()),
             prompt_turn: Mutex::new(()),
             run_once: Mutex::new(HashMap::new()),
+            held_locks: run::HeldLocks::default(),
             queue: run::TaskQueue::default(),
             sandbox_dirs: RefCell::new(Vec::new()),
         }

@@ -94,6 +94,11 @@ impl Locker {
         self
     }
 
+    /// How long [`Locker::lock`] waits on a held lock before giving up.
+    pub fn timeout(&self) -> Duration {
+        self.timeout.unwrap_or(DEFAULT_WAIT)
+    }
+
     /// Renew at `freq` instead of every [`HEARTBEAT_FREQ`], so a test can drive
     /// the heartbeat's classification in milliseconds.
     #[cfg(test)]

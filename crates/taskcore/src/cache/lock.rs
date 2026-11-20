@@ -162,6 +162,15 @@ impl CacheLock {
         }
     }
 
+    /// How long [`CacheLock::lock`] waits on a held lock before giving up.
+    pub fn timeout(&self) -> Duration {
+        match self {
+            CacheLock::File { timeout, .. } => timeout.unwrap_or(DEFAULT_TIMEOUT),
+            CacheLock::Vk(locker) => locker.timeout(),
+            CacheLock::Redis(locker) => locker.timeout(),
+        }
+    }
+
     /// Acquire the lock for `name`, blocking until acquired or the timeout
     /// expires. `on_contention` fires once, the first time the lock is held.
     pub async fn lock<F: FnOnce()>(
@@ -212,10 +221,14 @@ async fn file_lock<F: FnOnce()>(
                 return Ok(Guard::File(Some(path)));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Retry immediately after reclaiming a dead holder's file.
+                // Only a surviving lockfile counts as contention.
+                if evict_stale_lock(&path) {
+                    continue;
+                }
                 if let Some(cb) = notified.take() {
                     cb();
                 }
-                evict_stale_lock(&path);
                 if deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
                     return Err(CacheError::msg(format!(
                         "lock: timeout after {timeout:?} acquiring {name:?}"
@@ -233,15 +246,14 @@ fn write_holder(mut file: &std::fs::File, name: &str) {
     let _ = write!(file, "pid={}\nlock={name}\n", std::process::id());
 }
 
-/// Remove a lockfile whose recorded holder PID is no longer alive.
-fn evict_stale_lock(path: &Path) {
+/// Return true if we removed a lockfile left by a dead PID.
+fn evict_stale_lock(path: &Path) -> bool {
     let Ok(data) = std::fs::read_to_string(path) else {
-        return;
+        return false;
     };
     let pid = read_holder_pid(&data);
-    if pid > 0 && !process_alive(pid) {
-        let _ = std::fs::remove_file(path);
-    }
+    // A failed removal leaves the file to the next retry, as a held lock.
+    pid > 0 && !process_alive(pid) && std::fs::remove_file(path).is_ok()
 }
 
 fn read_holder_pid(info: &str) -> i32 {
@@ -414,8 +426,32 @@ mod tests {
         let path = dir.join("stale.lock");
         let dead_pid = (1i32 << 22) - 1; // almost certainly not running
         std::fs::write(&path, format!("pid={dead_pid}\nlock=stale\n")).unwrap();
-        evict_stale_lock(&path);
+        assert!(evict_stale_lock(&path));
         assert!(!path.exists());
+    }
+
+    /// A lockfile left by a dead holder is taken over without the wait being
+    /// announced: nobody holds it.
+    #[tokio::test]
+    async fn a_stale_lock_is_not_contention() {
+        let dir = tempdir();
+        let dead_pid = (1i32 << 22) - 1; // almost certainly not running
+        std::fs::write(
+            dir.join("stale.lock"),
+            format!("pid={dead_pid}\nlock=stale\n"),
+        )
+        .unwrap();
+        let lock = CacheLock::File {
+            dir,
+            timeout: Some(Duration::from_secs(2)),
+        };
+        let mut contended = false;
+        let g = lock.lock("stale", || contended = true).await.unwrap();
+        assert!(
+            !contended,
+            "a dead holder was announced as holding the lock"
+        );
+        g.unlock().await.unwrap();
     }
 
     #[test]

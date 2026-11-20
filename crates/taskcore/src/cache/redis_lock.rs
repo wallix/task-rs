@@ -121,6 +121,11 @@ impl RedisLocker {
         })
     }
 
+    /// How long [`RedisLocker::lock`] waits on a held lock before giving up.
+    pub fn timeout(&self) -> Duration {
+        self.acquire_max
+    }
+
     /// The Redis key for `name`: the URL path prefix joined with `name` by `:`
     /// (matching Go's URL-path append).
     fn key(&self, name: &str) -> String {

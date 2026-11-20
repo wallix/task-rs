@@ -6,6 +6,11 @@
   answering chunk requests, a save or restore gives up after about two minutes.
   Large transfers could previously hang for hours. A failed restore counts as a
   cache miss and the task runs. A failed save still prints a warning.
+- **Build-once lock waits are visible by default.** When running a task with
+  sources and generates, `task` reports the wait limit if another run holds
+  the lock and the elapsed time when it acquires the lock. This applies to
+  local locks and `cache.lock`. If the remote lock fails or times out, `task`
+  warns before falling back to a local lock.
 
 ## v4.12.1 - 2026-11-20
 
