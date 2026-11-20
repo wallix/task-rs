@@ -111,7 +111,7 @@ rationale. Concrete guidance:
   paths), `regex`, `semver`, `notify`, `minijinja`, `clap`, `redis` (the
   distributed `cache.lock` backend), the `brush-*` shell interpreter, and the
   hashing/compression/registry stack (`sha2`, `twox-hash`, `zstd`, `fastcdc`,
-  `zip`, `oci-client`, `reqwest`, `rustls`, `jsonwebtoken`). Check
+  `zip`, `oci-client`, `reqwest`, `rustls`). Check
   `[workspace.dependencies]` before concluding a crate is new.
 - One crypto provider only: `reqwest` is pinned `rustls-no-provider` and the
   `task` binary installs the ring provider at startup. Do not pull in a dep that
@@ -120,6 +120,6 @@ rationale. Concrete guidance:
   linkable under musl with no system C libraries. Add an advisory ignore only
   with documented rationale and residual risk in `.cargo/audit.toml`.
 - Keep the pins shared with virtkit (`oci-client`, `reqwest`, `rustls`,
-  `jsonwebtoken`, `zstd`, `sha2`, `fastcdc`) in step with that repo — `ocicas`
+ `zstd`, `sha2`, `fastcdc`) in step with that repo — `ocicas`
   is meant to merge back. `granit-parser` is required as `"2"`; `Cargo.lock`
   holds it at the version virtkit's `serde-saphyr` resolves to.
