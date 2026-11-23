@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::chunker::{AVG_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::error::{Error, Result};
 use crate::index::{
-    ChunkRef, FileEntry, Index, safe_rel_path, zstd_decode_bounded_into, zstd_frame,
+    ChunkRef, FileEntry, Index, safe_rel_path, zstd_decode_bounded_into, zstd_frame_into,
 };
 use crate::restore::{self, Tree, Written};
 
@@ -76,13 +76,15 @@ where
     }
 
     let mut seen: HashSet<String> = HashSet::new();
+    // One buffer for every frame, rather than one of the chunk's size each.
+    let mut frame: Vec<u8> = Vec::new();
     let mut concat = ConcatFiles::new(reg_paths);
     let chunker =
         fastcdc::v2020::StreamCDC::new(&mut concat, MIN_CHUNK_SIZE, AVG_CHUNK_SIZE, MAX_CHUNK_SIZE);
     for chunk in chunker {
         let chunk = chunk.map_err(|e| Error::format(format!("chunking: {e}")))?;
         let raw = &chunk.data;
-        let frame = zstd_frame(raw)?;
+        zstd_frame_into(raw, &mut frame)?;
         let refc = if transparent {
             let d = sha256_hex(raw);
             ChunkRef {

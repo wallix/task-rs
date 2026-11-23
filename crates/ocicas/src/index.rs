@@ -255,6 +255,12 @@ pub(crate) fn zstd_frame(raw: &[u8]) -> Result<Vec<u8>> {
     Ok(zctx::compress(raw)?)
 }
 
+/// [`zstd_frame`] into a buffer the caller keeps from one frame to the next.
+/// The frame overwrites `frame`.
+pub(crate) fn zstd_frame_into(raw: &[u8], frame: &mut Vec<u8>) -> Result<()> {
+    Ok(zctx::compress_into(raw, frame)?)
+}
+
 /// Decode `frames` like `zstd::stream::read::Decoder` using the context pool.
 pub(crate) fn zstd_reader(frames: &[u8]) -> std::io::Result<impl Read + '_> {
     zctx::decoder_buffered(frames)

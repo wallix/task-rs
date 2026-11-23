@@ -185,20 +185,32 @@ fn decoder_from<R: BufRead>(
 /// Compress `raw` as one frame at [`ZSTD_LEVEL`] with its content size in the
 /// header: the bytes of `zstd::bulk::compress`.
 pub(crate) fn compress(raw: &[u8]) -> io::Result<Vec<u8>> {
-    compress_from(&ENCODERS, raw)
+    let mut frame = Vec::new();
+    compress_into(raw, &mut frame)?;
+    Ok(frame)
 }
 
-fn compress_from(pool: &'static Pool<CCtx<'static>>, raw: &[u8]) -> io::Result<Vec<u8>> {
+/// [`compress`] into a buffer the caller keeps from one frame to the next. The
+/// frame overwrites `frame`.
+pub(crate) fn compress_into(raw: &[u8], frame: &mut Vec<u8>) -> io::Result<()> {
+    compress_from(&ENCODERS, raw, frame)
+}
+
+fn compress_from(
+    pool: &'static Pool<CCtx<'static>>,
+    raw: &[u8],
+    frame: &mut Vec<u8>,
+) -> io::Result<()> {
     let mut pooled = pool.take()?;
     let ctx = pooled.ctx()?;
     ctx.set_parameter(CParameter::CompressionLevel(ZSTD_LEVEL))
         .map_err(zstd_error)?;
-    let mut frame = Vec::new();
+    frame.clear();
     frame
-        .try_reserve_exact(zstd_safe::compress_bound(raw.len()))
+        .try_reserve(zstd_safe::compress_bound(raw.len()))
         .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
-    ctx.compress2(&mut frame, raw).map_err(zstd_error)?;
-    Ok(frame)
+    ctx.compress2(frame, raw).map_err(zstd_error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -229,6 +241,12 @@ pub(crate) mod tests {
         zstd::bulk::compress(raw, ZSTD_LEVEL).unwrap()
     }
 
+    fn encode(pool: &'static Pool<CCtx<'static>>, raw: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        compress_from(pool, raw, &mut frame).unwrap();
+        frame
+    }
+
     fn decode(pool: &'static Pool<DCtx<'static>>, frames: &[u8]) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
         decoder_from(pool, frames)?.read_to_end(&mut out)?;
@@ -236,10 +254,12 @@ pub(crate) mod tests {
     }
 
     /// A reused encoder produces the same frame bytes as a fresh encoder, whether the
-    /// preceding input was larger or smaller, and records the content size.
+    /// preceding input was larger or smaller, and records the content size. So does a
+    /// reused frame buffer.
     #[test]
     fn a_reused_encoder_writes_the_frames_a_new_one_does() {
         static POOL: Pool<CCtx<'static>> = Pool::new();
+        let mut frame = Vec::new();
         for (len, seed) in [
             (0, 1),
             (1, 2),
@@ -251,7 +271,7 @@ pub(crate) mod tests {
             (200_000, 8),
         ] {
             let raw = sample(len, seed);
-            let frame = compress_from(&POOL, &raw).unwrap();
+            compress_from(&POOL, &raw, &mut frame).unwrap();
             assert_eq!(frame, reference_frame(&raw), "{len} bytes");
             assert_eq!(
                 zstd_safe::get_frame_content_size(&frame).ok().flatten(),
@@ -272,7 +292,7 @@ pub(crate) mod tests {
                 scope.spawn(move || {
                     for round in 0..20 {
                         let raw = sample(50_000 + 7_000 * round, seed + round as u64);
-                        assert_eq!(compress_from(&POOL, &raw).unwrap(), reference_frame(&raw));
+                        assert_eq!(encode(&POOL, &raw), reference_frame(&raw));
                     }
                 });
             }
