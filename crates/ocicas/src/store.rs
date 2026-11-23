@@ -62,6 +62,10 @@ pub struct RemoteOptions {
     pub cache_dir: Option<PathBuf>,
     /// Talk to the registry without TLS (local development).
     pub plain_http: bool,
+    /// Require a successful probe advertising the transparent-zstd scheme:
+    /// [`Store::open`] fails without one. When unset, the scheme is detected
+    /// and a registry without it gets compressed-digest chunks.
+    pub require_transparent: bool,
 }
 
 /// A resolved entry whose index has been fetched and validated, but whose
@@ -107,7 +111,8 @@ pub struct Store {
 
 impl Store {
     /// Open `host/repo` as a store, probing the registry for the transparent-zstd
-    /// capability.
+    /// capability. With [`RemoteOptions::require_transparent`], a probe that
+    /// does not establish it is an error.
     pub async fn open(reference: &str, opts: RemoteOptions) -> Result<Self> {
         let parsed: Reference = reference
             .parse()
@@ -164,7 +169,8 @@ impl Store {
         };
 
         let scheme = if opts.plain_http { "http" } else { "https" };
-        let transparent = detect_transparent(&http, scheme, &registry, &auth).await?;
+        let transparent =
+            detect_transparent(&http, scheme, &registry, &auth, opts.require_transparent).await?;
 
         Ok(Store {
             client,
@@ -643,6 +649,10 @@ async fn upload_chunk(
 /// and every later operation would fail too, so it surfaces as [`Error::Network`]
 /// — letting `Store::open` fail fast and the caller warn instead of stalling.
 ///
+/// With `require` there is no fallback, so only a successful response carrying
+/// the header is `Ok`. A request error or an error status is reported as such:
+/// neither says whether the registry has the capability.
+///
 /// Authenticate the probe because a credential-gated vk-registry omits the
 /// capability header from its 401 response.
 async fn detect_transparent(
@@ -650,14 +660,33 @@ async fn detect_transparent(
     scheme: &str,
     registry: &str,
     auth: &Auth,
+    require: bool,
 ) -> Result<bool> {
     let url = format!("{scheme}://{registry}/v2/");
     with_retry(|| async {
-        match auth.apply(http.get(&url)).send().await {
-            Ok(resp) => Ok(resp.headers().contains_key(TRANSPARENT_ZSTD_HEADER)),
-            Err(e) if is_transport(&e) => Err(req_err(e)),
-            Err(_) => Ok(false),
+        let resp = match auth.apply(http.get(&url)).send().await {
+            Ok(resp) => resp,
+            Err(e) if require || is_transport(&e) => return Err(req_err(e)),
+            Err(_) => return Ok(false),
+        };
+        let advertised = resp.headers().contains_key(TRANSPARENT_ZSTD_HEADER);
+        if !require {
+            return Ok(advertised);
         }
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::format(format!(
+                "registry {registry} answered HTTP {status} to the transparent-zstd \
+                 probe ({url})"
+            )));
+        }
+        if !advertised {
+            return Err(Error::format(format!(
+                "registry {registry} does not advertise the transparent-zstd scheme \
+                 (no {TRANSPARENT_ZSTD_HEADER} header on {url}): not a vk-registry?"
+            )));
+        }
+        Ok(true)
     })
     .await
 }
@@ -940,10 +969,15 @@ mod tests {
             user: "ci".to_string(),
             pass: "s3cret".to_string(),
         };
-        let transparent =
-            detect_transparent(&reqwest::Client::new(), "http", &server.authority(), &auth)
-                .await
-                .expect("probe");
+        let transparent = detect_transparent(
+            &reqwest::Client::new(),
+            "http",
+            &server.authority(),
+            &auth,
+            false,
+        )
+        .await
+        .expect("probe");
         // A 200 without the capability header reports no support.
         assert!(!transparent);
         let seen = server.seen();
@@ -964,6 +998,7 @@ mod tests {
             &format!("{}/repo", server.authority()),
             RemoteOptions {
                 plain_http: true,
+                require_transparent: true,
                 ..Default::default()
             },
         )
@@ -971,6 +1006,91 @@ mod tests {
         .expect("probe retries");
         assert!(store.transparent());
         assert_eq!(server.seen().len(), 2);
+    }
+
+    /// The error of opening a store that requires the transparent-zstd scheme
+    /// on a registry answering its probe with `response`, at once: it
+    /// answered, so there is nothing to retry.
+    async fn required_transparent_refusal(response: &str) -> String {
+        install_crypto();
+        let server = FakeServer::start_raw(vec![response.to_string()]);
+        let Err(error) = Store::open(
+            &format!("{}/repo", server.authority()),
+            RemoteOptions {
+                plain_http: true,
+                require_transparent: true,
+                ..Default::default()
+            },
+        )
+        .await
+        else {
+            panic!("the registry was accepted");
+        };
+        assert!(matches!(error, Error::Format(_)), "{error}");
+        assert_eq!(server.seen().len(), 1);
+        error.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_required_transparent_scheme_refuses_a_plain_registry() {
+        let error = required_transparent_refusal(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
+        .await;
+        assert!(
+            error.contains("does not advertise the transparent-zstd scheme"),
+            "{error}"
+        );
+        assert!(error.contains("not a vk-registry?"), "{error}");
+    }
+
+    /// A credential-gated vk-registry omits the header from its 401: the
+    /// error names the status, not a missing capability.
+    #[tokio::test]
+    async fn a_required_transparent_scheme_reports_a_refused_probe() {
+        let error = required_transparent_refusal(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(error.contains("HTTP 401"), "{error}");
+        assert!(!error.contains("not a vk-registry?"), "{error}");
+    }
+
+    /// The header on an error response does not establish the capability.
+    #[tokio::test]
+    async fn a_required_transparent_scheme_refuses_a_failed_probe_with_the_header() {
+        let error = required_transparent_refusal(
+            "HTTP/1.1 503 Service Unavailable\r\nx-virtkit-transparent-zstd: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(error.contains("HTTP 503"), "{error}");
+        assert!(!error.contains("not a vk-registry?"), "{error}");
+    }
+
+    /// An answer that is not HTTP is final in both modes: a failed request
+    /// when the scheme is required, no capability otherwise.
+    #[tokio::test]
+    async fn the_capability_probe_reads_a_malformed_response_by_mode() {
+        install_crypto();
+        for require in [true, false] {
+            let server = FakeServer::start_raw(vec!["NOT HTTP\r\n\r\n".into()]);
+            let probed = detect_transparent(
+                &reqwest::Client::new(),
+                "http",
+                &server.authority(),
+                &Auth::None,
+                require,
+            )
+            .await;
+            match probed {
+                Err(Error::Format(error)) if require => {
+                    assert!(error.starts_with("http: "), "{error}");
+                }
+                Ok(false) if !require => {}
+                other => panic!("require {require}: {other:?}"),
+            }
+            assert_eq!(server.seen().len(), 1);
+        }
     }
 
     fn http_client() -> Client {

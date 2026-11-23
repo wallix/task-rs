@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **A `vk:` cache requires vk-registry's transparent-zstd mode.** When the
+  registry does not advertise it, restores are skipped and saves print a
+  warning naming the registry. A generic OCI registry can be configured with
+  `url: oci://…`.
+
 ## v4.13.0 - 2026-11-23
 
 - **Cache transfers stop when the first chunk fails.** If the registry stops

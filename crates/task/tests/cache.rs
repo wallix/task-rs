@@ -21,6 +21,8 @@
 )]
 
 mod common;
+#[path = "common/registry.rs"]
+mod registry;
 use common::*;
 
 use std::path::Path;
@@ -1507,6 +1509,62 @@ fn cache_vk_derives_cache_and_lock_from_the_registry() {
     assert!(
         out.contains("https://127.0.0.1:1/v2/"),
         "the cache should have pinged the derived registry: {out}"
+    );
+}
+
+// Without transparent-zstd, a `vk:` restore misses, the task runs, and the
+// save warns without pushing anything. An explicit `oci://` URL can save
+// and restore compressed-digest chunks on the same registry.
+#[test]
+fn cache_vk_requires_the_transparent_zstd_scheme() {
+    let registry = registry::Registry::start();
+    let cas = cache_dir();
+    let cas = cas.to_str().unwrap();
+
+    let dir = stage("cache_vk");
+    let vk = format!("http://{}/repo", registry.authority());
+    let env = [
+        ("VK_REGISTRY", vk.as_str()),
+        ("VK_NAMESPACE", "gcc-13"),
+        ("TASK_CACHE_OCI_CAS_DIR", cas),
+    ];
+    let (out, code) = run_env(&dir, &["--verbose", "build"], &env);
+    assert_eq!(code, 0, "run failed: {out}");
+    assert!(dir.join("output.txt").exists());
+    let refusal = "does not advertise the transparent-zstd scheme";
+    assert!(
+        out.contains(&format!(
+            "cache restore \"build\": ocicas: registry {} {refusal}",
+            registry.authority()
+        )),
+        "the restore should be a reported miss: {out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "WARNING: cache save \"build\" failed: ocicas: registry {} {refusal}",
+            registry.authority()
+        )),
+        "the save should warn: {out}"
+    );
+    assert!(!out.contains("saved to cache"), "{out}");
+    assert!(!registry.has_manifests());
+    assert!(!registry.has_blobs());
+
+    let env = [
+        ("REGISTRY", registry.authority()),
+        ("TASK_CACHE_OCI_CAS_DIR", cas),
+    ];
+    let first = stage("cache_oci_retry");
+    let (out, code) = run_env(&first, &["build"], &env);
+    assert_eq!(code, 0, "run failed: {out}");
+    assert!(out.contains("saved to cache"), "{out}");
+    let second = stage("cache_oci_retry");
+    let (out, code) = run_env(&second, &["--verbose", "build"], &env);
+    assert_eq!(code, 0, "run failed: {out}");
+    assert!(out.contains("restored from cache"), "{out}");
+    assert_eq!(
+        std::fs::read(second.join("output.txt")).unwrap(),
+        std::fs::read(second.join("input.txt")).unwrap()
     );
 }
 

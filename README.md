@@ -143,7 +143,9 @@ Two storage backends are available:
 
 A [vk-registry](https://github.com/wallix/virtkit) needs only its address: a
 `vk:` cache model derives the entry and the build-once lock from the one
-repository, authenticated by an API key in `TASK_VK_API_KEY`:
+repository, authenticated by an API key in `TASK_VK_API_KEY`. The registry must
+advertise its transparent-zstd mode; any other OCI registry takes an `oci://`
+`url`:
 
 ```yaml
 caches:

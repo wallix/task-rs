@@ -787,6 +787,15 @@ developer machine — disables the block; one that renders to anything but
 cannot be combined with `url` or `lock`. `api_key` also works with an explicit
 `oci://` URL and `vk://` lock, where it outranks every other credential.
 
+A `vk` cache requires the registry to advertise transparent-zstd. Each new
+save uploads compressed chunks named by the digest of their uncompressed
+bytes. Restores use the format in the saved index, including older entries
+whose digests cover the compressed bytes.
+
+If the registry omits the capability, a restore counts as a miss and a save
+prints a warning naming the registry. For a generic OCI registry, set `url`
+to its `oci://` URL.
+
 ```yaml
 caches:
   default:
@@ -808,8 +817,9 @@ Supported `url` (storage) schemes:
   are `$TASK_VK_API_KEY` (a bearer token, such as a vk-registry API key) or
   `$TASK_CACHE_OCI_USER` / `$TASK_CACHE_OCI_PASSWORD` (Basic), with the token
   taking precedence. `$TASK_CACHE_OCI_CA` and `$TASK_CACHE_OCI_CAS_DIR` provide
-  the other environment settings. Against a vk-registry server, Task also
-  negotiates its transparent-zstd upload mode automatically.
+  the other environment settings. Against a vk-registry server, Task uses its
+  transparent-zstd mode when the registry advertises it, and otherwise stores
+  compressed chunks named by their own digest, as on any OCI registry.
 
 Whatever the scheme, a restore writes only the task's `generates`: an entry
 holding any other file, or cached for another task or other sources, is refused

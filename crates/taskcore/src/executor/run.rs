@@ -2194,10 +2194,13 @@ impl Executor {
         let mut url = CacheUrl::parse(&c.url).unwrap_or_default();
         // A `cache.api_key` outranks every other credential, the URL's
         // included — the same order as the lock's.
-        if let Some(CacheUrl::Oci { opts, .. }) = &mut url
-            && !c.api_key.is_empty()
-        {
-            opts.token = c.api_key.clone();
+        if let Some(CacheUrl::Oci { opts, .. }) = &mut url {
+            if !c.api_key.is_empty() {
+                opts.token = c.api_key.clone();
+            }
+            // New `vk` saves require transparent-zstd. An explicit `oci://` URL
+            // uses the scheme its registry advertises.
+            opts.require_transparent = !c.vk.is_empty();
         }
         url
     }
