@@ -93,8 +93,11 @@ clap = { version = "4", features = ["derive", "env", "string"] }
 # of the dedup cache format. Kept in step with virtkit's pins (the eventual
 # merge target). No stdlib equivalent; the chunk boundaries and the
 # compressed/hashed bytes are part of the on-registry format.
+# `with-rust-allocator` gives zstd contexts Rust's global allocator instead of
+# the C runtime's malloc, as virtkit's pin does. The feature enables
+# zstd-safe's `experimental` API. No workspace code calls it directly.
 fastcdc = "5"
-zstd = "0.14.4"
+zstd = { version = "0.14.4", features = ["with-rust-allocator"] }
 sha2 = "0.11"
 # Fast non-cryptographic hashing (xxHash3) for the file-content fingerprint and
 # task-identity hashes — the cache hot path. Not security-sensitive; matches the
