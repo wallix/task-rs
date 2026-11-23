@@ -4,7 +4,7 @@
 //! transparent-zstd chunk transfers (which need a per-request `Content-Encoding`
 //! or `Accept-Encoding` that oci-client cannot set). An optional local chunk CAS
 //! makes repeated pulls incremental: only chunks absent from the cache directory
-//! are fetched.
+//! are fetched. It keeps each chunk as it arrived ([`Codec`]).
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -493,7 +493,7 @@ impl Store {
         if let Some(dir) = self.cache_dir.clone() {
             let mut set: JoinSet<Result<()>> = JoinSet::new();
             for c in want.values() {
-                if cas_valid(&dir, &c.digest) {
+                if cas_contains(&dir, &c.digest) {
                     continue;
                 }
                 next_slot(&mut set).await?;
@@ -501,18 +501,23 @@ impl Store {
                 let dir = dir.clone();
                 let c = c.clone();
                 set.spawn(async move {
-                    let data = fetcher.fetch(&c).await?;
-                    cas_write(&dir, &c.digest, &data)
+                    let fetched = fetcher.fetch(&c).await?;
+                    match &fetched.frame {
+                        Some(frame) => cas_write(&dir, Codec::Zstd, &c.digest, frame),
+                        None => cas_write(&dir, Codec::Raw, &c.digest, &fetched.data),
+                    }
                 });
             }
             while let Some(res) = set.join_next().await {
                 res.map_err(join_err)??;
             }
-            Ok(Box::new(move |d: &str| read_cas(&dir, d)))
+            // One buffer for every frame read back, rather than one each.
+            let mut frame = Vec::new();
+            Ok(Box::new(move |d: &str| read_cas(&dir, d, &mut frame)))
         } else {
             let mut mem: BTreeMap<String, Vec<u8>> = BTreeMap::new();
             for c in want.values() {
-                mem.insert(c.digest.clone(), fetcher.fetch(c).await?);
+                mem.insert(c.digest.clone(), fetcher.fetch(c).await?.data);
             }
             Ok(Box::new(move |d: &str| {
                 mem.get(d)
@@ -550,21 +555,37 @@ impl ChunkFetcher {
     /// Fetch the blob `c` names, verified against its digest. A
     /// transparent-zstd registry is asked for the frame it stores; any other
     /// serves the blob as is, through `oci-client`.
-    async fn fetch(&self, c: &ChunkRef) -> Result<Vec<u8>> {
+    async fn fetch(&self, c: &ChunkRef) -> Result<Fetched> {
         if self.transparent {
             let url = format!("{}/{}", self.blobs, c.digest);
             let (http, auth, url) = (&self.http, &self.auth, url.as_str());
             with_retry(|| pull_blob_zstd(http, auth, url, c)).await
         } else {
-            pull_blob_bytes(
+            let data = pull_blob_bytes(
                 &self.client,
                 &self.image,
                 &descriptor(MEDIA_TYPE_CHUNK, c.digest.clone(), c.size),
                 MAX_CHUNK_BLOB,
             )
-            .await
+            .await?;
+            Ok(Fetched { data, frame: None })
         }
     }
+}
+
+/// A blob pulled and verified.
+#[derive(Debug)]
+struct Fetched {
+    /// The bytes its digest names.
+    data: Vec<u8>,
+    /// The zstd frame of them the registry sent, when it sent one.
+    frame: Option<Vec<u8>>,
+}
+
+/// The most bytes the blob `c` names can hold: the size its descriptor states,
+/// which bounds the decoding of a frame of it.
+fn blob_size(c: &ChunkRef) -> usize {
+    usize::try_from(c.size).unwrap_or(0).min(MAX_CHUNK_BLOB)
 }
 
 fn descriptor(media_type: &str, digest: String, size: i64) -> OciDescriptor {
@@ -805,36 +826,67 @@ async fn push_blob_zstd(
     Ok(())
 }
 
-/// The local CAS's `sha256` directory, held open: every chunk operation is
+/// How a local CAS entry holds the bytes its digest names. Each form has its
+/// own directory, so an entry's place says how to read it and a store written
+/// before frames were kept stays valid as it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Codec {
+    /// The bytes themselves, under `sha256/`: a compressed-digest chunk (whose
+    /// digest is its frame's), or a chunk that arrived decoded.
+    Raw,
+    /// A zstd frame of them, under `zstd/`: a transparent-zstd chunk as the
+    /// registry sent it.
+    Zstd,
+}
+
+impl Codec {
+    /// The order a read tries them in: an entry that needs no decoding first.
+    const ALL: [Codec; 2] = [Codec::Raw, Codec::Zstd];
+
+    fn dir(self) -> &'static str {
+        match self {
+            Codec::Raw => "sha256",
+            Codec::Zstd => "zstd",
+        }
+    }
+}
+
+/// The local CAS's directory for `codec`, held open: every chunk operation is
 /// relative to it, never through a symlink, so a link planted in the store
 /// cannot redirect one. `dir` itself is the user's configured location.
-fn cas_dir(dir: &Path, create: bool) -> Result<std::fs::File> {
+fn cas_dir(dir: &Path, codec: Codec, create: bool) -> Result<std::fs::File> {
     if create {
         std::fs::create_dir_all(dir)?;
     }
     let root = cap_primitives::fs::open_ambient_dir(dir, cap_primitives::ambient_authority())?;
-    restore::open_parent(&root, &["sha256".to_string()], create, &mut Vec::new())
+    restore::open_parent(&root, &[codec.dir().to_string()], create, &mut Vec::new())
 }
 
 fn cas_hex(digest: &str) -> Result<&str> {
     digest_hex(digest).ok_or_else(|| Error::format(format!("bad digest {digest:?}")))
 }
 
-fn cas_valid(dir: &Path, digest: &str) -> bool {
-    let (Ok(hex), Ok(sub)) = (cas_hex(digest), cas_dir(dir, false)) else {
+/// Whether the local CAS holds an entry for `digest`, in either form. Its
+/// content is checked when it is read ([`read_cas`]), not here.
+fn cas_contains(dir: &Path, digest: &str) -> bool {
+    let Ok(hex) = cas_hex(digest) else {
         return false;
     };
-    restore::leaf_type(&sub, Path::new(hex)).is_ok_and(|t| t.is_some_and(|t| t.is_file()))
+    Codec::ALL.into_iter().any(|codec| {
+        cas_dir(dir, codec, false).is_ok_and(|sub| {
+            restore::leaf_type(&sub, Path::new(hex)).is_ok_and(|t| t.is_some_and(|t| t.is_file()))
+        })
+    })
 }
 
 /// Create an unpredictable temporary file exclusively, then rename it into
 /// place. Concurrent pulls see only complete chunks, and a planted file cannot
-/// redirect the write.
-fn cas_write(dir: &Path, digest: &str, data: &[u8]) -> Result<()> {
+/// redirect the write. `data` is the entry as `codec` holds it.
+fn cas_write(dir: &Path, codec: Codec, digest: &str, data: &[u8]) -> Result<()> {
     use std::io::Write as _;
     static TMPS: AtomicI64 = AtomicI64::new(0);
     let hex = cas_hex(digest)?;
-    let sub = cas_dir(dir, true)?;
+    let sub = cas_dir(dir, codec, true)?;
     let random = std::hash::BuildHasher::hash_one(
         &std::collections::hash_map::RandomState::new(),
         (
@@ -859,6 +911,100 @@ fn cas_write(dir: &Path, digest: &str, data: &[u8]) -> Result<()> {
         let _ = cap_primitives::fs::remove_file(&sub, &tmp);
     }
     Ok(written?)
+}
+
+/// Read a chunk from the local CAS, verifying its digest; a corrupted entry is
+/// removed and reported so the restore fails rather than trusting bad bytes.
+/// The entry is opened without following a link and must be a regular file.
+///
+/// A frame is decoded first and the digest taken over the result. Neither an
+/// entry nor what a frame decodes to may exceed [`MAX_CHUNK_BLOB`], whatever
+/// size an index gives the chunk: that size is for [`assemble`] to hold the
+/// bytes to, and a wrong one says nothing against the entry. `frame` is
+/// scratch space for a frame, kept by the caller from one read to the next.
+///
+/// A chunk held in both forms is read from the first that verifies, and a
+/// form that cannot be read (its directory is a link, say) does not hide the
+/// other. Only an entry found corrupt is removed: malformed, over the limit or
+/// of another digest. One that could not be read for want of memory or for an
+/// I/O error stays. The removal is best-effort: it can race a concurrent pull
+/// replacing the entry and unlink the new file, which is then fetched again,
+/// and its failing leaves the error of the read as it is.
+fn read_cas(dir: &Path, digest: &str, frame: &mut Vec<u8>) -> Result<Vec<u8>> {
+    let hex = cas_hex(digest)?;
+    let mut failed = None;
+    for codec in Codec::ALL {
+        let sub = match cas_dir(dir, codec, false) {
+            Ok(sub) => sub,
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                failed = Some(e);
+                continue;
+            }
+        };
+        match read_cas_entry(&sub, codec, hex, frame) {
+            Ok(Some(data)) if sha256_hex(&data) == digest => return Ok(data),
+            Ok(None) => {}
+            Ok(Some(_)) | Err(Error::Format(_)) => {
+                let _ = cap_primitives::fs::remove_file(&sub, Path::new(hex));
+                failed = Some(Error::format(format!("corrupt CAS entry {digest}")));
+            }
+            Err(e) => failed = Some(e),
+        }
+    }
+    Err(failed.unwrap_or_else(|| Error::format(format!("no CAS entry {digest}"))))
+}
+
+/// The bytes the entry `hex` of the `codec` directory `sub` holds, not yet
+/// verified, or `None` if there is no such entry. An entry that is corrupt
+/// whatever its digest is an [`Error::Format`]: one over [`MAX_CHUNK_BLOB`],
+/// or a frame that is malformed or decodes to more.
+fn read_cas_entry(
+    sub: &std::fs::File,
+    codec: Codec,
+    hex: &str,
+    frame: &mut Vec<u8>,
+) -> Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let file = match restore::open_nofollow(sub, Path::new(hex), false) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(Error::Io(std::io::Error::other(format!(
+            "CAS entry {}/{hex} is not a file",
+            codec.dir()
+        ))));
+    }
+    // No entry is longer: one byte more gives a longer file away without
+    // reading it all.
+    let mut entry = file.take((MAX_CHUNK_BLOB as u64).saturating_add(1));
+    let mut data = Vec::new();
+    match codec {
+        Codec::Raw => {
+            entry.read_to_end(&mut data)?;
+            if data.len() > MAX_CHUNK_BLOB {
+                return Err(Error::format("entry is larger than a chunk blob"));
+            }
+        }
+        Codec::Zstd => {
+            frame.clear();
+            entry.read_to_end(frame)?;
+            if frame.len() > MAX_CHUNK_BLOB {
+                return Err(Error::format("frame is larger than a chunk blob"));
+            }
+            match zstd_decode_chunk_into(frame, MAX_CHUNK_BLOB, &mut data) {
+                Ok(()) => {}
+                // Not the entry's fault: it may decode the next time.
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::OutOfMemory => {
+                    return Err(Error::Io(e));
+                }
+                Err(e) => return Err(Error::format(restore::message(&e))),
+            }
+        }
+    }
+    Ok(Some(data))
 }
 
 /// The `Content-Encoding` of a response, as far as a blob pull reads one.
@@ -984,12 +1130,12 @@ impl StatedDigest {
 
 /// Fetch the blob `c` names from a transparent-zstd registry and return its
 /// bytes, verified against the size and the digest of `c` and, as `oci-client`
-/// does, against a `Docker-Content-Digest` the response states. The request
-/// accepts zstd, so the registry may send the frame it stores rather than
-/// decompress it; a response without the encoding (a blob stored as is, or a
-/// proxy decoding on the way) is taken as the blob itself. Issued directly:
-/// oci-client can neither ask for an encoding nor undo one before it verifies
-/// the digest.
+/// does, against a `Docker-Content-Digest` the response states, with the frame
+/// they arrived as. The request accepts zstd, so the registry may send the
+/// frame it stores rather than decompress it; a response without the encoding
+/// (a blob stored as is, or a proxy decoding on the way) is taken as the blob
+/// itself. Issued directly: oci-client can neither ask for an encoding nor undo
+/// one before it verifies the digest.
 ///
 /// One attempt, for [`with_retry`] to repeat: only the transport failing is
 /// [`Error::Network`].
@@ -998,7 +1144,7 @@ async fn pull_blob_zstd(
     auth: &Auth,
     url: &str,
     c: &ChunkRef,
-) -> Result<Vec<u8>> {
+) -> Result<Fetched> {
     let mut resp = auth
         .apply(
             http.get(url)
@@ -1018,7 +1164,7 @@ async fn pull_blob_zstd(
     let stated = StatedDigest::of(resp.headers()).map_err(|e| in_blob(digest, &e))?;
     // Cap the buffered identity body at the indexed size. A zstd frame can
     // exceed the size of a small chunk, so use the chunk blob limit on the wire.
-    let size = usize::try_from(c.size).unwrap_or(0).min(MAX_CHUNK_BLOB);
+    let size = blob_size(c);
     let cap = match encoding {
         Encoding::Identity => size,
         Encoding::Zstd => MAX_CHUNK_BLOB,
@@ -1033,24 +1179,30 @@ async fn pull_blob_zstd(
         }
         body.extend_from_slice(&part);
     }
-    let data = match encoding {
-        Encoding::Identity => body,
+    let fetched = match encoding {
+        Encoding::Identity => Fetched {
+            data: body,
+            frame: None,
+        },
         Encoding::Zstd => {
             // A frame inflating past the blob's stated size is refused, a
             // byte beyond it.
             let mut data = Vec::new();
             zstd_decode_chunk_into(&body, size, &mut data).map_err(|e| in_blob(digest, &e))?;
-            data
+            Fetched {
+                data,
+                frame: Some(body),
+            }
         }
     };
-    if data.len() as i64 != c.size {
+    if fetched.data.len() as i64 != c.size {
         return Err(Error::format(format!(
             "blob {digest}: {} bytes, index says {}",
-            data.len(),
+            fetched.data.len(),
             c.size
         )));
     }
-    let got = sha256_hex(&data);
+    let got = sha256_hex(&fetched.data);
     if got != *digest {
         return Err(Error::format(format!(
             "blob digest mismatch: want {digest}, got {got}"
@@ -1058,36 +1210,16 @@ async fn pull_blob_zstd(
     }
     if let Some(stated) = stated {
         stated
-            .verify(&data, &got)
+            .verify(&fetched.data, &got)
             .map_err(|e| in_blob(digest, &e))?;
     }
-    Ok(data)
+    Ok(fetched)
 }
 
 /// `e` as a final failure of the blob `digest`: what the registry sent is
 /// wrong, which asking again does not change.
 fn in_blob(digest: &str, e: &Error) -> Error {
     Error::format(format!("blob {digest}: {}", restore::message(e)))
-}
-
-/// Read a chunk from the local CAS, verifying its digest; a corrupted entry is
-/// removed and reported so the restore fails rather than trusting bad bytes.
-/// The entry is opened without following a link and must be a regular file.
-fn read_cas(dir: &Path, digest: &str) -> Result<Vec<u8>> {
-    use std::io::Read as _;
-    let hex = cas_hex(digest)?;
-    let sub = cas_dir(dir, false)?;
-    let mut file = restore::open_nofollow(&sub, Path::new(hex), false)?;
-    if !file.metadata()?.is_file() {
-        return Err(Error::format(format!("CAS entry {digest} is not a file")));
-    }
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
-    if sha256_hex(&data) != digest {
-        let _ = cap_primitives::fs::remove_file(&sub, Path::new(hex));
-        return Err(Error::format(format!("corrupt CAS entry {digest}")));
-    }
-    Ok(data)
 }
 
 /// Whether a manifest fetch failed because the tag is not there — a cache miss,
@@ -1191,6 +1323,12 @@ mod tests {
         }
     }
 
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
     impl Drop for TempDir {
         fn drop(&mut self) {
             // Best-effort: a leftover only costs space in the temp directory.
@@ -1209,18 +1347,192 @@ mod tests {
         dir
     }
 
+    /// Read a CAS entry of any size a chunk can have.
+    fn read(dir: &Path, digest: &str) -> Result<Vec<u8>> {
+        read_cas(dir, digest, &mut Vec::new())
+    }
+
     #[test]
     fn cas_round_trips_and_drops_corrupt_entries() {
         let dir = cas_tmp("rt");
         let digest = sha256_hex(b"chunk");
-        assert!(!cas_valid(&dir, &digest));
-        cas_write(&dir, &digest, b"chunk").unwrap();
-        assert!(cas_valid(&dir, &digest));
-        assert_eq!(read_cas(&dir, &digest).unwrap(), b"chunk");
+        assert!(!cas_contains(&dir, &digest));
+        assert!(read(&dir, &digest).is_err());
+        cas_write(&dir, Codec::Raw, &digest, b"chunk").unwrap();
+        assert!(cas_contains(&dir, &digest));
+        assert_eq!(read(&dir, &digest).unwrap(), b"chunk");
         let hex = digest_hex(&digest).unwrap();
         std::fs::write(dir.join("sha256").join(hex), b"other").unwrap();
-        assert!(read_cas(&dir, &digest).is_err());
-        assert!(!cas_valid(&dir, &digest));
+        assert!(read(&dir, &digest).is_err());
+        assert!(!cas_contains(&dir, &digest));
+    }
+
+    /// A frame is kept as it is, apart from the entries that hold the bytes
+    /// themselves, and read back as the bytes it encodes.
+    #[test]
+    fn cas_keeps_a_frame_and_reads_its_content() {
+        let dir = TempDir::new("frame");
+        let raw = crate::zctx::tests::sample(300_000, 1);
+        let frame = zstd::bulk::compress(&raw, 3).unwrap();
+        let digest = sha256_hex(&raw);
+        let hex = digest_hex(&digest).unwrap();
+        cas_write(&dir, Codec::Zstd, &digest, &frame).unwrap();
+        assert_eq!(std::fs::read(dir.join("zstd").join(hex)).unwrap(), frame);
+        assert!(!dir.join("sha256").exists());
+        assert!(cas_contains(&dir, &digest));
+        let mut scratch = Vec::new();
+        assert_eq!(read_cas(&dir, &digest, &mut scratch).unwrap(), raw);
+        // The entry is still there, and the scratch buffer serves the next read.
+        assert_eq!(read_cas(&dir, &digest, &mut scratch).unwrap(), raw);
+    }
+
+    /// An entry that does not hold, within the size of a chunk blob, the bytes
+    /// its name digests is removed and nothing of it returned.
+    #[test]
+    fn cas_drops_a_corrupt_entry() {
+        let raw = crate::zctx::tests::sample(300_000, 1);
+        let frame = zstd::bulk::compress(&raw, 3).unwrap();
+        let other = zstd::bulk::compress(&crate::zctx::tests::sample(300_000, 2), 3).unwrap();
+        let mut longer = raw.clone();
+        longer.push(0);
+        let over = vec![0; MAX_CHUNK_BLOB + 1];
+        let cases: [(&str, Codec, &[u8], Vec<u8>); 7] = [
+            (
+                "not a frame",
+                Codec::Zstd,
+                &raw,
+                b"not a zstd frame".to_vec(),
+            ),
+            (
+                "cut short",
+                Codec::Zstd,
+                &raw,
+                frame[..frame.len() - 8].to_vec(),
+            ),
+            ("a frame of other bytes", Codec::Zstd, &raw, other),
+            (
+                "a frame of more bytes",
+                Codec::Zstd,
+                &raw,
+                zstd::bulk::compress(&longer, 3).unwrap(),
+            ),
+            (
+                "a frame of more than a chunk blob holds",
+                Codec::Zstd,
+                &over,
+                zstd::bulk::compress(&over, 3).unwrap(),
+            ),
+            ("longer than any frame", Codec::Zstd, &raw, over.clone()),
+            (
+                "longer than any chunk blob",
+                Codec::Raw,
+                &over,
+                over.clone(),
+            ),
+        ];
+        for (what, codec, named, entry) in cases {
+            let digest = sha256_hex(named);
+            let hex = digest_hex(&digest).unwrap();
+            let dir = TempDir::new("badentry");
+            cas_write(&dir, codec, &digest, &entry).unwrap();
+            assert!(cas_contains(&dir, &digest), "{what}");
+            let error = read_cas(&dir, &digest, &mut Vec::new()).unwrap_err();
+            assert!(
+                error.to_string().contains("corrupt CAS entry"),
+                "{what}: {error}"
+            );
+            assert!(!dir.join(codec.dir()).join(hex).exists(), "{what}");
+            assert!(!cas_contains(&dir, &digest), "{what}");
+        }
+    }
+
+    /// An entry of the largest size a chunk blob has is read, in either form.
+    #[test]
+    fn cas_reads_an_entry_of_the_largest_size() {
+        let raw = vec![0; MAX_CHUNK_BLOB];
+        let digest = sha256_hex(&raw);
+        for (codec, entry) in [
+            (Codec::Raw, raw.clone()),
+            (Codec::Zstd, zstd::bulk::compress(&raw, 3).unwrap()),
+        ] {
+            let dir = TempDir::new("largest");
+            cas_write(&dir, codec, &digest, &entry).unwrap();
+            assert!(read(&dir, &digest).unwrap() == raw, "{codec:?}");
+        }
+    }
+
+    /// A frame that could not be decoded for want of memory stays: it is read
+    /// once there is some.
+    #[test]
+    fn cas_keeps_a_frame_it_had_no_memory_to_decode() {
+        let dir = TempDir::new("nomemory");
+        let raw = crate::zctx::tests::sample(300_000, 1);
+        let digest = sha256_hex(&raw);
+        let hex = digest_hex(&digest).unwrap();
+        cas_write(
+            &dir,
+            Codec::Zstd,
+            &digest,
+            &zstd::bulk::compress(&raw, 3).unwrap(),
+        )
+        .unwrap();
+
+        crate::zctx::tests::OUT_OF_MEMORY.set(true);
+        let error = read(&dir, &digest).unwrap_err();
+        crate::zctx::tests::OUT_OF_MEMORY.set(false);
+        let Error::Io(error) = error else {
+            panic!("{error}");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
+        assert!(dir.join("zstd").join(hex).exists());
+        assert_eq!(read(&dir, &digest).unwrap(), raw);
+    }
+
+    /// Pulls that fill a new store at once each find or make the directory of
+    /// a form: the writer that loses the race to create it uses the winner's.
+    #[test]
+    fn concurrent_writers_share_a_new_cas_directory() {
+        const WRITERS: usize = 8;
+        let frame_of = |i: usize| zstd::bulk::compress(format!("chunk{i:02}").as_bytes(), 3);
+        for _ in 0..50 {
+            let dir = TempDir::new("race");
+            let start = std::sync::Barrier::new(WRITERS);
+            std::thread::scope(|scope| {
+                for i in 0..WRITERS {
+                    let (dir, start) = (&dir, &start);
+                    scope.spawn(move || {
+                        let digest = sha256_hex(format!("chunk{i:02}").as_bytes());
+                        start.wait();
+                        cas_write(dir, Codec::Zstd, &digest, &frame_of(i).unwrap()).unwrap();
+                    });
+                }
+            });
+            for i in 0..WRITERS {
+                let chunk = format!("chunk{i:02}");
+                let digest = sha256_hex(chunk.as_bytes());
+                assert_eq!(read(&dir, &digest).unwrap(), chunk.as_bytes());
+            }
+        }
+    }
+
+    /// A chunk held in both forms survives one of them being corrupt.
+    #[test]
+    fn cas_reads_the_form_that_verifies() {
+        let raw = crate::zctx::tests::sample(300_000, 1);
+        let frame = zstd::bulk::compress(&raw, 3).unwrap();
+        let digest = sha256_hex(&raw);
+        let hex = digest_hex(&digest).unwrap();
+
+        let dir = TempDir::new("bothraw");
+        cas_write(&dir, Codec::Raw, &digest, b"other").unwrap();
+        cas_write(&dir, Codec::Zstd, &digest, &frame).unwrap();
+        assert_eq!(read(&dir, &digest).unwrap(), raw);
+        assert!(!dir.join("sha256").join(hex).exists());
+
+        let dir = TempDir::new("bothframe");
+        cas_write(&dir, Codec::Raw, &digest, &raw).unwrap();
+        cas_write(&dir, Codec::Zstd, &digest, b"other").unwrap();
+        assert_eq!(read(&dir, &digest).unwrap(), raw);
     }
 
     #[cfg(unix)]
@@ -1233,7 +1545,7 @@ mod tests {
         // A symlinked `sha256` directory.
         let dir = cas_tmp("dirlink");
         std::os::unix::fs::symlink(&outside, dir.join("sha256")).unwrap();
-        assert!(cas_write(&dir, &digest, b"chunk").is_err());
+        assert!(cas_write(&dir, Codec::Raw, &digest, b"chunk").is_err());
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
 
         // An entry that is a link to a file holding the right bytes elsewhere.
@@ -1241,16 +1553,76 @@ mod tests {
         std::fs::create_dir(dir.join("sha256")).unwrap();
         std::fs::write(outside.join("secret"), b"chunk").unwrap();
         std::os::unix::fs::symlink(outside.join("secret"), dir.join("sha256").join(&hex)).unwrap();
-        assert!(!cas_valid(&dir, &digest));
-        assert!(read_cas(&dir, &digest).is_err());
+        assert!(!cas_contains(&dir, &digest));
+        assert!(read(&dir, &digest).is_err());
         // Writing replaces the link rather than writing through it.
-        cas_write(&dir, &digest, b"chunk").unwrap();
+        cas_write(&dir, Codec::Raw, &digest, b"chunk").unwrap();
         assert!(
             std::fs::symlink_metadata(dir.join("sha256").join(&hex))
                 .unwrap()
                 .is_file()
         );
         assert_eq!(std::fs::read(outside.join("secret")).unwrap(), b"chunk");
+
+        // A link to a file of the same directory is not followed either.
+        let dir = TempDir::new("siblinglink");
+        std::fs::create_dir(dir.join("sha256")).unwrap();
+        std::fs::write(dir.join("sha256").join("target"), b"chunk").unwrap();
+        std::os::unix::fs::symlink("target", dir.join("sha256").join(&hex)).unwrap();
+        assert!(!cas_contains(&dir, &digest));
+        assert!(read(&dir, &digest).is_err());
+        assert_eq!(
+            std::fs::read(dir.join("sha256").join("target")).unwrap(),
+            b"chunk"
+        );
+
+        // The same for the directory of frames and an entry in it.
+        let frame = zstd::bulk::compress(b"chunk", 3).unwrap();
+        let dir = TempDir::new("framedirlink");
+        let frames = TempDir::new("frames");
+        std::os::unix::fs::symlink(&frames, dir.join("zstd")).unwrap();
+        assert!(cas_write(&dir, Codec::Zstd, &digest, &frame).is_err());
+        assert!(std::fs::read_dir(&frames).unwrap().next().is_none());
+        std::fs::write(frames.join(&hex), &frame).unwrap();
+        assert!(!cas_contains(&dir, &digest));
+        assert!(read(&dir, &digest).is_err());
+
+        // Nor does an entry that is no file hide one in the other directory,
+        // or hold the read: a FIFO has no writer to wait for here.
+        let dir = TempDir::new("fifoframe");
+        std::fs::create_dir(dir.join("sha256")).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.join("sha256").join(&hex))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        cas_write(&dir, Codec::Zstd, &digest, &frame).unwrap();
+        // On a thread of its own: a read the FIFO holds fails the test rather
+        // than hang it.
+        let (done, read_back) = std::sync::mpsc::channel();
+        let (store, wanted) = (dir.to_path_buf(), digest.clone());
+        std::thread::spawn(move || done.send(read(&store, &wanted)));
+        let read_back = read_back
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the FIFO held the read");
+        assert_eq!(read_back.unwrap(), b"chunk");
+
+        // A linked directory does not hide the entry the other one holds.
+        let dir = TempDir::new("dirlinkframe");
+        let linked = TempDir::new("linked");
+        std::os::unix::fs::symlink(&linked, dir.join("sha256")).unwrap();
+        cas_write(&dir, Codec::Zstd, &digest, &frame).unwrap();
+        assert!(cas_contains(&dir, &digest));
+        assert_eq!(read(&dir, &digest).unwrap(), b"chunk");
+        assert!(std::fs::read_dir(&linked).unwrap().next().is_none());
+
+        let dir = TempDir::new("frameleaflink");
+        std::fs::create_dir(dir.join("zstd")).unwrap();
+        std::fs::write(outside.join("frame"), &frame).unwrap();
+        std::os::unix::fs::symlink(outside.join("frame"), dir.join("zstd").join(&hex)).unwrap();
+        assert!(!cas_contains(&dir, &digest));
+        assert!(read(&dir, &digest).is_err());
+        assert_eq!(std::fs::read(outside.join("frame")).unwrap(), frame);
     }
 
     /// A credential-gated registry omits the capability header from an
@@ -1502,7 +1874,7 @@ mod tests {
         }
     }
 
-    async fn pull_zstd(server: &FakeServer, auth: &Auth, c: &ChunkRef) -> Result<Vec<u8>> {
+    async fn pull_zstd(server: &FakeServer, auth: &Auth, c: &ChunkRef) -> Result<Fetched> {
         let url = format!("{}/v2/repo/blobs/{}", server.base(), c.digest);
         pull_blob_zstd(&raw_client().build().unwrap(), auth, &url, c).await
     }
@@ -1521,7 +1893,9 @@ mod tests {
             pass: "s3cret".to_string(),
         };
         let chunk = raw_ref(&raw);
-        assert_eq!(pull_zstd(&server, &auth, &chunk).await.unwrap(), raw);
+        let fetched = pull_zstd(&server, &auth, &chunk).await.unwrap();
+        assert_eq!(fetched.data, raw);
+        assert_eq!(fetched.frame, Some(frame));
         let seen = server.seen();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].method, "GET");
@@ -1541,7 +1915,8 @@ mod tests {
         for encoding in [None, Some("identity"), Some("")] {
             let server = FakeServer::start_bytes(vec![blob_response(encoding, &raw)]);
             let got = pull_zstd(&server, &Auth::None, &chunk).await.unwrap();
-            assert_eq!(got, raw, "{encoding:?}");
+            assert_eq!(got.data, raw, "{encoding:?}");
+            assert_eq!(got.frame, None, "{encoding:?}");
         }
     }
 
@@ -1679,7 +2054,7 @@ mod tests {
         let got = pull_zstd(&server, &Auth::None, &raw_ref(raw))
             .await
             .unwrap();
-        assert_eq!(got, raw);
+        assert_eq!(got.data, raw);
     }
 
     /// A `Docker-Content-Digest` is checked against the blob, decoded when it
@@ -1722,7 +2097,7 @@ mod tests {
                 let fields: Vec<&str> = stated.into_iter().collect();
                 let server = FakeServer::start_bytes(vec![response(&fields)]);
                 let got = pull_zstd(&server, &Auth::None, &chunk).await;
-                assert_eq!(got.unwrap(), raw, "{encoding:?}, {stated:?}");
+                assert_eq!(got.unwrap().data, raw, "{encoding:?}, {stated:?}");
             }
             for (stated, reason) in refused {
                 let server = FakeServer::start_bytes(vec![response(stated)]);
@@ -1755,7 +2130,7 @@ mod tests {
         let server = FakeServer::start_bytes(vec![cut, complete]);
         let chunk = raw_ref(&raw);
         let got = fetcher(&server, true).fetch(&chunk).await.unwrap();
-        assert_eq!(got, raw);
+        assert_eq!(got.data, raw);
         let seen = server.seen();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].path, seen[1].path);
@@ -1868,13 +2243,12 @@ mod tests {
                 .await
                 .unwrap();
 
-            let warm = TempDir::new("cas");
-            let store = open(&registry, Some(&warm)).await;
-            store.pull("tag", &TempDir::new("dst")).await.unwrap();
             for (delta, warmed) in [(-1, false), (-1, true), (1, false), (1, true)] {
-                let cold = TempDir::new("cas");
-                let cas: &Path = if warmed { &warm } else { &cold };
-                let store = open(&registry, Some(cas)).await;
+                let cas = TempDir::new("cas");
+                let store = open(&registry, Some(&cas)).await;
+                if warmed {
+                    store.pull("tag", &TempDir::new("dst")).await.unwrap();
+                }
                 let mut pulled = store.pull_index("tag").await.unwrap();
                 assert_eq!(pulled.index.transparent, transparent);
                 pulled.index.chunks[0].size += delta;
@@ -1883,7 +2257,8 @@ mod tests {
                     Ok(_) => panic!("restored (transparent: {transparent}, warm: {warmed})"),
                     Err(error) => error.to_string(),
                 };
-                // Decoding one byte past the indexed size reports an oversized chunk.
+                // A frame fetched for a smaller chunk is cut a byte past its
+                // size; one already stored is held to it once decoded.
                 let said = error.contains("index says") || error.contains("exceeds");
                 assert!(said, "transparent: {transparent}, warm: {warmed}: {error}");
             }
@@ -1923,6 +2298,163 @@ mod tests {
         );
         let digests = chunk_digests(&pulled.index);
         assert_eq!(registry.blob_gets(digests).len(), 0);
+    }
+
+    /// A transparent-zstd registry with the sample tree pushed as `tag`:
+    /// the tree, its paths and its index.
+    async fn pushed_transparent() -> (Registry, TempDir, Vec<String>, Index) {
+        let registry = Registry::start(true);
+        let (src, paths) = sample_tree("src");
+        let store = open(&registry, None).await;
+        store
+            .push("tag", &src, &paths, BTreeMap::new())
+            .await
+            .unwrap();
+        let idx = store.pull_index("tag").await.unwrap().index;
+        assert!(idx.transparent);
+        (registry, src, paths, idx)
+    }
+
+    /// The local store keeps a chunk as the frame the registry sent, a later
+    /// restore reads it from there, and a chunk that arrived decoded is kept
+    /// as its bytes.
+    #[tokio::test]
+    async fn the_local_store_keeps_frames_and_reuses_them() {
+        install_crypto();
+        let (registry, src, paths, idx) = pushed_transparent().await;
+        let digests = chunk_digests(&idx);
+        let cas = TempDir::new("cas");
+
+        let dst = TempDir::new("dst");
+        let store = open(&registry, Some(&cas)).await;
+        store.pull("tag", &dst).await.unwrap();
+        assert_same_tree(&src, &dst, &paths);
+        assert!(!cas.join("sha256").exists());
+        for digest in &digests {
+            let frame = std::fs::read(cas.join("zstd").join(digest_hex(digest).unwrap())).unwrap();
+            assert_eq!(frame, registry.blob(digest).unwrap().0);
+        }
+        let fetched = registry.blob_gets(digests.iter().copied()).len();
+        assert_eq!(fetched, digests.len());
+
+        let dst = TempDir::new("dst");
+        open(&registry, Some(&cas))
+            .await
+            .pull("tag", &dst)
+            .await
+            .unwrap();
+        assert_same_tree(&src, &dst, &paths);
+        assert_eq!(registry.blob_gets(digests.iter().copied()).len(), fetched);
+
+        // A proxy decoding on the way: the bytes themselves are what arrived.
+        registry.behaviour().decode.store(true, Ordering::Relaxed);
+        let (cas, dst) = (TempDir::new("cas"), TempDir::new("dst"));
+        open(&registry, Some(&cas))
+            .await
+            .pull("tag", &dst)
+            .await
+            .unwrap();
+        assert_same_tree(&src, &dst, &paths);
+        assert!(!cas.join("zstd").exists());
+        for digest in &digests {
+            let raw = std::fs::read(cas.join("sha256").join(digest_hex(digest).unwrap())).unwrap();
+            assert_eq!(sha256_hex(&raw), **digest);
+        }
+    }
+
+    /// A local store filled before frames were kept holds the bytes of each
+    /// chunk under `sha256`: they are restored from as they are.
+    #[tokio::test]
+    async fn the_local_store_reuses_entries_kept_decoded() {
+        install_crypto();
+        let (registry, src, paths, idx) = pushed_transparent().await;
+        let digests = chunk_digests(&idx);
+        let cas = TempDir::new("cas");
+        std::fs::create_dir(cas.join("sha256")).unwrap();
+        for digest in &digests {
+            let raw = zstd::stream::decode_all(registry.blob(digest).unwrap().0.as_slice());
+            std::fs::write(
+                cas.join("sha256").join(digest_hex(digest).unwrap()),
+                raw.unwrap(),
+            )
+            .unwrap();
+        }
+
+        let dst = TempDir::new("dst");
+        open(&registry, Some(&cas))
+            .await
+            .pull("tag", &dst)
+            .await
+            .unwrap();
+        assert_same_tree(&src, &dst, &paths);
+        assert!(registry.blob_gets(digests.iter().copied()).is_empty());
+        assert!(!cas.join("zstd").exists());
+    }
+
+    /// An index giving a chunk a smaller size than its stored frame decodes to
+    /// fails the restore and leaves the frame: the entry is what its digest
+    /// names, and the right index restores from it without fetching.
+    #[tokio::test]
+    async fn an_understated_size_fails_the_restore_and_keeps_the_stored_frame() {
+        install_crypto();
+        let (registry, src, paths, idx) = pushed_transparent().await;
+        let digests = chunk_digests(&idx);
+        let cas = TempDir::new("cas");
+        let store = open(&registry, Some(&cas)).await;
+        store.pull("tag", &TempDir::new("dst")).await.unwrap();
+        let fetched = registry.blob_gets(digests.iter().copied()).len();
+
+        let mut pulled = store.pull_index("tag").await.unwrap();
+        pulled.index.chunks[0].size -= 1;
+        let dst = TempDir::new("dst");
+        let error = match store.assemble_pulled(&pulled, &dst, None).await {
+            Ok(_) => panic!("restored from an index of another size"),
+            Err(error) => error.to_string(),
+        };
+        let says = format!("index says {}", pulled.index.chunks[0].size);
+        assert!(error.contains(&says), "{error}");
+        assert!(std::fs::read_dir(&dst).unwrap().next().is_none());
+
+        store.pull("tag", &dst).await.unwrap();
+        assert_same_tree(&src, &dst, &paths);
+        assert_eq!(registry.blob_gets(digests.iter().copied()).len(), fetched);
+    }
+
+    /// A frame gone bad in the local store fails the restore that reads it,
+    /// which leaves nothing behind; the entry is dropped, so the next restore
+    /// fetches that chunk again.
+    #[tokio::test]
+    async fn a_corrupt_frame_in_the_local_store_is_never_restored() {
+        install_crypto();
+        let (registry, src, paths, idx) = pushed_transparent().await;
+        let digests = chunk_digests(&idx);
+        let cas = TempDir::new("cas");
+        let store = open(&registry, Some(&cas)).await;
+        store.pull("tag", &TempDir::new("dst")).await.unwrap();
+        let fetched = registry.blob_gets(digests.iter().copied()).len();
+
+        // The frame of another chunk: it decodes, to the wrong bytes.
+        let entry = |digest: &str| cas.join("zstd").join(digest_hex(digest).unwrap());
+        let (last, first) = (digests[digests.len() - 1], digests[0]);
+        assert_ne!(last, first);
+        std::fs::copy(entry(first), entry(last)).unwrap();
+
+        let dst = TempDir::new("dst");
+        let Err(error) = store.pull("tag", &dst).await else {
+            panic!("restored from a corrupt entry");
+        };
+        assert!(error.to_string().contains("corrupt CAS entry"), "{error}");
+        assert!(std::fs::read_dir(&dst).unwrap().next().is_none());
+        assert!(!entry(last).exists());
+        assert_eq!(registry.blob_gets(digests.iter().copied()).len(), fetched);
+
+        store.pull("tag", &dst).await.unwrap();
+        assert_same_tree(&src, &dst, &paths);
+        assert_eq!(registry.blob_gets([last]).len(), 2);
+        assert_eq!(
+            registry.blob_gets(digests.iter().copied()).len(),
+            fetched + 1
+        );
     }
 
     /// A registry that does not advertise the scheme keeps compressed-digest

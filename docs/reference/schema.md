@@ -792,6 +792,12 @@ compressed chunks named by the digest of their uncompressed bytes. Restores
 request compressed chunks and use the digest format in the saved index. Older
 entries use digests of the compressed bytes.
 
+The local chunk store (`$TASK_CACHE_OCI_CAS_DIR`, defaulting to `task/ocicas`
+in the user cache directory) keeps chunks received with
+`Content-Encoding: zstd` compressed under `zstd/`. It stores identity
+responses under `sha256/` as received. This includes decoded chunks and older
+chunks whose digest covers the compressed bytes.
+
 If the registry omits the capability, a restore counts as a miss and a save
 prints a warning naming the registry. For a generic OCI registry, set `url`
 to its `oci://` URL.

@@ -1650,6 +1650,65 @@ fn cache_vk_restores_an_entry_saved_before_transparent_zstd() {
     assert_eq!(registry.zstd_blob_gets(), 1, "the one chunk: {out}");
 }
 
+// The first restore caches the registry's zstd frame. The second reuses it.
+#[test]
+fn cache_vk_keeps_frames_in_the_local_chunk_store() {
+    let registry = registry::Registry::start();
+    registry.advertise_transparent_zstd();
+    let vk = format!("http://{}/repo", registry.authority());
+    let cas = CacheDir::new();
+    let env = [
+        ("VK_REGISTRY", vk.as_str()),
+        ("VK_NAMESPACE", "gcc-13"),
+        ("TASK_CACHE_OCI_CAS_DIR", cas.0.to_str().unwrap()),
+    ];
+    let args = ["--verbose", "build"];
+    let (out, code) = run_env(&stage("cache_vk"), &args, &env);
+    assert_eq!(code, 0, "run failed: {out}");
+    assert!(out.contains("saved to cache"), "{out}");
+    assert_eq!(registry.zstd_blob_gets(), 0, "{out}");
+
+    for restore in ["first", "second"] {
+        let dir = stage("cache_vk");
+        let (out, code) = run_env(&dir, &args, &env);
+        assert_eq!(code, 0, "{restore} restore failed: {out}");
+        assert!(out.contains("restored from cache"), "{restore}: {out}");
+        assert_eq!(
+            std::fs::read(dir.join("output.txt")).unwrap(),
+            std::fs::read(dir.join("input.txt")).unwrap(),
+            "{restore}"
+        );
+        assert_eq!(registry.zstd_blob_gets(), 1, "{restore}: {out}");
+        assert_eq!(dir_len(&cas.0.join("zstd")), 1, "{restore}");
+        assert_eq!(dir_len(&cas.0.join("sha256")), 0, "{restore}");
+    }
+}
+
+// Cache entries in different namespaces share a single frame upload.
+#[test]
+fn cache_vk_skips_a_chunk_the_registry_holds() {
+    let registry = registry::Registry::start();
+    registry.advertise_transparent_zstd();
+    let vk = format!("http://{}/repo", registry.authority());
+    let args = ["--verbose", "build"];
+    for (namespace, pushed) in [
+        ("gcc-13", "pushed 1/1 chunks"),
+        ("gcc-14", "pushed 0/1 chunks"),
+    ] {
+        let cas = CacheDir::new();
+        let env = [
+            ("VK_REGISTRY", vk.as_str()),
+            ("VK_NAMESPACE", namespace),
+            ("TASK_CACHE_OCI_CAS_DIR", cas.0.to_str().unwrap()),
+        ];
+        let (out, code) = run_env(&stage("cache_vk"), &args, &env);
+        assert_eq!(code, 0, "{namespace}: run failed: {out}");
+        assert!(out.contains("saved to cache"), "{namespace}: {out}");
+        assert!(out.contains(pushed), "{namespace}: {out}");
+    }
+    assert_eq!(registry.manifest_tags().len(), 2);
+}
+
 // A namespace outside repository-name grammar is lowercased in the lock name,
 // which a vk-registry checks in that grammar; the cache tag keeps its case.
 #[test]

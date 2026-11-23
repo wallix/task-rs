@@ -79,6 +79,13 @@ impl<T: Context> Pool<T> {
 
     /// Renew an idle context, or create one if the pool is empty or renewal fails.
     fn take(&'static self) -> io::Result<Pooled<T>> {
+        #[cfg(test)]
+        if tests::OUT_OF_MEMORY.get() {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "zstd could not allocate a context",
+            ));
+        }
         // Pop in a separate statement so the lock is released before the reset.
         let kept = self.idle().pop();
         let renewed = kept.and_then(|mut ctx| ctx.renew().then_some(ctx));
@@ -128,8 +135,18 @@ impl<T: Context> Drop for Pooled<T> {
     }
 }
 
+/// The error of a zstd call that returned `code`. A failed allocation is
+/// [`io::ErrorKind::OutOfMemory`], like a context that could not be created:
+/// it says nothing against the data.
 fn zstd_error(code: usize) -> io::Error {
-    io::Error::other(zstd_safe::get_error_name(code))
+    // An error code is the negated `ZSTD_ErrorCode`.
+    let memory = zstd_safe::zstd_sys::ZSTD_ErrorCode::ZSTD_error_memory_allocation as usize;
+    let kind = if code == 0usize.wrapping_sub(memory) {
+        io::ErrorKind::OutOfMemory
+    } else {
+        io::ErrorKind::Other
+    };
+    io::Error::new(kind, zstd_safe::get_error_name(code))
 }
 
 /// Pooled equivalent of `zstd::stream::raw::Decoder` for the read paths, which never
@@ -314,6 +331,29 @@ pub(crate) mod tests {
     use super::*;
     use crate::chunker::MAX_CHUNK_SIZE;
     use std::io::{BufReader, Read, Write};
+
+    thread_local! {
+        /// Makes every context checkout on this thread fail as zstd does when
+        /// it cannot allocate one.
+        pub(crate) static OUT_OF_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Only a failed allocation is reported as a lack of memory.
+    #[test]
+    fn a_failed_allocation_is_out_of_memory() {
+        let code = |error: u32| 0usize.wrapping_sub(error as usize);
+        let memory = zstd_error(code(64));
+        assert_eq!(memory.kind(), io::ErrorKind::OutOfMemory);
+        assert!(memory.to_string().contains("memory"), "{memory}");
+        // `corruption_detected`, and the window refusal of the limit tests.
+        for error in [20, 16] {
+            assert_eq!(zstd_error(code(error)).kind(), io::ErrorKind::Other);
+        }
+        assert_eq!(
+            decode(&DECODERS, b"not a zstd frame").unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+    }
 
     /// Partly compressible test data with a repeatable mix of random and patterned bytes.
     pub(crate) fn sample(len: usize, seed: u64) -> Vec<u8> {

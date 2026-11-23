@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct State {
-    blobs: Mutex<HashMap<String, Vec<u8>>>,
+    /// Digest → (uploaded bytes, whether they encode the named content as zstd).
+    blobs: Mutex<HashMap<String, (Vec<u8>, bool)>>,
     /// Reference → (content type, body).
     manifests: Mutex<HashMap<String, (String, Vec<u8>)>>,
     uploads: Mutex<HashMap<String, Vec<u8>>>,
@@ -81,9 +82,9 @@ impl Registry {
         self.state.blob_gets_allowed.store(n, Ordering::Relaxed);
     }
 
-    /// Simulate a registry upgrade by advertising transparent-zstd. The mock
-    /// still serves blobs as uploaded, so it can restore older entries and
-    /// accept new saves. Restoring a new save requires encoding support.
+    /// Simulate a registry upgrade by advertising transparent-zstd. Older blobs
+    /// are served as uploaded. Frame downloads require a client that accepts
+    /// `Content-Encoding: zstd` because the mock cannot decode frames.
     pub fn advertise_transparent_zstd(&self) {
         self.state.transparent_zstd.store(true, Ordering::Relaxed);
     }
@@ -161,6 +162,7 @@ pub struct Request {
     pub path: String,
     pub query: String,
     content_type: String,
+    content_encoding: String,
     accept_encoding: String,
     body: Vec<u8>,
 }
@@ -177,6 +179,7 @@ pub fn read_request(stream: &TcpStream) -> Option<Request> {
         None => (target, String::new()),
     };
     let mut content_type = String::new();
+    let mut content_encoding = String::new();
     let mut accept_encoding = String::new();
     let mut length = 0;
     loop {
@@ -190,6 +193,7 @@ pub fn read_request(stream: &TcpStream) -> Option<Request> {
         match name.to_ascii_lowercase().as_str() {
             "content-length" => length = value.trim().parse().ok()?,
             "content-type" => content_type = value.trim().to_string(),
+            "content-encoding" => content_encoding = value.trim().to_string(),
             "accept-encoding" => accept_encoding = value.trim().to_string(),
             _ => {}
         }
@@ -201,6 +205,7 @@ pub fn read_request(stream: &TcpStream) -> Option<Request> {
         path,
         query,
         content_type,
+        content_encoding,
         accept_encoding,
         body,
     })
@@ -254,7 +259,8 @@ fn handle(stream: TcpStream, state: &State, started: Instant) {
         }
         return respond(stream, 200, &headers, b"{}");
     }
-    if is_blob_get && req.accept_encoding.split(',').any(|c| c.trim() == "zstd") {
+    let accepts_zstd = req.accept_encoding.split(',').any(|c| c.trim() == "zstd");
+    if is_blob_get && accepts_zstd {
         state.zstd_blob_gets.fetch_add(1, Ordering::Relaxed);
     }
     if let Some(reference) = req.path.strip_prefix("/v2/repo/manifests/") {
@@ -321,18 +327,30 @@ fn handle(stream: TcpStream, state: &State, started: Instant) {
             .unwrap_or_default()
             .replace("%3A", ":");
         let data = uploads.remove(&req.path).unwrap_or_default();
-        state.blobs.lock().unwrap().insert(digest.clone(), data);
+        let frame = req.content_encoding == "zstd";
+        state
+            .blobs
+            .lock()
+            .unwrap()
+            .insert(digest.clone(), (data, frame));
         let location = format!("/v2/repo/blobs/{digest}");
         return respond(stream, 201, &[("Location", location), length(0)], b"");
     }
     if let Some(digest) = req.path.strip_prefix("/v2/repo/blobs/") {
         let found = state.blobs.lock().unwrap().get(digest).cloned();
         return match found {
-            Some(body) => {
-                let headers = [
+            // HEAD can confirm a frame exists regardless of the accepted encoding.
+            Some((_, true)) if method != "HEAD" && !accepts_zstd => {
+                respond(stream, 500, &[length(0)], b"")
+            }
+            Some((body, frame)) => {
+                let mut headers = vec![
                     ("Content-Type", "application/octet-stream".to_string()),
                     length(body.len()),
                 ];
+                if frame {
+                    headers.push(("Content-Encoding", "zstd".to_string()));
+                }
                 respond(
                     stream,
                     200,

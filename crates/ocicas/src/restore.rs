@@ -1200,11 +1200,16 @@ pub(crate) fn open_parent(
             }
             Ok(_) => {}
             Err(e) if create && e.kind() == std::io::ErrorKind::NotFound => {
-                capfs::create_dir(&dir, part_path, &capfs::DirOptions::new())?;
-                created.push(Owned {
-                    parts: parents.get(..=depth).unwrap_or_default().to_vec(),
-                    id: leaf_id(&dir, part_path)?.flatten(),
-                });
+                match capfs::create_dir(&dir, part_path, &capfs::DirOptions::new()) {
+                    Ok(()) => created.push(Owned {
+                        parts: parents.get(..=depth).unwrap_or_default().to_vec(),
+                        id: leaf_id(&dir, part_path)?.flatten(),
+                    }),
+                    // Another writer made it since the check: theirs, and
+                    // opened below like one found there, never through a link.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
             Err(e) => return Err(e.into()),
         }
@@ -1215,14 +1220,24 @@ pub(crate) fn open_parent(
 
 /// Open `leaf` in `dir` for reading, failing rather than following it if it
 /// is a symlink; with `directory`, failing too if it is not a directory.
+///
+/// The open does not wait: a FIFO planted there would otherwise hold it until
+/// a writer came, before the caller could check the type through the handle.
+/// Reading a regular file is the same with the flag.
 #[cfg(unix)]
 pub(crate) fn open_nofollow(dir: &File, leaf: &Path, directory: bool) -> std::io::Result<File> {
     use capfs::OpenOptionsExt;
-    let flags = libc::O_NOFOLLOW | if directory { libc::O_DIRECTORY } else { 0 };
+    let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK | if directory { libc::O_DIRECTORY } else { 0 };
+    // The flag covers the open cap makes itself; the policy, the path it
+    // resolves component by component, where it would follow a link to a
+    // file of the same directory.
     capfs::open(
         dir,
         leaf,
-        capfs::OpenOptions::new().read(true).custom_flags(flags),
+        capfs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            ._cap_fs_ext_follow(FollowSymlinks::No),
     )
 }
 

@@ -8,6 +8,9 @@
   `url: oci://…`.
 - **Cache restores request compressed chunks from vk-registry.** The registry
   can serve chunks as uploaded without decompressing each one.
+- **Chunks received compressed from vk-registry stay compressed on disk** to
+  save space. Existing chunks remain usable. Older versions of `task` sharing
+  the store download any chunks they cannot find.
 
 ## v4.13.0 - 2026-11-23
 
