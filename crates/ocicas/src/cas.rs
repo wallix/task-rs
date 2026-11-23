@@ -16,7 +16,9 @@ use sha2::{Digest, Sha256};
 
 use crate::chunker::{AVG_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::error::{Error, Result};
-use crate::index::{ChunkRef, FileEntry, Index, safe_rel_path, zstd_decode_bounded, zstd_frame};
+use crate::index::{
+    ChunkRef, FileEntry, Index, safe_rel_path, zstd_decode_bounded_into, zstd_frame,
+};
 use crate::restore::{self, Tree, Written};
 
 /// Concatenate the given files (slash-separated paths relative to `base_dir`,
@@ -287,6 +289,9 @@ struct StreamReader<'a, Src> {
     src: Src,
     next: usize,
     raw: Vec<u8>,
+    /// Holds each compressed chunk as it is decoded, at most
+    /// [`MAX_CHUNK_SIZE`] plus one byte to detect an overlong frame.
+    decoded: Vec<u8>,
 }
 
 impl<'a, Src> StreamReader<'a, Src>
@@ -299,6 +304,7 @@ where
             src,
             next: 0,
             raw: Vec::new(),
+            decoded: Vec::new(),
         }
     }
 
@@ -321,9 +327,16 @@ where
                 )));
             }
             let raw = if idx.transparent {
-                data
+                &data
             } else {
-                zstd_decode_bounded(&data, refc.raw_size as usize)?
+                let max = refc.raw_size as usize;
+                // Reserve the extra byte so detecting an overlong frame needs
+                // no reallocation.
+                self.decoded.clear();
+                self.decoded
+                    .reserve_exact(max.min(MAX_CHUNK_SIZE).saturating_add(1));
+                zstd_decode_bounded_into(&data, max, &mut self.decoded)?;
+                &self.decoded
             };
             if raw.len() as i64 != refc.raw_size {
                 return Err(Error::format(format!(
@@ -333,7 +346,7 @@ where
                     refc.raw_size
                 )));
             }
-            self.raw.extend_from_slice(&raw);
+            self.raw.extend_from_slice(raw);
         }
         Ok(self.raw.drain(..n).collect())
     }

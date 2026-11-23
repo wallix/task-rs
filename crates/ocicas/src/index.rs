@@ -264,14 +264,24 @@ pub(crate) fn zstd_reader(frames: &[u8]) -> std::io::Result<impl Read + '_> {
 /// instead of exhausting memory.
 pub(crate) fn zstd_decode_bounded(data: &[u8], max: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
+    zstd_decode_bounded_into(data, max, &mut out)?;
+    Ok(out)
+}
+
+/// [`zstd_decode_bounded`] into a buffer the caller keeps from one frame to
+/// the next. The frame overwrites `out`, which is read a byte past `max` to
+/// detect an overlong frame: capacity for `max + 1` bytes avoids a
+/// reallocation.
+pub(crate) fn zstd_decode_bounded_into(data: &[u8], max: usize, out: &mut Vec<u8>) -> Result<()> {
+    out.clear();
     let limit = (max as u64).saturating_add(1);
-    zstd_reader(data)?.take(limit).read_to_end(&mut out)?;
+    zstd_reader(data)?.take(limit).read_to_end(out)?;
     if out.len() > max {
         return Err(Error::format(format!(
             "decompressed data exceeds {max} bytes"
         )));
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -439,5 +449,31 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// A reused buffer holds each frame in turn, with nothing left of the one
+    /// before, also right after a frame that was truncated or over its cap.
+    #[test]
+    fn a_reused_buffer_holds_only_the_last_frame() {
+        let sample = crate::zctx::tests::sample;
+        let (a, b) = (sample(300_000, 1), sample(MAX_CHUNK_SIZE, 2));
+        let (fa, fb) = (zstd_frame(&a).unwrap(), zstd_frame(&b).unwrap());
+        let mut out = Vec::new();
+        let mut decode = |frame: &[u8], max: usize| {
+            let reused = zstd_decode_bounded_into(frame, max, &mut out)
+                .ok()
+                .map(|()| out.clone());
+            assert_eq!(reused, zstd_decode_bounded(frame, max).ok());
+            reused
+        };
+        assert_eq!(decode(&fb, b.len()), Some(b.clone()));
+        assert_eq!(decode(&fa, a.len()), Some(a.clone()));
+        assert_eq!(decode(&fb[..fb.len() / 2], b.len()), None, "truncated");
+        assert_eq!(decode(&fa, a.len()), Some(a.clone()));
+        assert_eq!(decode(&fb, b.len() - 1), None, "over its cap");
+        assert_eq!(decode(&fa, a.len()), Some(a.clone()));
+        // Two frames back to back decode as one stream.
+        let both = [fa.clone(), fb.clone()].concat();
+        assert_eq!(decode(&both, a.len() + b.len()), Some([a, b].concat()));
     }
 }
