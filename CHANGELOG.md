@@ -11,6 +11,8 @@
   the lock and the elapsed time when it acquires the lock. This applies to
   local locks and `cache.lock`. If the remote lock fails or times out, `task`
   warns before falling back to a local lock.
+- Fixed a stack overflow when computing the origin of deeply nested `blob:` URLs
+  (RUSTSEC-2026-0592).
 
 ## v4.12.1 - 2026-11-20
 
