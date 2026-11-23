@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.13.0 - 2026-11-23
+
 - **Cache transfers stop when the first chunk fails.** If the registry stops
   answering chunk requests, a save or restore gives up after about two minutes.
   Large transfers could previously hang for hours. A failed restore counts as a
