@@ -261,24 +261,17 @@ where
     Src: FnMut(&str) -> Result<Vec<u8>>,
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let want = self
-            .remaining
-            .min(buf.len() as u64)
-            .min(MAX_CHUNK_SIZE as u64) as usize;
-        if want == 0 {
+        let want = self.remaining.min(buf.len() as u64) as usize;
+        let Some(dst) = buf.get_mut(..want) else {
             return Ok(0);
-        }
-        let data = self.stream.read(want).map_err(|e| match e {
+        };
+        let n = self.stream.read(dst).map_err(|e| match e {
             Error::Io(e) => e,
             Error::Format(m) | Error::Network(m) | Error::Unrecoverable(m) => {
                 std::io::Error::other(m)
             }
             e => std::io::Error::other(e),
         })?;
-        let n = data.len();
-        if let Some(dst) = buf.get_mut(..n) {
-            dst.copy_from_slice(&data);
-        }
         self.remaining = self.remaining.saturating_sub(n as u64);
         Ok(n)
     }
@@ -290,10 +283,11 @@ struct StreamReader<'a, Src> {
     idx: &'a Index,
     src: Src,
     next: usize,
+    /// The current chunk, decompressed, of which `pos` bytes were read. One
+    /// buffer holds every chunk decoded, at most [`MAX_CHUNK_SIZE`] plus one
+    /// byte to detect an overlong frame.
     raw: Vec<u8>,
-    /// Holds each compressed chunk as it is decoded, at most
-    /// [`MAX_CHUNK_SIZE`] plus one byte to detect an overlong frame.
-    decoded: Vec<u8>,
+    pos: usize,
 }
 
 impl<'a, Src> StreamReader<'a, Src>
@@ -306,51 +300,72 @@ where
             src,
             next: 0,
             raw: Vec::new(),
-            decoded: Vec::new(),
+            pos: 0,
         }
     }
 
-    fn read(&mut self, n: usize) -> Result<Vec<u8>> {
-        let idx = self.idx;
-        while self.raw.len() < n {
-            let Some(refc) = idx.chunks.get(self.next) else {
-                return Err(Error::format("stream exhausted (index inconsistent)"));
-            };
-            self.next = self.next.saturating_add(1);
-            let data = (self.src)(&refc.digest)?;
-            // The digest covers whatever `src` returns: the raw bytes under the
-            // transparent scheme (the registry serves canonical), the zstd frame
-            // otherwise.
-            let got = sha256_hex(&data);
-            if got != refc.digest {
-                return Err(Error::format(format!(
-                    "chunk digest mismatch: want {}, got {got}",
-                    refc.digest
-                )));
-            }
-            let raw = if idx.transparent {
-                &data
-            } else {
-                let max = refc.raw_size as usize;
-                // Reserve the extra byte so detecting an overlong frame needs
-                // no reallocation.
-                self.decoded.clear();
-                self.decoded
-                    .reserve_exact(max.min(MAX_CHUNK_SIZE).saturating_add(1));
-                zstd_decode_bounded_into(&data, max, &mut self.decoded)?;
-                &self.decoded
-            };
-            if raw.len() as i64 != refc.raw_size {
-                return Err(Error::format(format!(
-                    "chunk {}: raw size {}, index says {}",
-                    refc.digest,
-                    raw.len(),
-                    refc.raw_size
-                )));
-            }
-            self.raw.extend_from_slice(raw);
+    /// Copy the next bytes of the stream into `dst`: what the current chunk
+    /// still holds, up to `dst.len()`, and at least one byte unless `dst` is
+    /// empty.
+    fn read(&mut self, dst: &mut [u8]) -> Result<usize> {
+        if dst.is_empty() {
+            return Ok(0);
         }
-        Ok(self.raw.drain(..n).collect())
+        while self.pos >= self.raw.len() {
+            if let Err(e) = self.next_chunk() {
+                // Nothing of a chunk that failed is ever read.
+                self.raw.clear();
+                return Err(e);
+            }
+        }
+        let rest = self.raw.get(self.pos..).unwrap_or_default();
+        let n = rest.len().min(dst.len());
+        if let (Some(dst), Some(src)) = (dst.get_mut(..n), rest.get(..n)) {
+            dst.copy_from_slice(src);
+        }
+        self.pos = self.pos.saturating_add(n);
+        Ok(n)
+    }
+
+    /// Fetch, verify and decompress the next chunk in place of the current one.
+    fn next_chunk(&mut self) -> Result<()> {
+        let idx = self.idx;
+        let Some(refc) = idx.chunks.get(self.next) else {
+            return Err(Error::format("stream exhausted (index inconsistent)"));
+        };
+        self.next = self.next.saturating_add(1);
+        let data = (self.src)(&refc.digest)?;
+        // The digest covers whatever `src` returns: the raw bytes under the
+        // transparent scheme (the registry serves canonical), the zstd frame
+        // otherwise.
+        let got = sha256_hex(&data);
+        if got != refc.digest {
+            return Err(Error::format(format!(
+                "chunk digest mismatch: want {}, got {got}",
+                refc.digest
+            )));
+        }
+        self.pos = 0;
+        if idx.transparent {
+            self.raw = data;
+        } else {
+            let max = refc.raw_size as usize;
+            // Reserve the extra byte so detecting an overlong frame needs no
+            // reallocation.
+            self.raw.clear();
+            self.raw
+                .reserve_exact(max.min(MAX_CHUNK_SIZE).saturating_add(1));
+            zstd_decode_bounded_into(&data, max, &mut self.raw)?;
+        }
+        if self.raw.len() as i64 != refc.raw_size {
+            return Err(Error::format(format!(
+                "chunk {}: raw size {}, index says {}",
+                refc.digest,
+                self.raw.len(),
+                refc.raw_size
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -591,6 +606,52 @@ mod tests {
                 "index sha256:8bcabaf7f1e43927000b7270bb382ec48175808d1295dd6ce5354573cb66d8a9",
             ]
         );
+    }
+
+    /// Files of every size against the chunk boundaries — within a chunk,
+    /// across several, empty — come back as they were, under both schemes.
+    #[test]
+    fn round_trips_files_across_chunk_boundaries() {
+        let src = tmpdir("src");
+        let mut paths = Vec::new();
+        for (i, len) in [0, 1, 300_000, 5_000_000, 0, 7, 2_500_000, 100_000, 3]
+            .into_iter()
+            .enumerate()
+        {
+            let rel = format!("d/f{i}");
+            write_file(&src, &rel, &pseudo_random(len, i as u64));
+            paths.push(rel);
+        }
+        for transparent in [false, true] {
+            let (idx, mut store) = mem_build(&src, &paths, transparent);
+            assert!(idx.chunks.len() > 3, "{} chunks", idx.chunks.len());
+            if transparent {
+                for frame in store.values_mut() {
+                    *frame = zstd::bulk::decompress(frame, MAX_CHUNK_SIZE).unwrap();
+                }
+            }
+            let dst = tmpdir("dst");
+            assemble(&idx, &dst, None, mem_source(&store)).unwrap();
+            for rel in &paths {
+                assert!(
+                    std::fs::read(src.join(rel)).unwrap() == std::fs::read(dst.join(rel)).unwrap(),
+                    "{rel} (transparent: {transparent})"
+                );
+            }
+
+            // An index a chunk short of its files fails the restore.
+            let mut short = idx.clone();
+            short.chunks.pop();
+            let dst = tmpdir("short");
+            let err = assemble(&short, &dst, None, mem_source(&store)).unwrap_err();
+            assert!(err.to_string().contains("stream exhausted"), "{err}");
+            // As does a chunk that is not the size the index gives it.
+            let mut resized = idx.clone();
+            resized.chunks[0].raw_size += 1;
+            let dst = tmpdir("resized");
+            assert!(assemble(&resized, &dst, None, mem_source(&store)).is_err());
+        }
+        std::fs::remove_dir_all(&src).ok();
     }
 
     #[test]
