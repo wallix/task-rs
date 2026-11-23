@@ -251,10 +251,12 @@ pub(crate) fn safe_rel_path(p: &str) -> bool {
 /// Decode a zstd frame, capping the output at `max` bytes so a bomb fails
 /// instead of exhausting memory.
 pub(crate) fn zstd_decode_bounded(data: &[u8], max: usize) -> Result<Vec<u8>> {
-    zstd_decode_bounded_with(&mut zstd_decoder()?, data, max)
+    let mut out = Vec::new();
+    zstd_decode_bounded_into(&mut zstd_decoder()?, data, max, &mut out)?;
+    Ok(out)
 }
 
-/// A zstd decompression context for [`zstd_decode_bounded_with`].
+/// A zstd decompression context for [`zstd_decode_bounded_into`].
 pub(crate) fn zstd_decoder() -> Result<DCtx<'static>> {
     DCtx::try_create().ok_or_else(|| {
         Error::Io(std::io::Error::new(
@@ -264,28 +266,30 @@ pub(crate) fn zstd_decoder() -> Result<DCtx<'static>> {
     })
 }
 
-/// [`zstd_decode_bounded`] on a context the caller keeps from one frame to the
-/// next: a context costs about 1 MiB to allocate and set up, and decodes the
-/// same bytes whatever it decoded before. The context is one from
-/// [`zstd_decoder`], with no parameter or dictionary set on it.
-pub(crate) fn zstd_decode_bounded_with(
+/// [`zstd_decode_bounded`] on a context and into a buffer the caller keeps from
+/// one frame to the next: a context costs about 1 MiB to allocate and set up,
+/// and decodes the same bytes whatever it decoded before. The context is one
+/// from [`zstd_decoder`], with no parameter or dictionary set on it. `out` is
+/// emptied first and holds the decoded frame afterwards.
+pub(crate) fn zstd_decode_bounded_into(
     ctx: &mut DCtx<'static>,
     data: &[u8],
     max: usize,
-) -> Result<Vec<u8>> {
+    out: &mut Vec<u8>,
+) -> Result<()> {
     // Starts by resetting the context's session, so a frame the previous call
     // left unfinished (truncated, corrupt or over its cap) does not reach
     // this one.
     let mut dec = zstd::stream::read::Decoder::with_context(data, ctx);
-    let mut out = Vec::new();
+    out.clear();
     let limit = (max as u64).saturating_add(1);
-    dec.by_ref().take(limit).read_to_end(&mut out)?;
+    dec.by_ref().take(limit).read_to_end(out)?;
     if out.len() > max {
         return Err(Error::format(format!(
             "decompressed data exceeds {max} bytes"
         )));
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -446,8 +450,12 @@ mod tests {
         let (a, b) = (sample(300_000, 1), sample(MAX_CHUNK_SIZE, 2));
         let fa = zstd::bulk::compress(&a, ZSTD_LEVEL).expect("compress");
         let fb = zstd::bulk::compress(&b, ZSTD_LEVEL).expect("compress");
+        // The buffer is reused as well, with whatever the last frame left in it.
+        let mut out = Vec::new();
         let mut decode = |frame: &[u8], max: usize| {
-            let reused = zstd_decode_bounded_with(&mut ctx, frame, max).ok();
+            let reused = zstd_decode_bounded_into(&mut ctx, frame, max, &mut out)
+                .ok()
+                .map(|()| out.clone());
             assert_eq!(reused, zstd_decode_bounded(frame, max).ok());
             reused
         };
