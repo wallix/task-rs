@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::chunker::{AVG_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::error::{Error, Result};
 use crate::index::{
-    ChunkRef, FileEntry, Index, safe_rel_path, zstd_decode_bounded_into, zstd_frame_into,
+    ChunkRef, FileEntry, Index, safe_rel_path, zstd_decode_chunk_into, zstd_frame_into,
 };
 use crate::restore::{self, Tree, Written};
 
@@ -107,6 +107,8 @@ where
         let chunk = chunk.map_err(|e| Error::format(format!("chunking: {e}")))?;
         let raw = &chunk.data;
         zstd_frame_into(raw, &mut frame)?;
+        // The reference names what a chunk source returns on restore: the raw
+        // chunk under the transparent scheme, the frame otherwise.
         let refc = if transparent {
             let d = sha256_hex(raw);
             ChunkRef {
@@ -357,9 +359,16 @@ where
         };
         self.next = self.next.saturating_add(1);
         let data = (self.src)(&refc.digest)?;
-        // The digest covers whatever `src` returns: the raw bytes under the
-        // transparent scheme (the registry serves canonical), the zstd frame
-        // otherwise.
+        // `src` returns the bytes the reference names: the raw chunk under
+        // the transparent scheme, its zstd frame otherwise.
+        if data.len() as i64 != refc.size {
+            return Err(Error::format(format!(
+                "chunk {}: size {}, index says {}",
+                refc.digest,
+                data.len(),
+                refc.size
+            )));
+        }
         let got = sha256_hex(&data);
         if got != refc.digest {
             return Err(Error::format(format!(
@@ -377,7 +386,7 @@ where
             self.raw.clear();
             self.raw
                 .reserve_exact(max.min(MAX_CHUNK_SIZE).saturating_add(1));
-            zstd_decode_bounded_into(&data, max, &mut self.raw)?;
+            zstd_decode_chunk_into(&data, max, &mut self.raw)?;
         }
         if self.raw.len() as i64 != refc.raw_size {
             return Err(Error::format(format!(
@@ -711,6 +720,15 @@ mod tests {
             resized.chunks[0].raw_size += 1;
             let dst = tmpdir("resized");
             assert!(assemble(&resized, &dst, None, mem_source(&store)).is_err());
+            // Or whose bytes, as its source returns them, are not.
+            for delta in [-1, 1] {
+                let mut resized = idx.clone();
+                resized.chunks[0].size += delta;
+                let dst = tmpdir("resized");
+                let err = assemble(&resized, &dst, None, mem_source(&store)).unwrap_err();
+                let says = format!("index says {}", resized.chunks[0].size);
+                assert!(err.to_string().contains(&says), "{err}");
+            }
         }
         std::fs::remove_dir_all(&src).ok();
     }

@@ -6,6 +6,8 @@
   registry does not advertise it, restores are skipped and saves print a
   warning naming the registry. A generic OCI registry can be configured with
   `url: oci://…`.
+- **Cache restores request compressed chunks from vk-registry.** The registry
+  can serve chunks as uploaded without decompressing each one.
 
 ## v4.13.0 - 2026-11-23
 

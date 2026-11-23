@@ -1,9 +1,10 @@
 //! Pushing and pulling ocicas artifacts against an OCI registry.
 //!
 //! A [`Store`] wraps an oci-client [`Client`] plus a `reqwest` client for the
-//! transparent-zstd blob push (which needs a per-request `Content-Encoding` that
-//! oci-client cannot set). An optional local chunk CAS makes repeated pulls
-//! incremental: only chunks absent from the cache directory are fetched.
+//! transparent-zstd chunk transfers (which need a per-request `Content-Encoding`
+//! or `Accept-Encoding` that oci-client cannot set). An optional local chunk CAS
+//! makes repeated pulls incremental: only chunks absent from the cache directory
+//! are fetched.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -24,7 +25,7 @@ use crate::cas::{assemble, build_unless, digest_hex, sha256_hex};
 use crate::error::{Error, Result, with_causes};
 use crate::index::{
     ARTIFACT_TYPE, ChunkRef, Index, MAX_CHUNK_BLOB, MAX_INDEX_BLOB, MEDIA_TYPE_CHUNK,
-    MEDIA_TYPE_INDEX, unmarshal_index,
+    MEDIA_TYPE_INDEX, unmarshal_index, zstd_decode_chunk_into,
 };
 use crate::restore::{self, Written};
 use crate::retry::{is_transport, with_retry};
@@ -47,6 +48,9 @@ const EMPTY_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.empty.v1+json";
 /// Capability header a cooperating vk-registry sets on its `GET /v2/` probe, so
 /// an auto-mode client knows it may push transparent-zstd chunks.
 const TRANSPARENT_ZSTD_HEADER: &str = "x-virtkit-transparent-zstd";
+
+/// The header a registry states a served blob's digest in.
+const DOCKER_CONTENT_DIGEST: &str = "Docker-Content-Digest";
 
 /// Configures [`Store::open`].
 #[derive(Debug, Default, Clone)]
@@ -98,7 +102,7 @@ struct Counters {
 pub struct Store {
     client: Client,
     http: reqwest::Client,
-    /// Shared by `oci-client` requests and raw transparent-zstd pushes.
+    /// Shared by `oci-client` requests and raw transparent-zstd transfers.
     auth: Auth,
     /// `host/repo` reference base; a per-tag [`Reference`] is built from it.
     base: String,
@@ -147,7 +151,7 @@ impl Store {
         cfg.read_timeout = Some(READ_TIMEOUT);
         let client = Client::new(cfg);
 
-        let mut builder = reqwest::Client::builder()
+        let mut builder = raw_client()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT);
         for root in ca_certs {
@@ -434,7 +438,9 @@ impl Store {
     }
 
     /// Fetch the chunks of a pulled index and assemble its file set under
-    /// `dir` (see [`assemble`]).
+    /// `dir` (see [`assemble`]). `pulled` must come from this store: its
+    /// chunks are fetched from the store's repository, so one pulled from
+    /// another registry or repository is an error.
     pub async fn assemble_pulled(
         &self,
         pulled: &Pulled,
@@ -457,11 +463,33 @@ impl Store {
         image: &Reference,
         idx: &Index,
     ) -> Result<Box<dyn FnMut(&str) -> Result<Vec<u8>> + Send>> {
+        // A transparent fetch addresses the store's repository and a classic
+        // one the image's: they must be the same.
+        if image.resolve_registry() != self.registry || image.repository() != self.repository {
+            return Err(Error::format(format!(
+                "{}/{} was not pulled from this store ({}/{})",
+                image.resolve_registry(),
+                image.repository(),
+                self.registry,
+                self.repository
+            )));
+        }
         let mut want: BTreeMap<String, ChunkRef> = BTreeMap::new();
         for c in &idx.chunks {
             want.insert(c.digest.clone(), c.clone());
         }
 
+        let fetcher = Arc::new(ChunkFetcher {
+            client: self.client.clone(),
+            http: self.http.clone(),
+            auth: self.auth.clone(),
+            image: image.clone(),
+            blobs: format!(
+                "{}://{}/v2/{}/blobs",
+                self.scheme, self.registry, self.repository
+            ),
+            transparent: self.transparent,
+        });
         if let Some(dir) = self.cache_dir.clone() {
             let mut set: JoinSet<Result<()>> = JoinSet::new();
             for c in want.values() {
@@ -469,18 +497,11 @@ impl Store {
                     continue;
                 }
                 next_slot(&mut set).await?;
-                let client = self.client.clone();
-                let image = image.clone();
+                let fetcher = fetcher.clone();
                 let dir = dir.clone();
                 let c = c.clone();
                 set.spawn(async move {
-                    let data = pull_blob_bytes(
-                        &client,
-                        &image,
-                        &descriptor(MEDIA_TYPE_CHUNK, c.digest.clone(), c.size),
-                        MAX_CHUNK_BLOB,
-                    )
-                    .await?;
+                    let data = fetcher.fetch(&c).await?;
                     cas_write(&dir, &c.digest, &data)
                 });
             }
@@ -491,20 +512,57 @@ impl Store {
         } else {
             let mut mem: BTreeMap<String, Vec<u8>> = BTreeMap::new();
             for c in want.values() {
-                let data = pull_blob_bytes(
-                    &self.client,
-                    image,
-                    &descriptor(MEDIA_TYPE_CHUNK, c.digest.clone(), c.size),
-                    MAX_CHUNK_BLOB,
-                )
-                .await?;
-                mem.insert(c.digest.clone(), data);
+                mem.insert(c.digest.clone(), fetcher.fetch(c).await?);
             }
             Ok(Box::new(move |d: &str| {
                 mem.get(d)
                     .cloned()
                     .ok_or_else(|| Error::format(format!("chunk {d} not fetched")))
             }))
+        }
+    }
+}
+
+/// The settings of the `reqwest` client behind the raw transfers. A response
+/// body is taken as sent: a blob pull reads the `Content-Encoding` itself,
+/// whatever decoders `reqwest` is built with.
+fn raw_client() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
+}
+
+/// What a chunk fetch needs of its [`Store`], owned so a transfer task can
+/// hold it.
+struct ChunkFetcher {
+    client: Client,
+    http: reqwest::Client,
+    auth: Auth,
+    image: Reference,
+    /// The repository's blob endpoint, `<scheme>://<registry>/v2/<repo>/blobs`.
+    blobs: String,
+    transparent: bool,
+}
+
+impl ChunkFetcher {
+    /// Fetch the blob `c` names, verified against its digest. A
+    /// transparent-zstd registry is asked for the frame it stores; any other
+    /// serves the blob as is, through `oci-client`.
+    async fn fetch(&self, c: &ChunkRef) -> Result<Vec<u8>> {
+        if self.transparent {
+            let url = format!("{}/{}", self.blobs, c.digest);
+            let (http, auth, url) = (&self.http, &self.auth, url.as_str());
+            with_retry(|| pull_blob_zstd(http, auth, url, c)).await
+        } else {
+            pull_blob_bytes(
+                &self.client,
+                &self.image,
+                &descriptor(MEDIA_TYPE_CHUNK, c.digest.clone(), c.size),
+                MAX_CHUNK_BLOB,
+            )
+            .await
         }
     }
 }
@@ -694,7 +752,8 @@ async fn detect_transparent(
 /// Upload an already-zstd-compressed frame keyed by the digest of its
 /// uncompressed form, tagging the body `Content-Encoding: zstd`. A monolithic
 /// OCI upload issued directly (oci-client cannot set the per-request encoding);
-/// vk-registry stores the frame and serves canonical bytes back.
+/// vk-registry stores the frame, and serves it back or decoded
+/// ([`pull_blob_zstd`]).
 async fn push_blob_zstd(
     http: &reqwest::Client,
     scheme: &str,
@@ -802,6 +861,215 @@ fn cas_write(dir: &Path, digest: &str, data: &[u8]) -> Result<()> {
     Ok(written?)
 }
 
+/// The `Content-Encoding` of a response, as far as a blob pull reads one.
+enum Encoding {
+    Identity,
+    Zstd,
+}
+
+impl Encoding {
+    /// Accept a single `identity` or `zstd` coding, ignoring case. A missing
+    /// or empty field means identity. Reject lists and repeated fields.
+    fn of(headers: &reqwest::header::HeaderMap) -> Result<Self> {
+        let mut fields = headers.get_all(reqwest::header::CONTENT_ENCODING).iter();
+        let Some(field) = fields.next() else {
+            return Ok(Encoding::Identity);
+        };
+        let more = fields.count();
+        if more > 0 {
+            return Err(Error::format(format!(
+                "{} Content-Encoding fields",
+                more.saturating_add(1)
+            )));
+        }
+        let coding = field.to_str().unwrap_or("?").trim();
+        if coding.is_empty() || coding.eq_ignore_ascii_case("identity") {
+            Ok(Encoding::Identity)
+        } else if coding.eq_ignore_ascii_case("zstd") {
+            Ok(Encoding::Zstd)
+        } else {
+            Err(Error::format(format!(
+                "unsupported Content-Encoding {field:?}"
+            )))
+        }
+    }
+}
+
+/// The digest a registry states for the blob it serves, in a
+/// `Docker-Content-Digest` header.
+struct StatedDigest {
+    /// As sent: `<algorithm>:<hex>`.
+    stated: String,
+    algorithm: DigestAlgorithm,
+}
+
+enum DigestAlgorithm {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl StatedDigest {
+    /// As `oci-client` reads the header on the pulls it makes: absent or
+    /// empty states nothing, and one that is not text, has no `:` or names
+    /// another algorithm than these is an error. Unlike it, more than one
+    /// field is an error too, whatever each holds: which one the registry
+    /// means is not known.
+    fn of(headers: &reqwest::header::HeaderMap) -> Result<Option<Self>> {
+        let mut fields = headers.get_all(DOCKER_CONTENT_DIGEST).iter();
+        let Some(value) = fields.next() else {
+            return Ok(None);
+        };
+        let more = fields.count();
+        if more > 0 {
+            return Err(Error::format(format!(
+                "{} {DOCKER_CONTENT_DIGEST} fields",
+                more.saturating_add(1)
+            )));
+        }
+        let stated = value
+            .to_str()
+            .map_err(|_| Error::format(format!("{DOCKER_CONTENT_DIGEST} {value:?} is not text")))?;
+        if stated.is_empty() {
+            return Ok(None);
+        }
+        let algorithm = match stated.split_once(':') {
+            Some(("sha256", _)) => DigestAlgorithm::Sha256,
+            Some(("sha384", _)) => DigestAlgorithm::Sha384,
+            Some(("sha512", _)) => DigestAlgorithm::Sha512,
+            Some(_) => {
+                return Err(Error::format(format!(
+                    "{DOCKER_CONTENT_DIGEST} {stated:?} uses an unsupported algorithm"
+                )));
+            }
+            None => {
+                return Err(Error::format(format!(
+                    "{DOCKER_CONTENT_DIGEST} {stated:?} names no algorithm"
+                )));
+            }
+        };
+        Ok(Some(StatedDigest {
+            stated: stated.to_string(),
+            algorithm,
+        }))
+    }
+
+    /// Whether `data`, whose `sha256:<hex>` digest is `sha256`, has the stated
+    /// digest, compared as text like `oci-client` does: lowercase hex only.
+    fn verify(&self, data: &[u8], sha256: &str) -> Result<()> {
+        use sha2::Digest;
+        use std::fmt::Write as _;
+        let hex = |name: &str, hash: &[u8]| {
+            let mut digest = String::from(name);
+            for b in hash {
+                // Writing to a `String` does not fail.
+                let _ = write!(digest, "{b:02x}");
+            }
+            digest
+        };
+        let got = match self.algorithm {
+            DigestAlgorithm::Sha256 => sha256.to_string(),
+            DigestAlgorithm::Sha384 => hex("sha384:", &sha2::Sha384::digest(data)),
+            DigestAlgorithm::Sha512 => hex("sha512:", &sha2::Sha512::digest(data)),
+        };
+        if got != self.stated {
+            return Err(Error::format(format!(
+                "{DOCKER_CONTENT_DIGEST} mismatch: the registry states {}, got {got}",
+                self.stated
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Fetch the blob `c` names from a transparent-zstd registry and return its
+/// bytes, verified against the size and the digest of `c` and, as `oci-client`
+/// does, against a `Docker-Content-Digest` the response states. The request
+/// accepts zstd, so the registry may send the frame it stores rather than
+/// decompress it; a response without the encoding (a blob stored as is, or a
+/// proxy decoding on the way) is taken as the blob itself. Issued directly:
+/// oci-client can neither ask for an encoding nor undo one before it verifies
+/// the digest.
+///
+/// One attempt, for [`with_retry`] to repeat: only the transport failing is
+/// [`Error::Network`].
+async fn pull_blob_zstd(
+    http: &reqwest::Client,
+    auth: &Auth,
+    url: &str,
+    c: &ChunkRef,
+) -> Result<Vec<u8>> {
+    let mut resp = auth
+        .apply(
+            http.get(url)
+                .header(reqwest::header::ACCEPT_ENCODING, "zstd"),
+        )
+        .send()
+        .await
+        .map_err(req_err)?;
+    let digest = &c.digest;
+    if resp.status() != reqwest::StatusCode::OK {
+        return Err(Error::format(format!(
+            "blob {digest} GET: HTTP {}",
+            resp.status()
+        )));
+    }
+    let encoding = Encoding::of(resp.headers()).map_err(|e| in_blob(digest, &e))?;
+    let stated = StatedDigest::of(resp.headers()).map_err(|e| in_blob(digest, &e))?;
+    // Cap the buffered identity body at the indexed size. A zstd frame can
+    // exceed the size of a small chunk, so use the chunk blob limit on the wire.
+    let size = usize::try_from(c.size).unwrap_or(0).min(MAX_CHUNK_BLOB);
+    let cap = match encoding {
+        Encoding::Identity => size,
+        Encoding::Zstd => MAX_CHUNK_BLOB,
+    };
+    // Grown as bytes arrive and capped, whatever length the response claims.
+    let mut body = Vec::new();
+    while let Some(part) = resp.chunk().await.map_err(req_err)? {
+        if body.len().saturating_add(part.len()) > cap {
+            return Err(Error::format(format!(
+                "blob {digest} is larger than {cap} bytes"
+            )));
+        }
+        body.extend_from_slice(&part);
+    }
+    let data = match encoding {
+        Encoding::Identity => body,
+        Encoding::Zstd => {
+            // A frame inflating past the blob's stated size is refused, a
+            // byte beyond it.
+            let mut data = Vec::new();
+            zstd_decode_chunk_into(&body, size, &mut data).map_err(|e| in_blob(digest, &e))?;
+            data
+        }
+    };
+    if data.len() as i64 != c.size {
+        return Err(Error::format(format!(
+            "blob {digest}: {} bytes, index says {}",
+            data.len(),
+            c.size
+        )));
+    }
+    let got = sha256_hex(&data);
+    if got != *digest {
+        return Err(Error::format(format!(
+            "blob digest mismatch: want {digest}, got {got}"
+        )));
+    }
+    if let Some(stated) = stated {
+        stated
+            .verify(&data, &got)
+            .map_err(|e| in_blob(digest, &e))?;
+    }
+    Ok(data)
+}
+
+/// `e` as a final failure of the blob `digest`: what the registry sent is
+/// wrong, which asking again does not change.
+fn in_blob(digest: &str, e: &Error) -> Error {
+    Error::format(format!("blob {digest}: {}", restore::message(e)))
+}
+
 /// Read a chunk from the local CAS, verifying its digest; a corrupted entry is
 /// removed and reported so the restore fails rather than trusting bad bytes.
 /// The entry is opened without following a link and must be a regular file.
@@ -901,8 +1169,34 @@ async fn next_slot(set: &mut JoinSet<Result<()>>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{FakeServer, install_crypto};
+    use crate::testutil::{
+        FakeServer, Registry, blob_response, blob_response_with, install_crypto,
+    };
     use std::sync::atomic::AtomicBool;
+
+    /// A directory of [`cas_tmp`], removed with what it holds when dropped.
+    #[derive(Debug)]
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            TempDir(cas_tmp(tag))
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            // Best-effort: a leftover only costs space in the temp directory.
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn cas_tmp(tag: &str) -> PathBuf {
         static N: AtomicI64 = AtomicI64::new(0);
@@ -1199,12 +1493,477 @@ mod tests {
         assert_eq!(counters.bytes.load(Ordering::Relaxed), frame.len() as i64);
     }
 
+    /// The reference of the chunk `raw` under the transparent scheme.
+    fn raw_ref(raw: &[u8]) -> ChunkRef {
+        ChunkRef {
+            digest: sha256_hex(raw),
+            size: raw.len() as i64,
+            raw_size: raw.len() as i64,
+        }
+    }
+
+    async fn pull_zstd(server: &FakeServer, auth: &Auth, c: &ChunkRef) -> Result<Vec<u8>> {
+        let url = format!("{}/v2/repo/blobs/{}", server.base(), c.digest);
+        pull_blob_zstd(&raw_client().build().unwrap(), auth, &url, c).await
+    }
+
+    /// A transparent pull accepts zstd, so the registry sends the frame it
+    /// stores; the digest is that of the decoded bytes.
+    #[tokio::test]
+    async fn a_transparent_pull_asks_for_the_frame() {
+        install_crypto();
+        let raw = crate::zctx::tests::sample(300_000, 1);
+        let frame = zstd::bulk::compress(&raw, 3).unwrap();
+        assert!(frame.len() < raw.len());
+        let server = FakeServer::start_bytes(vec![blob_response(Some("zstd"), &frame)]);
+        let auth = Auth::Basic {
+            user: "ci".to_string(),
+            pass: "s3cret".to_string(),
+        };
+        let chunk = raw_ref(&raw);
+        assert_eq!(pull_zstd(&server, &auth, &chunk).await.unwrap(), raw);
+        let seen = server.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "GET");
+        assert_eq!(seen[0].path, format!("/v2/repo/blobs/{}", chunk.digest));
+        assert_eq!(seen[0].accept_encoding.as_deref(), Some("zstd"));
+        assert_eq!(seen[0].authorization.as_deref(), Some("Basic Y2k6czNjcmV0"));
+    }
+
+    /// A proxy on the way may decode the frame: a response without the
+    /// encoding is the blob itself. So is one whose field is empty, which
+    /// lists no coding.
+    #[tokio::test]
+    async fn a_transparent_pull_takes_a_decoded_response() {
+        install_crypto();
+        let raw = crate::zctx::tests::sample(300_000, 2);
+        let chunk = raw_ref(&raw);
+        for encoding in [None, Some("identity"), Some("")] {
+            let server = FakeServer::start_bytes(vec![blob_response(encoding, &raw)]);
+            let got = pull_zstd(&server, &Auth::None, &chunk).await.unwrap();
+            assert_eq!(got, raw, "{encoding:?}");
+        }
+    }
+
+    /// What a registry answered is final, and nothing of a response that does
+    /// not decode to the bytes the digest names is returned.
+    #[tokio::test]
+    async fn a_bad_transparent_response_is_refused() {
+        install_crypto();
+        let raw = crate::zctx::tests::sample(300_000, 3);
+        let frame = zstd::bulk::compress(&raw, 3).unwrap();
+        let other = crate::zctx::tests::sample(300_000, 4);
+        let mut longer = raw.clone();
+        longer.push(0);
+        let frame_of = |raw: &[u8]| zstd::bulk::compress(raw, 3).unwrap();
+        let not_found = b"HTTP/1.1 404 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let wire_cap = format!("is larger than {MAX_CHUNK_BLOB} bytes");
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            (
+                "not a frame",
+                blob_response(Some("zstd"), b"not a zstd frame"),
+                "blob sha256:",
+            ),
+            (
+                "a frame cut short",
+                blob_response(Some("zstd"), &frame[..frame.len() - 8]),
+                "blob sha256:",
+            ),
+            (
+                "a frame followed by other bytes",
+                blob_response(Some("zstd"), &[frame.as_slice(), b"trailer"].concat()),
+                "blob sha256:",
+            ),
+            (
+                "a frame of other bytes",
+                blob_response(Some("zstd"), &frame_of(&other)),
+                "digest mismatch",
+            ),
+            (
+                "other bytes",
+                blob_response(None, &other),
+                "digest mismatch",
+            ),
+            (
+                "a frame one byte longer than the chunk",
+                blob_response(Some("zstd"), &frame_of(&longer)),
+                "exceeds 300000 bytes",
+            ),
+            (
+                "a frame inflating far past the chunk",
+                blob_response(Some("zstd"), &frame_of(&vec![0; 64 << 20])),
+                "exceeds 300000 bytes",
+            ),
+            (
+                "an encoding other than zstd",
+                blob_response(Some("gzip"), &frame),
+                "unsupported Content-Encoding",
+            ),
+            (
+                "two encodings",
+                blob_response(Some("zstd, gzip"), &frame),
+                "unsupported Content-Encoding",
+            ),
+            (
+                "an encoding in two fields",
+                blob_response_with(
+                    &[("Content-Encoding", "zstd"), ("Content-Encoding", "zstd")],
+                    &frame,
+                ),
+                "2 Content-Encoding fields",
+            ),
+            (
+                "a frame asking for a window past any chunk's",
+                blob_response(
+                    Some("zstd"),
+                    &crate::zctx::tests::frame_with_window(&raw, 26),
+                ),
+                "byte window",
+            ),
+            (
+                "more than a chunk blob holds",
+                blob_response(None, &vec![0; MAX_CHUNK_BLOB + 1]),
+                "is larger than",
+            ),
+            (
+                "a frame of more than a chunk blob holds",
+                blob_response(Some("zstd"), &vec![0; MAX_CHUNK_BLOB + 1]),
+                wire_cap.as_str(),
+            ),
+            ("a missing blob", not_found.to_vec(), "HTTP 404"),
+        ];
+        let chunk = raw_ref(&raw);
+        for (what, response, reason) in cases {
+            let server = FakeServer::start_bytes(vec![response]);
+            let error = pull_zstd(&server, &Auth::None, &chunk).await.unwrap_err();
+            assert!(matches!(error, Error::Format(_)), "{what}: {error}");
+            assert!(error.to_string().contains(reason), "{what}: {error}");
+        }
+    }
+
+    /// The blob is the bytes the reference's size counts: a response holding
+    /// more or fewer is refused whatever its digest, as a frame or decoded.
+    #[tokio::test]
+    async fn a_transparent_pull_holds_the_blob_to_its_size() {
+        install_crypto();
+        let raw = crate::zctx::tests::sample(300_000, 6);
+        let frame = zstd::bulk::compress(&raw, 3).unwrap();
+        for (encoding, body) in [(None, &raw), (Some("zstd"), &frame)] {
+            for (size, reason) in [
+                (raw.len() - 1, ["is larger than 299999", "exceeds 299999"]),
+                (raw.len() + 1, ["index says 300001"; 2]),
+            ] {
+                let mut chunk = raw_ref(&raw);
+                chunk.size = size as i64;
+                let server = FakeServer::start_bytes(vec![blob_response(encoding, body)]);
+                let error = pull_zstd(&server, &Auth::None, &chunk).await.unwrap_err();
+                assert!(matches!(error, Error::Format(_)), "{encoding:?}: {error}");
+                let error = error.to_string();
+                assert!(
+                    reason.iter().any(|r| error.contains(r)),
+                    "{encoding:?}, size {size}: {error}"
+                );
+            }
+        }
+    }
+
+    /// A frame is not held to the size of the chunk it encodes: that of a
+    /// small chunk is the longer of the two.
+    #[tokio::test]
+    async fn a_transparent_pull_takes_a_frame_longer_than_its_chunk() {
+        install_crypto();
+        let raw = b"ED-209";
+        let frame = zstd::bulk::compress(raw, 3).unwrap();
+        assert!(frame.len() > raw.len());
+        let server = FakeServer::start_bytes(vec![blob_response(Some("zstd"), &frame)]);
+        let got = pull_zstd(&server, &Auth::None, &raw_ref(raw))
+            .await
+            .unwrap();
+        assert_eq!(got, raw);
+    }
+
+    /// A `Docker-Content-Digest` is checked against the blob, decoded when it
+    /// came as a frame, as `oci-client` checks one on its own pulls.
+    #[tokio::test]
+    async fn a_transparent_pull_checks_the_digest_the_registry_states() {
+        use sha2::Digest;
+        install_crypto();
+        let raw = crate::zctx::tests::sample(300_000, 7);
+        let frame = zstd::bulk::compress(&raw, 3).unwrap();
+        let chunk = raw_ref(&raw);
+        let hex = |hash: &[u8]| hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let sha512 = format!("sha512:{}", hex(&sha2::Sha512::digest(&raw)));
+        let other = sha256_hex(b"Dick Jones");
+
+        let accepted = [
+            None,
+            Some(""),
+            Some(chunk.digest.as_str()),
+            Some(sha512.as_str()),
+        ];
+        let mismatch = "Docker-Content-Digest mismatch";
+        let two = "2 Docker-Content-Digest fields";
+        let md5 = "md5:d41d8cd98f00b204e9800998ecf8427e";
+        let refused: [(&[&str], &str); 5] = [
+            (&[&other], mismatch),
+            (&["sha256"], "names no algorithm"),
+            (&[md5], "unsupported algorithm"),
+            (&[&chunk.digest, &other], two),
+            (&["", &chunk.digest], two),
+        ];
+        for (encoding, body) in [(None, &raw), (Some("zstd"), &frame)] {
+            let response = |stated: &[&str]| {
+                let mut headers = Vec::new();
+                headers.extend(encoding.map(|e| ("Content-Encoding", e)));
+                headers.extend(stated.iter().map(|s| ("Docker-Content-Digest", *s)));
+                blob_response_with(&headers, body)
+            };
+            for stated in accepted {
+                let fields: Vec<&str> = stated.into_iter().collect();
+                let server = FakeServer::start_bytes(vec![response(&fields)]);
+                let got = pull_zstd(&server, &Auth::None, &chunk).await;
+                assert_eq!(got.unwrap(), raw, "{encoding:?}, {stated:?}");
+            }
+            for (stated, reason) in refused {
+                let server = FakeServer::start_bytes(vec![response(stated)]);
+                let error = fetcher(&server, true).fetch(&chunk).await.unwrap_err();
+                assert!(matches!(error, Error::Format(_)), "{stated:?}: {error}");
+                assert!(error.to_string().contains(reason), "{stated:?}: {error}");
+                assert_eq!(server.seen().len(), 1, "{stated:?}: asked again");
+            }
+        }
+    }
+
+    fn fetcher(server: &FakeServer, transparent: bool) -> ChunkFetcher {
+        ChunkFetcher {
+            client: http_client(),
+            http: raw_client().build().unwrap(),
+            auth: Auth::None,
+            image: format!("{}/repo:tag", server.authority()).parse().unwrap(),
+            blobs: format!("{}/v2/repo/blobs", server.base()),
+            transparent,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transparent_pull_retry_discards_the_partial_body() {
+        install_crypto();
+        let raw = crate::zctx::tests::sample(300_000, 5);
+        let frame = zstd::bulk::compress(&raw, 3).unwrap();
+        let complete = blob_response(Some("zstd"), &frame);
+        let cut = complete[..complete.len() - 100].to_vec();
+        let server = FakeServer::start_bytes(vec![cut, complete]);
+        let chunk = raw_ref(&raw);
+        let got = fetcher(&server, true).fetch(&chunk).await.unwrap();
+        assert_eq!(got, raw);
+        let seen = server.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].path, seen[1].path);
+    }
+
+    /// A refused response is not asked for again.
+    #[tokio::test]
+    async fn a_transparent_digest_mismatch_is_final() {
+        install_crypto();
+        let server = FakeServer::start_bytes(vec![blob_response(None, b"corrupt")]);
+        let error = fetcher(&server, true)
+            .fetch(&raw_ref(b"correct"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("digest mismatch"), "{error}");
+        assert_eq!(server.seen().len(), 1);
+    }
+
+    /// A few files, one of them several chunks long, under a new directory.
+    fn sample_tree(tag: &str) -> (TempDir, Vec<String>) {
+        let dir = TempDir::new(tag);
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        let files = [("big.bin", 6 << 20), ("sub/small.bin", 1000), ("empty", 0)];
+        for (i, (path, len)) in files.iter().enumerate() {
+            std::fs::write(dir.join(path), crate::zctx::tests::sample(*len, i as u64)).unwrap();
+        }
+        (dir, files.iter().map(|(p, _)| p.to_string()).collect())
+    }
+
+    fn assert_same_tree(src: &Path, dst: &Path, paths: &[String]) {
+        for path in paths {
+            assert!(
+                std::fs::read(src.join(path)).unwrap() == std::fs::read(dst.join(path)).unwrap(),
+                "{path} differs"
+            );
+        }
+    }
+
+    async fn open(registry: &Registry, cas: Option<&Path>) -> Store {
+        Store::open(
+            &format!("{}/repo", registry.authority()),
+            RemoteOptions {
+                plain_http: true,
+                cache_dir: cas.map(Path::to_path_buf),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn chunk_digests(idx: &Index) -> Vec<&str> {
+        idx.chunks.iter().map(|c| c.digest.as_str()).collect()
+    }
+
+    /// An entry pushed to a transparent-zstd registry restores the same bytes
+    /// whether its chunks come back as the stored frames or decoded on the way,
+    /// through a local chunk store or without one; each is asked for as a frame.
+    #[tokio::test]
+    async fn a_transparent_entry_restores_from_frames_and_from_decoded_chunks() {
+        install_crypto();
+        let registry = Registry::start(true);
+        let (src, paths) = sample_tree("src");
+        let store = open(&registry, None).await;
+        assert!(store.transparent());
+        store
+            .push("tag", &src, &paths, BTreeMap::new())
+            .await
+            .unwrap();
+
+        let mut asked = 0;
+        for decode in [false, true] {
+            registry.behaviour().decode.store(decode, Ordering::Relaxed);
+            for cas in [None, Some(TempDir::new("cas"))] {
+                let dst = TempDir::new("dst");
+                let store = open(&registry, cas.as_deref()).await;
+                let (idx, _) = store.pull("tag", &dst).await.unwrap();
+                assert!(idx.transparent);
+                assert_same_tree(&src, &dst, &paths);
+
+                let digests = chunk_digests(&idx);
+                assert!(digests.len() > 2, "{} chunks", digests.len());
+                for digest in &digests {
+                    let (stored, zstd) = registry.blob(digest).unwrap();
+                    assert!(zstd, "{digest} is not stored as a frame");
+                    assert_ne!(sha256_hex(&stored), **digest);
+                }
+                let gets = registry.blob_gets(digests.iter().copied());
+                asked += digests.len();
+                assert_eq!(gets.len(), asked, "decode: {decode}, cas: {cas:?}");
+                for get in gets {
+                    assert_eq!(get.accept_encoding.as_deref(), Some("zstd"));
+                }
+            }
+        }
+    }
+
+    /// A chunk whose bytes are not the length its reference gives fails the
+    /// restore under either scheme, whether it is fetched or already in the
+    /// local chunk store.
+    #[tokio::test]
+    async fn a_chunk_of_another_size_than_its_reference_fails_the_restore() {
+        install_crypto();
+        for transparent in [false, true] {
+            let registry = Registry::start(transparent);
+            let (src, paths) = sample_tree("src");
+            let store = open(&registry, None).await;
+            store
+                .push("tag", &src, &paths, BTreeMap::new())
+                .await
+                .unwrap();
+
+            let warm = TempDir::new("cas");
+            let store = open(&registry, Some(&warm)).await;
+            store.pull("tag", &TempDir::new("dst")).await.unwrap();
+            for (delta, warmed) in [(-1, false), (-1, true), (1, false), (1, true)] {
+                let cold = TempDir::new("cas");
+                let cas: &Path = if warmed { &warm } else { &cold };
+                let store = open(&registry, Some(cas)).await;
+                let mut pulled = store.pull_index("tag").await.unwrap();
+                assert_eq!(pulled.index.transparent, transparent);
+                pulled.index.chunks[0].size += delta;
+                let dst = TempDir::new("dst");
+                let error = match store.assemble_pulled(&pulled, &dst, None).await {
+                    Ok(_) => panic!("restored (transparent: {transparent}, warm: {warmed})"),
+                    Err(error) => error.to_string(),
+                };
+                // Decoding one byte past the indexed size reports an oversized chunk.
+                let said = error.contains("index says") || error.contains("exceeds");
+                assert!(said, "transparent: {transparent}, warm: {warmed}: {error}");
+            }
+        }
+    }
+
+    /// An index is assembled by the store that pulled it: its chunks are not
+    /// looked for in another repository.
+    #[tokio::test]
+    async fn an_index_pulled_from_another_repository_is_refused() {
+        install_crypto();
+        let registry = Registry::start(true);
+        let (src, paths) = sample_tree("src");
+        let store = open(&registry, None).await;
+        store
+            .push("tag", &src, &paths, BTreeMap::new())
+            .await
+            .unwrap();
+        let pulled = store.pull_index("tag").await.unwrap();
+
+        let other = Store::open(
+            &format!("{}/other", registry.authority()),
+            RemoteOptions {
+                plain_http: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let dst = TempDir::new("dst");
+        let Err(error) = other.assemble_pulled(&pulled, &dst, None).await else {
+            panic!("assembled from another repository");
+        };
+        assert!(
+            error.to_string().contains("was not pulled from this store"),
+            "{error}"
+        );
+        let digests = chunk_digests(&pulled.index);
+        assert_eq!(registry.blob_gets(digests).len(), 0);
+    }
+
+    /// A registry that does not advertise the scheme keeps compressed-digest
+    /// chunks, pulled as the blobs they are.
+    #[tokio::test]
+    async fn a_plain_registry_keeps_the_compressed_digest_scheme() {
+        install_crypto();
+        let registry = Registry::start(false);
+        let (src, paths) = sample_tree("src");
+        let store = open(&registry, None).await;
+        assert!(!store.transparent());
+        store
+            .push("tag", &src, &paths, BTreeMap::new())
+            .await
+            .unwrap();
+
+        let dst = TempDir::new("dst");
+        let cas = TempDir::new("cas");
+        let store = open(&registry, Some(&cas)).await;
+        let (idx, _) = store.pull("tag", &dst).await.unwrap();
+        assert!(!idx.transparent);
+        assert_same_tree(&src, &dst, &paths);
+        let digests = chunk_digests(&idx);
+        for digest in &digests {
+            let (stored, zstd) = registry.blob(digest).unwrap();
+            assert!(!zstd);
+            assert_eq!(sha256_hex(&stored), **digest);
+        }
+        let gets = registry.blob_gets(digests.iter().copied());
+        assert_eq!(gets.len(), digests.len());
+        for get in gets {
+            assert_eq!(get.accept_encoding, None);
+        }
+    }
+
     /// A registry that answers the probe, serves the first chunk GET corrupt
     /// and holds every later connection open without answering, as a proxy
     /// whose upstream has gone does. Returns its authority, the count of
     /// chunk GETs it received and the flag that, once set, releases the silent
     /// connections.
-    fn one_corrupt_then_silent() -> (String, Arc<AtomicI64>, Arc<AtomicBool>) {
+    fn one_corrupt_then_silent(transparent: bool) -> (String, Arc<AtomicI64>, Arc<AtomicBool>) {
         use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let authority = listener.local_addr().unwrap().to_string();
@@ -1225,7 +1984,9 @@ mod tests {
                             break;
                         }
                     }
-                    let response = if line.starts_with("GET /v2/ ") {
+                    let response = if line.starts_with("GET /v2/ ") && transparent {
+                        "HTTP/1.1 200 OK\r\nx-virtkit-transparent-zstd: 1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                    } else if line.starts_with("GET /v2/ ") {
                         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
                     } else if gets.fetch_add(1, Ordering::Relaxed) == 0 {
                         "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncorrupt"
@@ -1247,8 +2008,18 @@ mod tests {
     /// than each waiting out its own read timeout and retries.
     #[tokio::test]
     async fn a_failed_chunk_ends_the_prefetch() {
+        a_failed_chunk_ends_the_prefetch_of(false).await;
+    }
+
+    /// The same when the chunks are asked for compressed.
+    #[tokio::test]
+    async fn a_failed_chunk_ends_the_transparent_prefetch() {
+        a_failed_chunk_ends_the_prefetch_of(true).await;
+    }
+
+    async fn a_failed_chunk_ends_the_prefetch_of(transparent: bool) {
         install_crypto();
-        let (authority, gets, stop) = one_corrupt_then_silent();
+        let (authority, gets, stop) = one_corrupt_then_silent(transparent);
         let cas = cas_tmp("ends");
         let store = Store::open(
             &format!("{authority}/repo"),
@@ -1260,10 +2031,14 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(store.transparent(), transparent);
         let mut idx = Index::new();
+        idx.transparent = transparent;
         idx.chunks = (0..3 * FETCH_CONCURRENCY)
             .map(|i| {
-                let data = format!("chunk {i}");
+                // As long as the `corrupt` served: it is refused for its
+                // digest, whichever chunk is asked for first.
+                let data = format!("chunk{i:02}");
                 ChunkRef {
                     digest: sha256_hex(data.as_bytes()),
                     size: data.len() as i64,

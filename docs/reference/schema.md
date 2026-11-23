@@ -787,10 +787,10 @@ developer machine — disables the block; one that renders to anything but
 cannot be combined with `url` or `lock`. `api_key` also works with an explicit
 `oci://` URL and `vk://` lock, where it outranks every other credential.
 
-A `vk` cache requires the registry to advertise transparent-zstd. Each new
-save uploads compressed chunks named by the digest of their uncompressed
-bytes. Restores use the format in the saved index, including older entries
-whose digests cover the compressed bytes.
+A `vk` cache requires the registry to advertise transparent-zstd. Saves upload
+compressed chunks named by the digest of their uncompressed bytes. Restores
+request compressed chunks and use the digest format in the saved index. Older
+entries use digests of the compressed bytes.
 
 If the registry omits the capability, a restore counts as a miss and a save
 prints a warning naming the registry. For a generic OCI registry, set `url`

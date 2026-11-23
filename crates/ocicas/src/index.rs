@@ -43,13 +43,19 @@ pub(crate) const MAX_INDEX_BLOB: usize = MAX_INDEX_SIZE / 4;
 /// scheme serves).
 pub(crate) const MAX_CHUNK_BLOB: usize = MAX_CHUNK_SIZE * 2;
 
+/// Largest window, as a power of two, a chunk frame may ask its decoder for:
+/// the first to hold [`MAX_CHUNK_BLOB`]. No chunk needs more, and zstd's
+/// default would let each frame of a concurrent pull claim 128 MiB.
+pub(crate) const CHUNK_WINDOW_LOG_MAX: u32 = usize::BITS - (MAX_CHUNK_BLOB - 1).leading_zeros();
+
 /// References one compressed chunk blob of the stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkRef {
     /// `sha256:<hex>` of the COMPRESSED bytes — the blob digest the registry
     /// stores and verifies (of the RAW bytes under the transparent scheme).
     pub digest: String,
-    /// Compressed (blob) size.
+    /// Length of the bytes `digest` names: the compressed blob, or the raw
+    /// chunk under the transparent scheme.
     pub size: i64,
     /// Uncompressed size; bounds decompression on restore.
     #[serde(rename = "rawSize")]
@@ -99,8 +105,9 @@ pub struct Index {
     pub chunker: ChunkerParams,
     pub compression: Compression,
     /// The vk-registry transparent-zstd scheme: each chunk's `digest` is over
-    /// its UNCOMPRESSED bytes and the blob was uploaded as a zstd frame, so the
-    /// registry serves canonical (raw) bytes and restore skips decompression.
+    /// its UNCOMPRESSED bytes and the blob was uploaded as a zstd frame, which
+    /// the registry serves back to a pull that accepts zstd, and decoded to
+    /// any other. A chunk source hands restore the raw bytes.
     /// Absent (false) = the classic compressed-digest scheme any OCI registry
     /// stores as-is.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -267,7 +274,8 @@ pub(crate) fn zstd_reader(frames: &[u8]) -> std::io::Result<impl Read + '_> {
 }
 
 /// Decode a zstd frame, capping the output at `max` bytes so a bomb fails
-/// instead of exhausting memory.
+/// instead of exhausting memory. For the index: a chunk frame goes through
+/// [`zstd_decode_chunk_into`], which also limits the decoder's window.
 pub(crate) fn zstd_decode_bounded(data: &[u8], max: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     zstd_decode_bounded_into(data, max, &mut out)?;
@@ -279,9 +287,23 @@ pub(crate) fn zstd_decode_bounded(data: &[u8], max: usize) -> Result<Vec<u8>> {
 /// detect an overlong frame: capacity for `max + 1` bytes avoids a
 /// reallocation.
 pub(crate) fn zstd_decode_bounded_into(data: &[u8], max: usize, out: &mut Vec<u8>) -> Result<()> {
+    read_bounded(zstd_reader(data)?, max, out)
+}
+
+/// [`zstd_decode_bounded_into`] for chunk frames, with a decoder window of at most
+/// `1 << CHUNK_WINDOW_LOG_MAX` bytes.
+pub(crate) fn zstd_decode_chunk_into(data: &[u8], max: usize, out: &mut Vec<u8>) -> Result<()> {
+    read_bounded(
+        zctx::decoder_windowed(data, CHUNK_WINDOW_LOG_MAX)?,
+        max,
+        out,
+    )
+}
+
+fn read_bounded(decoder: impl Read, max: usize, out: &mut Vec<u8>) -> Result<()> {
     out.clear();
     let limit = (max as u64).saturating_add(1);
-    zstd_reader(data)?.take(limit).read_to_end(out)?;
+    decoder.take(limit).read_to_end(out)?;
     if out.len() > max {
         return Err(Error::format(format!(
             "decompressed data exceeds {max} bytes"

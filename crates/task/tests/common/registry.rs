@@ -24,6 +24,10 @@ struct State {
     stall_blobs: AtomicBool,
     /// Blob GETs still answered before they stall too.
     blob_gets_allowed: AtomicI64,
+    /// Advertise vk-registry's transparent-zstd scheme.
+    transparent_zstd: AtomicBool,
+    /// Blob GETs received that accept zstd.
+    zstd_blob_gets: AtomicU64,
     /// (seconds since start, method, path) of every request left unanswered.
     stalled: Mutex<Vec<(u64, String, String)>>,
     /// Ends the stalled requests and the accept loop.
@@ -77,9 +81,35 @@ impl Registry {
         self.state.blob_gets_allowed.store(n, Ordering::Relaxed);
     }
 
+    /// Simulate a registry upgrade by advertising transparent-zstd. The mock
+    /// still serves blobs as uploaded, so it can restore older entries and
+    /// accept new saves. Restoring a new save requires encoding support.
+    pub fn advertise_transparent_zstd(&self) {
+        self.state.transparent_zstd.store(true, Ordering::Relaxed);
+    }
+
+    /// How many blob GETs accepted zstd.
+    pub fn zstd_blob_gets(&self) -> u64 {
+        self.state.zstd_blob_gets.load(Ordering::Relaxed)
+    }
+
     /// Whether any blob was pushed.
     pub fn has_blobs(&self) -> bool {
         !self.state.blobs.lock().unwrap().is_empty()
+    }
+
+    /// The references manifests were pushed under, sorted.
+    pub fn manifest_tags(&self) -> Vec<String> {
+        let mut tags: Vec<String> = self
+            .state
+            .manifests
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        tags.sort();
+        tags
     }
 
     /// Whether any manifest was pushed.
@@ -131,6 +161,7 @@ pub struct Request {
     pub path: String,
     pub query: String,
     content_type: String,
+    accept_encoding: String,
     body: Vec<u8>,
 }
 
@@ -146,6 +177,7 @@ pub fn read_request(stream: &TcpStream) -> Option<Request> {
         None => (target, String::new()),
     };
     let mut content_type = String::new();
+    let mut accept_encoding = String::new();
     let mut length = 0;
     loop {
         let mut header = String::new();
@@ -158,6 +190,7 @@ pub fn read_request(stream: &TcpStream) -> Option<Request> {
         match name.to_ascii_lowercase().as_str() {
             "content-length" => length = value.trim().parse().ok()?,
             "content-type" => content_type = value.trim().to_string(),
+            "accept-encoding" => accept_encoding = value.trim().to_string(),
             _ => {}
         }
     }
@@ -168,6 +201,7 @@ pub fn read_request(stream: &TcpStream) -> Option<Request> {
         path,
         query,
         content_type,
+        accept_encoding,
         body,
     })
 }
@@ -214,7 +248,14 @@ fn handle(stream: TcpStream, state: &State, started: Instant) {
 
     let method = req.method.as_str();
     if req.path == "/v2/" {
-        return respond(stream, 200, &[length(2)], b"{}");
+        let mut headers = vec![length(2)];
+        if state.transparent_zstd.load(Ordering::Relaxed) {
+            headers.push(("x-virtkit-transparent-zstd", "1".to_string()));
+        }
+        return respond(stream, 200, &headers, b"{}");
+    }
+    if is_blob_get && req.accept_encoding.split(',').any(|c| c.trim() == "zstd") {
+        state.zstd_blob_gets.fetch_add(1, Ordering::Relaxed);
     }
     if let Some(reference) = req.path.strip_prefix("/v2/repo/manifests/") {
         if method == "PUT" {
