@@ -13,10 +13,13 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+use zstd::zstd_safe::DCtx;
 
 use crate::chunker::{AVG_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::error::{Error, Result};
-use crate::index::{ChunkRef, FileEntry, Index, ZSTD_LEVEL, safe_rel_path, zstd_decode_bounded};
+use crate::index::{
+    ChunkRef, FileEntry, Index, ZSTD_LEVEL, safe_rel_path, zstd_decode_bounded_with, zstd_decoder,
+};
 use crate::restore::{self, Tree, Written};
 
 /// Concatenate the given files (slash-separated paths relative to `base_dir`,
@@ -74,13 +77,16 @@ where
     }
 
     let mut seen: HashSet<String> = HashSet::new();
+    // One compression context for every chunk: a new one per chunk is over
+    // 1 MiB allocated and set up each time, for the same frames.
+    let mut compressor = zstd::bulk::Compressor::new(ZSTD_LEVEL)?;
     let mut concat = ConcatFiles::new(reg_paths);
     let chunker =
         fastcdc::v2020::StreamCDC::new(&mut concat, MIN_CHUNK_SIZE, AVG_CHUNK_SIZE, MAX_CHUNK_SIZE);
     for chunk in chunker {
         let chunk = chunk.map_err(|e| Error::format(format!("chunking: {e}")))?;
         let raw = &chunk.data;
-        let frame = zstd::bulk::compress(raw, ZSTD_LEVEL)?;
+        let frame = compressor.compress(raw)?;
         let refc = if transparent {
             let d = sha256_hex(raw);
             ChunkRef {
@@ -287,6 +293,8 @@ struct StreamReader<'a, Src> {
     src: Src,
     next: usize,
     raw: Vec<u8>,
+    /// Decodes every chunk of the stream; created with the first one.
+    decoder: Option<DCtx<'static>>,
 }
 
 impl<'a, Src> StreamReader<'a, Src>
@@ -299,6 +307,7 @@ where
             src,
             next: 0,
             raw: Vec::new(),
+            decoder: None,
         }
     }
 
@@ -323,7 +332,11 @@ where
             let raw = if idx.transparent {
                 data
             } else {
-                zstd_decode_bounded(&data, refc.raw_size as usize)?
+                let decoder = match &mut self.decoder {
+                    Some(decoder) => decoder,
+                    none => none.insert(zstd_decoder()?),
+                };
+                zstd_decode_bounded_with(decoder, &data, refc.raw_size as usize)?
             };
             if raw.len() as i64 != refc.raw_size {
                 return Err(Error::format(format!(
@@ -500,6 +513,28 @@ mod tests {
             idx1.chunks.len() > 1,
             "a 2 MB stream should cut into multiple chunks"
         );
+        std::fs::remove_dir_all(&src).ok();
+    }
+
+    /// Every chunk is the frame a compression context of its own makes of it,
+    /// whichever chunks the build's context compressed before.
+    #[test]
+    fn chunks_are_the_frames_a_new_context_writes() {
+        let src = tmpdir("src");
+        write_file(&src, "big", &pseudo_random(6_000_000, 21));
+        write_file(&src, "text", &b"some compressible text\n".repeat(150_000));
+        write_file(&src, "tiny", b"x");
+        let paths = vec!["big".to_string(), "text".to_string(), "tiny".to_string()];
+
+        let (idx, store) = mem_build(&src, &paths, false);
+        assert!(idx.chunks.len() > 3, "{} chunks", idx.chunks.len());
+        for c in &idx.chunks {
+            let frame = &store[&c.digest];
+            let raw = zstd::bulk::decompress(frame, MAX_CHUNK_SIZE).unwrap();
+            assert_eq!(raw.len() as i64, c.raw_size);
+            assert_eq!(*frame, zstd::bulk::compress(&raw, ZSTD_LEVEL).unwrap());
+            assert_eq!(c.digest, sha256_hex(frame));
+        }
         std::fs::remove_dir_all(&src).ok();
     }
 

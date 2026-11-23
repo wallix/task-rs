@@ -10,6 +10,7 @@
 use std::io::Read;
 
 use serde::{Deserialize, Serialize};
+use zstd::zstd_safe::DCtx;
 
 use crate::chunker::{AVG_CHUNK_SIZE, CHUNKER_ALGO, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::error::{Error, Result};
@@ -250,7 +251,32 @@ pub(crate) fn safe_rel_path(p: &str) -> bool {
 /// Decode a zstd frame, capping the output at `max` bytes so a bomb fails
 /// instead of exhausting memory.
 pub(crate) fn zstd_decode_bounded(data: &[u8], max: usize) -> Result<Vec<u8>> {
-    let mut dec = zstd::stream::read::Decoder::new(data)?;
+    zstd_decode_bounded_with(&mut zstd_decoder()?, data, max)
+}
+
+/// A zstd decompression context for [`zstd_decode_bounded_with`].
+pub(crate) fn zstd_decoder() -> Result<DCtx<'static>> {
+    DCtx::try_create().ok_or_else(|| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "zstd could not allocate a context",
+        ))
+    })
+}
+
+/// [`zstd_decode_bounded`] on a context the caller keeps from one frame to the
+/// next: a context costs about 1 MiB to allocate and set up, and decodes the
+/// same bytes whatever it decoded before. The context is one from
+/// [`zstd_decoder`], with no parameter or dictionary set on it.
+pub(crate) fn zstd_decode_bounded_with(
+    ctx: &mut DCtx<'static>,
+    data: &[u8],
+    max: usize,
+) -> Result<Vec<u8>> {
+    // Starts by resetting the context's session, so a frame the previous call
+    // left unfinished (truncated, corrupt or over its cap) does not reach
+    // this one.
+    let mut dec = zstd::stream::read::Decoder::with_context(data, ctx);
     let mut out = Vec::new();
     let limit = (max as u64).saturating_add(1);
     dec.by_ref().take(limit).read_to_end(&mut out)?;
@@ -393,5 +419,55 @@ mod tests {
         let frame = zstd::bulk::compress(&big, 3).expect("compress");
         assert!(zstd_decode_bounded(&frame, 1024).is_err());
         assert!(zstd_decode_bounded(&frame, 4096).is_ok());
+    }
+
+    /// Bytes that compress, but not to nothing.
+    fn sample(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|i| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                if i % 7 < 4 {
+                    (state >> 56) as u8
+                } else {
+                    (i % 13) as u8
+                }
+            })
+            .collect()
+    }
+
+    /// One context decodes every frame in turn as a new one does, also right
+    /// after a frame that was truncated, corrupt or over its cap.
+    #[test]
+    fn a_reused_decoder_reads_what_a_new_one_does() {
+        let mut ctx = zstd_decoder().expect("context");
+        let (a, b) = (sample(300_000, 1), sample(MAX_CHUNK_SIZE, 2));
+        let fa = zstd::bulk::compress(&a, ZSTD_LEVEL).expect("compress");
+        let fb = zstd::bulk::compress(&b, ZSTD_LEVEL).expect("compress");
+        let mut decode = |frame: &[u8], max: usize| {
+            let reused = zstd_decode_bounded_with(&mut ctx, frame, max).ok();
+            assert_eq!(reused, zstd_decode_bounded(frame, max).ok());
+            reused
+        };
+
+        assert_eq!(decode(&fa, a.len()), Some(a.clone()));
+        assert_eq!(decode(&fb, b.len()), Some(b.clone()));
+        assert_eq!(decode(&fb[..fb.len() / 2], b.len()), None, "truncated");
+        assert_eq!(decode(&fa, a.len()), Some(a.clone()));
+        assert_eq!(decode(&fb, b.len() - 1), None, "over its cap");
+        assert_eq!(decode(&fa, a.len()), Some(a.clone()));
+        assert_eq!(decode(b"not a zstd frame", 64), None);
+        let mut corrupt = fb.clone();
+        let mid = corrupt.len() / 2;
+        corrupt[mid..mid + 64].fill(0xff);
+        assert_ne!(decode(&corrupt, b.len()), Some(b.clone()));
+        assert_eq!(decode(&fa, a.len()), Some(a.clone()));
+        // Two frames back to back decode as one stream.
+        let both = [fa.clone(), fb.clone()].concat();
+        assert_eq!(decode(&both, a.len() + b.len()), Some([a, b].concat()));
+        // No input at all: whatever a new context makes of it.
+        decode(&[], 0);
     }
 }
