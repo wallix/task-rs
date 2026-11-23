@@ -503,6 +503,58 @@ mod tests {
         std::fs::remove_dir_all(&src).ok();
     }
 
+    /// The digests of compressed chunks, and of the compressed index, for
+    /// fixed inputs: a zstd upgrade that writes other bytes for the same
+    /// chunks stops deduplicating against every entry pushed before it, and
+    /// fails here. Covers frames on both sides of 128 KiB, the size up to
+    /// which zstd's streaming helpers record a frame's content size.
+    #[test]
+    fn compressed_bytes_are_pinned() {
+        let text = b"some compressible text\n".repeat(150_000);
+        let trees: [&[(&str, &[u8])]; 3] = [
+            &[("tiny", b"x")],
+            &[("small", &text[..70_000])],
+            &[
+                ("big", &pseudo_random(3_000_000, 21)),
+                ("text", &text),
+                ("tiny", b"x"),
+            ],
+        ];
+        let mut pinned = Vec::new();
+        for files in trees {
+            let src = tmpdir("src");
+            let mut paths = Vec::new();
+            for (rel, data) in files {
+                write_file(&src, rel, data);
+                paths.push(rel.to_string());
+            }
+            let (mut idx, store) = mem_build(&src, &paths, false);
+            for c in &idx.chunks {
+                assert_eq!(c.digest, sha256_hex(&store[&c.digest]));
+                pinned.push(format!("{} {}", c.raw_size, c.digest));
+            }
+            // The mode of a file just written follows the umask.
+            for f in &mut idx.files {
+                f.mode = 0o644;
+            }
+            pinned.push(format!("index {}", sha256_hex(&idx.marshal().unwrap())));
+            std::fs::remove_dir_all(&src).ok();
+        }
+        assert_eq!(
+            pinned,
+            [
+                "1 sha256:0cef3ff8071f74052c0cc36a590c643f64552766d72a07168846a0e1b103dead",
+                "index sha256:06477e2bc892980e554e0f3c5ea130c8a912ee0c393db8f30d093200eb37e042",
+                "70000 sha256:d1f89fc5df7874925d9fc764f737cde66e8cabd1d438bf04f9ec9610f455f151",
+                "index sha256:099512e614375cab9c793bfcdceb5a5e7ecb79aa4554cb20c9777ae084169449",
+                "1014785 sha256:b287f4c92f9d18bba5a7a2d888fab671418901c76d56cb402df39410f2b8f30a",
+                "1306900 sha256:3041b47a958f18e79bdb6a88b63e6f458a33bee260d139948449578b7c83eb12",
+                "4128316 sha256:d54bc79f7aa3d82275b405ccffd35533f228acb454ef866e4bf5e06b0e5958b9",
+                "index sha256:8bcabaf7f1e43927000b7270bb382ec48175808d1295dd6ce5354573cb66d8a9",
+            ]
+        );
+    }
+
     #[test]
     fn transparent_scheme_round_trips() {
         let src = tmpdir("src");
