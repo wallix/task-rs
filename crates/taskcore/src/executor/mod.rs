@@ -53,7 +53,7 @@ pub use run::MatchingTask;
 pub use watch::should_ignore;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -201,6 +201,9 @@ pub struct Executor {
     pub(crate) prompt_turn: Mutex<()>,
     /// Deduplicates concurrent executions of the same task hash.
     pub(crate) run_once: Mutex<HashMap<String, Arc<OnceCell<RunOnceResult>>>>,
+    /// Names of the build-once locks this run holds, so a wait on one of them
+    /// is told apart from a wait on another run.
+    pub(crate) held_locks: RefCell<HashSet<String>>,
     /// Tracks the tasks queued on the runtime so an abandoned run can tear them
     /// down instead of leaving their commands behind.
     pub(crate) queue: run::TaskQueue,
@@ -259,6 +262,7 @@ impl Default for Executor {
             mkdir_locks: Mutex::new(HashMap::new()),
             prompt_turn: Mutex::new(()),
             run_once: Mutex::new(HashMap::new()),
+            held_locks: RefCell::new(HashSet::new()),
             queue: run::TaskQueue::default(),
             sandbox_dirs: RefCell::new(Vec::new()),
         }

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **A cache registry that stops answering fails the save or restore once.**
+  A chunk transfer ends at the first chunk that fails, after that request's
+  own retries (about two minutes without an answer), and the chunks still in
+  flight are abandoned. Until now every remaining chunk of the entry went
+  through the same retries, eight at a time, so a registry that accepted
+  requests and never answered them kept `task` silent for hours. The restore
+  then counts as a miss and the task runs; a failed save is warned about as
+  before.
+- **Waiting on a held build-once lock is logged.** A task whose lock
+  (`cache.lock`, or the local lock of any task with sources and generates)
+  is held by another run says so at default verbosity, with the wait limit,
+  and says how long it waited once it has the lock. Falling back to a local
+  lock after the remote lock failed or timed out is now a visible warning.
+
 ## v4.12.1 - 2026-11-20
 
 - **rustix updated for RUSTSEC-2026-0486.**
