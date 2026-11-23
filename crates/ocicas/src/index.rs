@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunker::{AVG_CHUNK_SIZE, CHUNKER_ALGO, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::error::{Error, Result};
+use crate::zctx;
 
 /// Bumped on any incompatible change to the index schema or the
 /// chunking/compression parameters. Entries of another version are rejected on
@@ -150,7 +151,7 @@ impl Index {
     /// Render the index as zstd-compressed deterministic JSON.
     pub fn marshal(&self) -> Result<Vec<u8>> {
         let raw = serde_json::to_vec(self)?;
-        Ok(zstd::bulk::compress(&raw, ZSTD_LEVEL)?)
+        zstd_frame(&raw)
     }
 }
 
@@ -247,13 +248,24 @@ pub(crate) fn safe_rel_path(p: &str) -> bool {
         && crate::restore::components(p, false).is_ok()
 }
 
+/// Encode `raw` as one frame at [`ZSTD_LEVEL`] on a pooled context. Its bytes
+/// must match `zstd::bulk::compress(raw, ZSTD_LEVEL)`: the digest of a
+/// compressed chunk is taken over them.
+pub(crate) fn zstd_frame(raw: &[u8]) -> Result<Vec<u8>> {
+    Ok(zctx::compress(raw)?)
+}
+
+/// Decode `frames` like `zstd::stream::read::Decoder` using the context pool.
+pub(crate) fn zstd_reader(frames: &[u8]) -> std::io::Result<impl Read + '_> {
+    zctx::decoder_buffered(frames)
+}
+
 /// Decode a zstd frame, capping the output at `max` bytes so a bomb fails
 /// instead of exhausting memory.
 pub(crate) fn zstd_decode_bounded(data: &[u8], max: usize) -> Result<Vec<u8>> {
-    let mut dec = zstd::stream::read::Decoder::new(data)?;
     let mut out = Vec::new();
     let limit = (max as u64).saturating_add(1);
-    dec.by_ref().take(limit).read_to_end(&mut out)?;
+    zstd_reader(data)?.take(limit).read_to_end(&mut out)?;
     if out.len() > max {
         return Err(Error::format(format!(
             "decompressed data exceeds {max} bytes"
@@ -393,5 +405,39 @@ mod tests {
         let frame = zstd::bulk::compress(&big, 3).expect("compress");
         assert!(zstd_decode_bounded(&frame, 1024).is_err());
         assert!(zstd_decode_bounded(&frame, 4096).is_ok());
+    }
+
+    /// Concurrent workers sharing the pool must decode valid frames after
+    /// truncated or corrupt frames, or frames that expand beyond their cap.
+    #[test]
+    fn bounded_decoding_recovers_on_shared_contexts() {
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                s.spawn(move || {
+                    for (i, len) in [0, 1, 70_000, MAX_CHUNK_SIZE, 300, 3 << 20]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let raw = crate::zctx::tests::sample(len, t * 16 + i as u64);
+                        let frame = zstd_frame(&raw).unwrap();
+                        assert_eq!(frame, zstd::bulk::compress(&raw, ZSTD_LEVEL).unwrap());
+                        let decode =
+                            |frame: &[u8], max: usize| zstd_decode_bounded(frame, max).ok();
+                        assert_eq!(decode(&frame, len), Some(raw.clone()));
+                        if len > 300 {
+                            assert_eq!(decode(&frame[..frame.len() / 2], len), None);
+                            assert_eq!(decode(&frame, len - 1), None, "over its cap");
+                            let mut corrupt = frame.clone();
+                            let mid = corrupt.len() / 2;
+                            corrupt[mid..mid + 64].fill(0xff);
+                            // Corruption can yield different bytes of the expected length.
+                            assert_ne!(decode(&corrupt, len), Some(raw.clone()));
+                        }
+                        assert_eq!(decode(b"not a zstd frame", len), None);
+                        assert_eq!(decode(&frame, len), Some(raw));
+                    }
+                });
+            }
+        });
     }
 }

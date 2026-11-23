@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::chunker::{AVG_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::error::{Error, Result};
-use crate::index::{ChunkRef, FileEntry, Index, ZSTD_LEVEL, safe_rel_path, zstd_decode_bounded};
+use crate::index::{ChunkRef, FileEntry, Index, safe_rel_path, zstd_decode_bounded, zstd_frame};
 use crate::restore::{self, Tree, Written};
 
 /// Concatenate the given files (slash-separated paths relative to `base_dir`,
@@ -80,7 +80,7 @@ where
     for chunk in chunker {
         let chunk = chunk.map_err(|e| Error::format(format!("chunking: {e}")))?;
         let raw = &chunk.data;
-        let frame = zstd::bulk::compress(raw, ZSTD_LEVEL)?;
+        let frame = zstd_frame(raw)?;
         let refc = if transparent {
             let d = sha256_hex(raw);
             ChunkRef {
@@ -391,6 +391,7 @@ fn perm_bits(m: &Metadata) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::ZSTD_LEVEL;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -500,6 +501,28 @@ mod tests {
             idx1.chunks.len() > 1,
             "a 2 MB stream should cut into multiple chunks"
         );
+        std::fs::remove_dir_all(&src).ok();
+    }
+
+    /// Every chunk is the frame a compression context of its own makes of it,
+    /// whichever chunks the pooled context compressed before.
+    #[test]
+    fn chunks_are_the_frames_a_new_context_writes() {
+        let src = tmpdir("src");
+        write_file(&src, "big", &pseudo_random(6_000_000, 21));
+        write_file(&src, "text", &b"some compressible text\n".repeat(150_000));
+        write_file(&src, "tiny", b"x");
+        let paths = vec!["big".to_string(), "text".to_string(), "tiny".to_string()];
+
+        let (idx, store) = mem_build(&src, &paths, false);
+        assert!(idx.chunks.len() > 3, "{} chunks", idx.chunks.len());
+        for c in &idx.chunks {
+            let frame = &store[&c.digest];
+            let raw = zstd::bulk::decompress(frame, MAX_CHUNK_SIZE).unwrap();
+            assert_eq!(raw.len() as i64, c.raw_size);
+            assert_eq!(*frame, zstd::bulk::compress(&raw, ZSTD_LEVEL).unwrap());
+            assert_eq!(c.digest, sha256_hex(frame));
+        }
         std::fs::remove_dir_all(&src).ok();
     }
 
