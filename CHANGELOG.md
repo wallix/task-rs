@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v4.14.0 - 2026-11-24
+
 - **A `vk:` cache requires vk-registry's transparent-zstd mode.** When the
   registry does not advertise it, restores are skipped and saves print a
   warning naming the registry. A generic OCI registry can be configured with
